@@ -6,11 +6,13 @@
 
 pub mod ast;
 pub mod parser;
+pub mod scanner;
 
 /// Decoder trait that define the interface for
 /// a decoder.
 pub trait Decoder {
     type Output = ();
+
     /// decode the type from a sequence of bytes
     fn decode<T>(self) -> T;
 
