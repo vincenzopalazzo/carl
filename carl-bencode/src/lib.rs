@@ -1,14 +1,18 @@
-pub fn add(left: usize, right: usize) -> usize {
-    left + right
-}
+//! Bencoding format parser written in Rust!
+//!
+//! Bencoding is a way to specify and organize data in a terse format.
+//! It supports the following types: byte strings, integers, lists, and dictionaries.
+#![feature(associated_type_defaults)]
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod ast;
+pub mod parser;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
+/// Decoder trait that define the interface for
+/// a decoder.
+pub trait Decoder {
+    type Output = ();
+    /// decode the type from a sequence of bytes
+    fn decode<T>(self) -> T;
+
+    fn raw_decode(self) -> Self::Output;
 }
