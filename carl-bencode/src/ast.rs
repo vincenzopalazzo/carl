@@ -44,10 +44,11 @@ pub enum BEncodingAST {
 }
 
 pub enum BEncodingToken {
-    RawStr(Vec<u8>),
+    RawStr(String),
+    RawInt(i64),
     ITok,
     LTok,
     DTok,
-    Dash,
+    DotDot,
     ETok,
 }
