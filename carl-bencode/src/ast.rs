@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 /// AST result after the parsing of the token stream!
+#[derive(Debug, Hash, Eq, PartialEq)]
 pub enum BEncodingAST {
     /// i-0e is invalid. All encodings with a leading zero, such as i03e, are invalid,
     /// other than i0e, which of course corresponds to the integer "0".
@@ -21,7 +22,7 @@ pub enum BEncodingAST {
     ///
     /// Example: 4: spam represents the string "spam"
     /// Example: 0: represents the empty string ""
-    Str(Vec<u8>),
+    Str(String),
     /// Lists are encoded as follows: l<bencoded values>e
     /// The initial l and trailing e are beginning and ending delimiters.
     ///
@@ -40,15 +41,5 @@ pub enum BEncodingAST {
     /// Example: d4:spaml1:a1:bee represents the dictionary { "spam" => [ "a", "b" ] }
     /// Example: d9:publisher3:bob17:publisher-webpage15:www.example.com18:publisher.location4:homee represents { "publisher" => "bob", "publisher-webpage" => "www.example.com", "publisher.location" => "home" }
     /// Example: de represents an empty dictionary {}
-    Dic(HashMap<Vec<u8>, Rc<BEncodingAST>>),
-}
-
-pub enum BEncodingToken {
-    RawStr(String),
-    RawInt(i64),
-    ITok,
-    LTok,
-    DTok,
-    DotDot,
-    ETok,
+    Dic(Vec<(Rc<BEncodingAST>, Rc<BEncodingAST>)>),
 }

@@ -1,8 +1,11 @@
 //! Scanner Bencoding format
-use albert_stream::{BasicStream, Stream};
+use std::collections::HashMap;
+use std::rc::Rc;
 use std::vec::Vec;
 
-use crate::ast::BEncodingToken;
+use albert_stream::{BasicStream, Stream};
+
+use crate::ast::BEncodingAST;
 
 pub struct Scanner;
 
@@ -20,35 +23,29 @@ impl Scanner {
     /// data model language to parser. However, it is possible to
     /// simplify a lot the parser logic and make the logic
     /// more readble.
-    pub fn scan(&self, stream: &mut BasicStream<char>) -> Result<Vec<BEncodingToken>, ()> {
-        let mut tokens = vec![];
+    pub fn scan(&self, stream: &mut BasicStream<char>) -> Result<Vec<BEncodingAST>, ()> {
+        let mut tokens = Vec::new();
         while !stream.is_end() {
-            match stream.peek() {
-                'i' => {
-                    let inum = self.parse_int(stream, &mut tokens)?;
-                    tokens.push(inum);
-                }
-                'l' => {
-                    let llist = self.parse_list(stream, &mut tokens);
-                    tokens.push(llist);
-                }
-                'd' => {
-                    let ddic = self.parse_dic(stream, &mut tokens);
-                    tokens.push(ddic);
-                }
-                // FIXME: return an error
-                otherwise => {
-                    if otherwise.is_numeric() {
-                        let sstr = self.parse_str(stream, &mut tokens)?;
-                        tokens.push(sstr);
-                    } else {
-                        panic!("wrong token {}", stream.peek())
-                    }
-                }
-            }
-            tokens.push(BEncodingToken::ETok);
+            let tok = self.parse_types(stream)?;
+            tokens.push(tok);
         }
         Ok(tokens)
+    }
+
+    fn parse_types(&self, stream: &mut BasicStream<char>) -> Result<BEncodingAST, ()> {
+        match stream.peek() {
+            'i' => self.parse_int(stream),
+            'l' => self.parse_list(stream),
+            'd' => self.parse_dic(stream),
+            // FIXME: return an error
+            otherwise => {
+                if otherwise.is_numeric() {
+                    self.parse_str(stream)
+                } else {
+                    panic!("wrong token {}", stream.peek())
+                }
+            }
+        }
     }
 
     fn match_or_eof(&self, stream: &mut BasicStream<char>, tok: char) -> bool {
@@ -68,38 +65,30 @@ impl Scanner {
     ///
     /// Example: i3e represents the integer "3"
     /// Example: i-3e represents the integer "-3"
-    pub fn parse_int(
-        &self,
-        stream: &mut BasicStream<char>,
-        toks: &mut Vec<BEncodingToken>,
-    ) -> Result<BEncodingToken, ()> {
+    pub fn parse_int(&self, stream: &mut BasicStream<char>) -> Result<BEncodingAST, ()> {
         // check if there is the stop words and check if
         // it is the single one.
         let tok = stream.advance().to_owned();
         assert_eq!(tok, 'i', "expected `i` but found {tok}");
-        toks.push(BEncodingToken::ITok);
         let mut buff = String::new();
         while !stream.match_tok("e") {
             let tok = stream.advance();
             buff += &tok.to_string();
         }
-        let res = BEncodingToken::RawStr(buff);
         assert!(
             stream.advance().to_string() == "e",
             "stop token `e` not found"
         );
-        Ok(res)
+        // SAFETY: It is safe to unwrap here because
+        // because otherwise it is a bug.
+        Ok(BEncodingAST::Int(buff.parse().unwrap()))
     }
 
     /// Parsing a string from an input stream.
     ///
     /// Example: 4: spam represents the string "spam"
     /// Example: 0: represents the empty string ""
-    pub fn parse_str(
-        &self,
-        stream: &mut BasicStream<char>,
-        toks: &mut Vec<BEncodingToken>,
-    ) -> Result<BEncodingToken, ()> {
+    pub fn parse_str(&self, stream: &mut BasicStream<char>) -> Result<BEncodingAST, ()> {
         let ssize = stream.advance().to_owned();
         assert!(
             ssize.is_numeric(),
@@ -107,19 +96,17 @@ impl Scanner {
         );
         let sep = stream.advance().to_owned();
         assert_eq!(sep, ':', "expected a separator `:` but found {sep}");
-        toks.push(BEncodingToken::DotDot);
 
         // FIXME: add inside albert stream the method to advance by chunk!
         let mut step: i64 = 0;
         let size: i64 = ssize.to_string().parse().unwrap();
         let mut buff = String::new();
-        while step <= size {
+        while step < size {
             let tok = stream.advance().to_owned();
             buff += &tok.to_string();
             step += 1;
         }
-        let res = BEncodingToken::RawStr(buff);
-        Ok(res)
+        Ok(BEncodingAST::Str(buff))
     }
 
     /// Parsing a list of element from a input stream
@@ -127,21 +114,21 @@ impl Scanner {
     ///
     /// Example: l4:spam4:eggse represents the list of two strings: [ "spam", "eggs" ]
     /// Example: le represents an empty list: []
-    pub fn parse_list(
-        &self,
-        stream: &mut BasicStream<char>,
-        toks: &mut Vec<BEncodingToken>,
-    ) -> BEncodingToken {
+    pub fn parse_list(&self, stream: &mut BasicStream<char>) -> Result<BEncodingAST, ()> {
         let tok = stream.advance().to_owned();
         assert_eq!(tok, 'l', "expected `i` but found {tok}");
-        toks.push(BEncodingToken::LTok);
 
-        let mut buff = String::new();
-        while self.with_next_match(stream, 'e', 'e') {
-            let tok = stream.advance().to_owned();
-            buff += tok.to_string().as_str();
+        let mut elements = Vec::new();
+        while !stream.match_tok("e") {
+            let elem = self.parse_types(stream)?;
+            elements.push(Rc::new(elem));
         }
-        BEncodingToken::RawStr(buff)
+        assert!(
+            stream.advance().to_string() == "e",
+            "stop token `e` not found"
+        );
+
+        Ok(BEncodingAST::List(elements))
     }
 
     /// Parsing a dictionary from an input stream
@@ -151,21 +138,22 @@ impl Scanner {
     /// Example: d4:spaml1:a1:bee represents the dictionary { "spam" => [ "a", "b" ] }
     /// Example: d9:publisher3:bob17:publisher-webpage15:www.example.com18:publisher.location4:homee represents { "publisher" => "bob", "publisher-webpage" => "www.example.com", "publisher.location" => "home" }
     /// Example: de represents an empty dictionary {}
-    pub fn parse_dic(
-        &self,
-        stream: &mut BasicStream<char>,
-        toks: &mut Vec<BEncodingToken>,
-    ) -> BEncodingToken {
+    pub fn parse_dic(&self, stream: &mut BasicStream<char>) -> Result<BEncodingAST, ()> {
         let tok = stream.advance().to_owned();
         assert_eq!(tok, 'd', "expected `d` but found {tok}");
-        toks.push(BEncodingToken::DTok);
 
-        let mut buff = String::new();
-        while self.with_next_match(stream, 'e', 'e') {
-            let tok = stream.advance().to_owned();
-            buff += tok.to_string().as_str();
+        let mut elements = Vec::new();
+        while !stream.match_tok("e") {
+            let key = self.parse_types(stream)?;
+            let value = self.parse_types(stream)?;
+            elements.push((key.into(), value.into()));
         }
-        BEncodingToken::RawStr(buff)
+        assert!(
+            stream.advance().to_string() == "e",
+            "stop token `e` not found"
+        );
+
+        Ok(BEncodingAST::Dic(elements))
     }
 }
 
@@ -179,7 +167,7 @@ mod tests {
         let mut stream = Scanner::make_stream(input);
         let scaner = Scanner {};
         let toks = scaner.scan(&mut stream).unwrap();
-        assert_eq!(toks.len(), 3);
+        assert_eq!(toks.len(), 1);
     }
 
     #[test]
@@ -188,6 +176,26 @@ mod tests {
         let mut stream = Scanner::make_stream(input);
         let scaner = Scanner {};
         let toks = scaner.scan(&mut stream).unwrap();
-        assert_eq!(toks.len(), 3);
+        assert_eq!(toks.len(), 1);
+    }
+
+    #[test]
+    fn parse_list_test() {
+        let input = "l4:spam4:eggse";
+
+        let mut stream = Scanner::make_stream(input);
+        let scaner = Scanner {};
+        let toks = scaner.scan(&mut stream).unwrap();
+        assert_eq!(toks.len(), 1);
+    }
+
+    #[test]
+    fn parse_dic_test() {
+        let input = "d4:spam4:eggse";
+
+        let mut stream = Scanner::make_stream(input);
+        let scaner = Scanner {};
+        let toks = scaner.scan(&mut stream).unwrap();
+        assert_eq!(toks.len(), 1);
     }
 }
