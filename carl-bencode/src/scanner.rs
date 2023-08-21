@@ -46,12 +46,6 @@ impl Scanner {
                     }
                 }
             }
-            let stop_tok = stream.advance();
-            assert_eq!(
-                stop_tok.to_owned(),
-                'e',
-                "expected stop token `e` received {stop_tok}"
-            );
             tokens.push(BEncodingToken::ETok);
         }
         Ok(tokens)
@@ -90,6 +84,10 @@ impl Scanner {
             buff += &tok.to_string();
         }
         let res = BEncodingToken::RawStr(buff);
+        assert!(
+            stream.advance().to_string() == "e",
+            "stop token `e` not found"
+        );
         Ok(res)
     }
 
@@ -117,9 +115,9 @@ impl Scanner {
         let mut buff = String::new();
         while step <= size {
             let tok = stream.advance().to_owned();
-            buff += tok.to_string().as_str();
+            buff += &tok.to_string();
+            step += 1;
         }
-        step += 1;
         let res = BEncodingToken::RawStr(buff);
         Ok(res)
     }
@@ -178,6 +176,15 @@ mod tests {
     #[test]
     fn parse_int_test() {
         let input = "i3e";
+        let mut stream = Scanner::make_stream(input);
+        let scaner = Scanner {};
+        let toks = scaner.scan(&mut stream).unwrap();
+        assert_eq!(toks.len(), 3);
+    }
+
+    #[test]
+    fn parse_string_test() {
+        let input = "4:spam";
         let mut stream = Scanner::make_stream(input);
         let scaner = Scanner {};
         let toks = scaner.scan(&mut stream).unwrap();
