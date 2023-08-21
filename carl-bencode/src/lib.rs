@@ -5,13 +5,12 @@
 pub mod ast;
 pub mod scanner;
 
+// Realiasing in a more readble type.
+pub use ast::BEncodingAST as Value;
+
 /// Decoder trait that define the interface for
 /// a decoder.
 pub trait Decoder {
-    type Output;
-
     /// decode the type from a sequence of bytes
-    fn decode<T>(self) -> T;
-
-    fn raw_decode(self) -> Self::Output;
+    fn decode(self) -> Result<Value, ()>;
 }
