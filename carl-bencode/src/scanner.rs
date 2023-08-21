@@ -85,9 +85,9 @@ impl Scanner {
         assert_eq!(tok, 'i', "expected `i` but found {tok}");
         toks.push(BEncodingToken::ITok);
         let mut buff = String::new();
-        while self.with_next_match(stream, 'e', 'e') {
-            let tok = stream.advance().to_owned();
-            buff += tok.to_string().as_str();
+        while !stream.match_tok("e") {
+            let tok = stream.advance();
+            buff += &tok.to_string();
         }
         let res = BEncodingToken::RawStr(buff);
         Ok(res)
@@ -118,8 +118,8 @@ impl Scanner {
         while step <= size {
             let tok = stream.advance().to_owned();
             buff += tok.to_string().as_str();
-            step += 1;
         }
+        step += 1;
         let res = BEncodingToken::RawStr(buff);
         Ok(res)
     }
@@ -181,6 +181,6 @@ mod tests {
         let mut stream = Scanner::make_stream(input);
         let scaner = Scanner {};
         let toks = scaner.scan(&mut stream).unwrap();
-        assert_eq!(toks.len(), 4);
+        assert_eq!(toks.len(), 3);
     }
 }
