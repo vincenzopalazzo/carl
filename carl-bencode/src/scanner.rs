@@ -66,14 +66,19 @@ impl Scanner {
     /// this is useful to parse stop tok like the `e`.
     fn with_next_match(&self, stream: &mut BasicStream<char>, tok: char, tok_next: char) -> bool {
         let fut = stream.lookup(2).cloned();
-        self.match_or_eof(stream, tok) || (!stream.is_end() && fut.is_some() && fut.unwrap().to_owned() == tok_next)
+        self.match_or_eof(stream, tok)
+            || (!stream.is_end() && fut.is_some() && fut.unwrap().to_owned() == tok_next)
     }
 
     /// Parsing a integer from an input stream.
     ///
     /// Example: i3e represents the integer "3"
     /// Example: i-3e represents the integer "-3"
-    pub fn parse_int(&self, stream: &mut BasicStream<char>, toks: &mut Vec<BEncodingToken>) -> Result<BEncodingToken, ()> {
+    pub fn parse_int(
+        &self,
+        stream: &mut BasicStream<char>,
+        toks: &mut Vec<BEncodingToken>,
+    ) -> Result<BEncodingToken, ()> {
         // check if there is the stop words and check if
         // it is the single one.
         let tok = stream.advance().to_owned();
@@ -124,7 +129,11 @@ impl Scanner {
     ///
     /// Example: l4:spam4:eggse represents the list of two strings: [ "spam", "eggs" ]
     /// Example: le represents an empty list: []
-    pub fn parse_list(&self, stream: &mut BasicStream<char>, toks: &mut Vec<BEncodingToken>) -> BEncodingToken {
+    pub fn parse_list(
+        &self,
+        stream: &mut BasicStream<char>,
+        toks: &mut Vec<BEncodingToken>,
+    ) -> BEncodingToken {
         let tok = stream.advance().to_owned();
         assert_eq!(tok, 'l', "expected `i` but found {tok}");
         toks.push(BEncodingToken::LTok);
@@ -144,7 +153,11 @@ impl Scanner {
     /// Example: d4:spaml1:a1:bee represents the dictionary { "spam" => [ "a", "b" ] }
     /// Example: d9:publisher3:bob17:publisher-webpage15:www.example.com18:publisher.location4:homee represents { "publisher" => "bob", "publisher-webpage" => "www.example.com", "publisher.location" => "home" }
     /// Example: de represents an empty dictionary {}
-    pub fn parse_dic(&self, stream: &mut BasicStream<char>, toks: &mut Vec<BEncodingToken>) -> BEncodingToken {
+    pub fn parse_dic(
+        &self,
+        stream: &mut BasicStream<char>,
+        toks: &mut Vec<BEncodingToken>,
+    ) -> BEncodingToken {
         let tok = stream.advance().to_owned();
         assert_eq!(tok, 'd', "expected `d` but found {tok}");
         toks.push(BEncodingToken::DTok);
@@ -158,7 +171,6 @@ impl Scanner {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use crate::scanner::Scanner;
@@ -167,7 +179,7 @@ mod tests {
     fn parse_int_test() {
         let input = "i3e";
         let mut stream = Scanner::make_stream(input);
-        let scaner = Scanner{};
+        let scaner = Scanner {};
         let toks = scaner.scan(&mut stream).unwrap();
         assert_eq!(toks.len(), 4);
     }
