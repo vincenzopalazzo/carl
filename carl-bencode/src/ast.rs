@@ -1,5 +1,4 @@
 //! Bencoding AST specification.
-use std::collections::HashMap;
 use std::rc::Rc;
 
 /// AST result after the parsing of the token stream!

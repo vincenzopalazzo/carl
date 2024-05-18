@@ -3,5 +3,5 @@
 members = [
     "carl-cli",
     "carl-proto",
-    "carl-bencode",
+    "carl-bencode", "carld",
 ]
