@@ -12,5 +12,5 @@ pub use ast::BEncodingAST as Value;
 /// a decoder.
 pub trait Decoder {
     /// decode the type from a sequence of bytes
-    fn decode(self) -> Result<Value, ()>;
+    fn decode(self) -> anyhow::Result<Value>;
 }

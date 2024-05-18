@@ -1,5 +1,4 @@
 //! Scanner Bencoding format
-use std::collections::HashMap;
 use std::rc::Rc;
 use std::vec::Vec;
 
@@ -23,7 +22,7 @@ impl Scanner {
     /// data model language to parser. However, it is possible to
     /// simplify a lot the parser logic and make the logic
     /// more readble.
-    pub fn scan(&self, stream: &mut BasicStream<char>) -> Result<Vec<BEncodingAST>, ()> {
+    pub fn scan(&self, stream: &mut BasicStream<char>) -> anyhow::Result<Vec<BEncodingAST>> {
         let mut tokens = Vec::new();
         while !stream.is_end() {
             let tok = self.parse_types(stream)?;
@@ -32,7 +31,7 @@ impl Scanner {
         Ok(tokens)
     }
 
-    fn parse_types(&self, stream: &mut BasicStream<char>) -> Result<BEncodingAST, ()> {
+    fn parse_types(&self, stream: &mut BasicStream<char>) -> anyhow::Result<BEncodingAST> {
         match stream.peek() {
             'i' => self.parse_int(stream),
             'l' => self.parse_list(stream),
@@ -42,7 +41,7 @@ impl Scanner {
                 if otherwise.is_numeric() {
                     self.parse_str(stream)
                 } else {
-                    panic!("wrong token {}", stream.peek())
+                    anyhow::bail!("wrong token {}", stream.peek())
                 }
             }
         }
@@ -65,7 +64,7 @@ impl Scanner {
     ///
     /// Example: i3e represents the integer "3"
     /// Example: i-3e represents the integer "-3"
-    pub fn parse_int(&self, stream: &mut BasicStream<char>) -> Result<BEncodingAST, ()> {
+    pub fn parse_int(&self, stream: &mut BasicStream<char>) -> anyhow::Result<BEncodingAST> {
         // check if there is the stop words and check if
         // it is the single one.
         let tok = stream.advance().to_owned();
@@ -88,7 +87,7 @@ impl Scanner {
     ///
     /// Example: 4: spam represents the string "spam"
     /// Example: 0: represents the empty string ""
-    pub fn parse_str(&self, stream: &mut BasicStream<char>) -> Result<BEncodingAST, ()> {
+    pub fn parse_str(&self, stream: &mut BasicStream<char>) -> anyhow::Result<BEncodingAST> {
         let ssize = stream.advance().to_owned();
         assert!(
             ssize.is_numeric(),
@@ -114,7 +113,7 @@ impl Scanner {
     ///
     /// Example: l4:spam4:eggse represents the list of two strings: [ "spam", "eggs" ]
     /// Example: le represents an empty list: []
-    pub fn parse_list(&self, stream: &mut BasicStream<char>) -> Result<BEncodingAST, ()> {
+    pub fn parse_list(&self, stream: &mut BasicStream<char>) -> anyhow::Result<BEncodingAST> {
         let tok = stream.advance().to_owned();
         assert_eq!(tok, 'l', "expected `i` but found {tok}");
 
@@ -138,7 +137,7 @@ impl Scanner {
     /// Example: d4:spaml1:a1:bee represents the dictionary { "spam" => [ "a", "b" ] }
     /// Example: d9:publisher3:bob17:publisher-webpage15:www.example.com18:publisher.location4:homee represents { "publisher" => "bob", "publisher-webpage" => "www.example.com", "publisher.location" => "home" }
     /// Example: de represents an empty dictionary {}
-    pub fn parse_dic(&self, stream: &mut BasicStream<char>) -> Result<BEncodingAST, ()> {
+    pub fn parse_dic(&self, stream: &mut BasicStream<char>) -> anyhow::Result<BEncodingAST> {
         let tok = stream.advance().to_owned();
         assert_eq!(tok, 'd', "expected `d` but found {tok}");
 
