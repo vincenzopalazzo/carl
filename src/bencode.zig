@@ -158,7 +158,7 @@ fn decodeString(allocator: Allocator, input: []const u8, pos: *usize) DecodeErro
     const length = std.fmt.parseUnsigned(usize, len_str, 10) catch return error.InvalidStringLength;
     pos.* += 1; // skip ':'
 
-    if (pos.* + length > input.len) return error.UnexpectedEnd;
+    if (length > input.len - pos.*) return error.UnexpectedEnd;
 
     const data = allocator.alloc(u8, length) catch return error.OutOfMemory;
     @memcpy(data, input[pos.* .. pos.* + length]);
