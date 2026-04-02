@@ -85,7 +85,10 @@ pub const Message = union(enum) {
         block: []const u8,
     };
 
-    /// Free any heap-allocated data owned by this message.
+    /// Free heap-allocated data owned by this message. Only call this on
+    /// messages returned by `parseMessage`, which allocates bitfield and
+    /// piece block data. Do NOT call on caller-constructed messages passed
+    /// to `serializeMessage` -- those borrow their data.
     pub fn deinit(self: Message, allocator: Allocator) void {
         switch (self) {
             .bitfield => |data| allocator.free(data),
