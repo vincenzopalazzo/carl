@@ -1,0 +1,13 @@
+.{
+    .name = .carl,
+    .version = "0.1.0",
+    .fingerprint = 0x18cf10e1f7c720be,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+    },
+}

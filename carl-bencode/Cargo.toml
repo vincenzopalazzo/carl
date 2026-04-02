@@ -1,7 +1,0 @@
-[package]
-name = "carl-bencode"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-albert_stream = "0.0.4"

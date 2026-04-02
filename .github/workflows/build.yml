@@ -1,50 +1,33 @@
 on: [push, pull_request]
 
-name: Sanity Check codebase
+name: CI
 
 jobs:
-  check:
-    name: Build
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        node: [nightly]
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v2
-
-      - name: Install toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: ${{ matrix.node }}
-          override: true
-
-      - name: Run cargo check
-        uses: actions-rs/cargo@v1
-        with:
-          command: check
-
-      - name: Run cargo test
-        run: make check
-
-  lints:
-    name: Lints
+  build:
+    name: Build & Test
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout sources
-        uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
-      - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
+      - uses: mlugg/setup-zig@v2
         with:
-          profile: minimal
-          toolchain: stable
-          override: true
-          components: rustfmt, clippy
+          version: 0.15.2
 
-      - name: Run cargo fmt
-        uses: actions-rs/cargo@v1
+      - name: Build
+        run: zig build
+
+      - name: Test
+        run: zig build test
+
+  fmt:
+    name: Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
         with:
-          command: fmt
-          args: --all -- --check
+          version: 0.15.2
+
+      - name: Check formatting
+        run: zig fmt --check src/
