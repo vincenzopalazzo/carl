@@ -95,11 +95,15 @@ pub const Message = union(enum) {
     }
 };
 
+/// Maximum wire message length (2MB). Generous upper bound -- typical
+/// piece blocks are 16KB. Prevents memory exhaustion from malicious peers.
+pub const max_message_len: u32 = 1 << 21;
+
 pub const ParseError = error{
     InvalidProtocol,
-    UnexpectedEnd,
     InvalidLength,
     UnknownMessageId,
+    MessageTooLarge,
     OutOfMemory,
 };
 
@@ -157,6 +161,9 @@ pub fn parseMessage(allocator: Allocator, buf: []const u8) ParseError!?struct { 
     // Keep-alive
     if (length == 0) return .{ .msg = .keep_alive, .consumed = 4 };
 
+    // Reject oversized messages before buffering
+    if (length > max_message_len) return error.MessageTooLarge;
+
     const total = 4 + @as(usize, length);
     if (buf.len < total) return null; // incomplete message
 
@@ -164,10 +171,22 @@ pub fn parseMessage(allocator: Allocator, buf: []const u8) ParseError!?struct { 
     const payload = buf[5..total];
 
     const msg: Message = switch (id) {
-        .choke => .choke,
-        .unchoke => .unchoke,
-        .interested => .interested,
-        .not_interested => .not_interested,
+        .choke => blk: {
+            if (payload.len != 0) return error.InvalidLength;
+            break :blk .choke;
+        },
+        .unchoke => blk: {
+            if (payload.len != 0) return error.InvalidLength;
+            break :blk .unchoke;
+        },
+        .interested => blk: {
+            if (payload.len != 0) return error.InvalidLength;
+            break :blk .interested;
+        },
+        .not_interested => blk: {
+            if (payload.len != 0) return error.InvalidLength;
+            break :blk .not_interested;
+        },
         .have => blk: {
             if (payload.len != 4) return error.InvalidLength;
             break :blk .{ .have = std.mem.readInt(u32, payload[0..4], .big) };
@@ -241,6 +260,7 @@ test "handshake roundtrip" {
     try std.testing.expectEqualStrings(protocol_string, buf[1..20]);
 
     const parsed = try Handshake.parse(&buf);
+    try std.testing.expectEqual(hs.reserved, parsed.reserved);
     try std.testing.expectEqual(hs.info_hash, parsed.info_hash);
     try std.testing.expectEqual(hs.peer_id, parsed.peer_id);
 }
