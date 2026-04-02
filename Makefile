@@ -1,19 +1,15 @@
-CC=cargo
-FMT=fmt
+ZIG ?= zig
 
-OPTIONS=
+default: build
 
-default: fmt
-	$(CC) build
-
-fmt:
-	$(CC) fmt --all
+build:
+	$(ZIG) build
 
 check:
-	$(CC) test --all
+	$(ZIG) build test
 
-example:
-	@echo "nothing yet!"
+fmt:
+	$(ZIG) fmt src/
 
 clean:
-	$(CC) clean
+	rm -rf zig-out .zig-cache zig-cache
