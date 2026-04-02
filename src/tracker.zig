@@ -1,7 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const bencode = @import("bencode.zig");
-const metainfo = @import("metainfo.zig");
 
 /// A peer returned by the tracker.
 pub const Peer = struct {
@@ -143,20 +142,20 @@ pub fn parseAnnounceResponse(
     }
 
     const interval_val = root.dictGet("interval") orelse return error.InvalidResponse;
-    const interval: u64 = @intCast(interval_val.asInt() orelse return error.InvalidResponse);
+    const interval: u64 = std.math.cast(u64, interval_val.asInt() orelse return error.InvalidResponse) orelse return error.InvalidResponse;
 
     const min_interval = if (root.dictGet("min interval")) |v|
-        if (v.asInt()) |i| @as(?u64, @intCast(i)) else null
+        if (v.asInt()) |i| std.math.cast(u64, i) else null
     else
         null;
 
     const complete = if (root.dictGet("complete")) |v|
-        if (v.asInt()) |i| @as(?u64, @intCast(i)) else null
+        if (v.asInt()) |i| std.math.cast(u64, i) else null
     else
         null;
 
     const incomplete = if (root.dictGet("incomplete")) |v|
-        if (v.asInt()) |i| @as(?u64, @intCast(i)) else null
+        if (v.asInt()) |i| std.math.cast(u64, i) else null
     else
         null;
 
@@ -279,7 +278,7 @@ fn parseDictPeers(allocator: Allocator, peer_list: []const bencode.Value) Tracke
         const ip = parseIpv4(ip_str) orelse continue;
         peers.append(allocator, .{
             .ip = ip,
-            .port = @intCast(port_int),
+            .port = std.math.cast(u16, port_int) orelse continue,
         }) catch return error.OutOfMemory;
     }
 

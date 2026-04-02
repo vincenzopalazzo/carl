@@ -117,7 +117,9 @@ pub fn parse(allocator: Allocator, data: []const u8) MetainfoError!Metainfo {
 
     const info_val = root.dictGet("info") orelse return error.MissingField;
 
-    const raw_info = extractRawInfo(allocator, data) catch return error.InvalidTorrent;
+    // Re-encode the info dict to get canonical bytes for info_hash.
+    // This is correct because bencode has a single canonical encoding.
+    const raw_info = bencode.encode(allocator, info_val) catch return error.OutOfMemory;
     errdefer allocator.free(raw_info);
 
     const name_val = info_val.dictGet("name") orelse return error.MissingField;
@@ -126,7 +128,7 @@ pub fn parse(allocator: Allocator, data: []const u8) MetainfoError!Metainfo {
     errdefer allocator.free(name);
 
     const pl_val = info_val.dictGet("piece length") orelse return error.MissingField;
-    const piece_length: u64 = @intCast(pl_val.asInt() orelse return error.InvalidTorrent);
+    const piece_length: u64 = std.math.cast(u64, pl_val.asInt() orelse return error.InvalidTorrent) orelse return error.InvalidTorrent;
 
     const pieces_val = info_val.dictGet("pieces") orelse return error.MissingField;
     const pieces_str = pieces_val.asString() orelse return error.InvalidTorrent;
@@ -154,7 +156,7 @@ pub fn parse(allocator: Allocator, data: []const u8) MetainfoError!Metainfo {
         break :blk files_arr.toOwnedSlice(allocator) catch return error.OutOfMemory;
     } else blk: {
         const length_val = info_val.dictGet("length") orelse return error.MissingField;
-        const length: u64 = @intCast(length_val.asInt() orelse return error.InvalidTorrent);
+        const length: u64 = std.math.cast(u64, length_val.asInt() orelse return error.InvalidTorrent) orelse return error.InvalidTorrent;
 
         const path_comp = allocator.dupe(u8, name_str) catch return error.OutOfMemory;
         const path = allocator.alloc([]const u8, 1) catch {
@@ -217,7 +219,7 @@ pub fn parse(allocator: Allocator, data: []const u8) MetainfoError!Metainfo {
 
 fn parseFileEntry(allocator: Allocator, value: Value) MetainfoError!FileInfo {
     const length_val = value.dictGet("length") orelse return error.MissingField;
-    const length: u64 = @intCast(length_val.asInt() orelse return error.InvalidTorrent);
+    const length: u64 = std.math.cast(u64, length_val.asInt() orelse return error.InvalidTorrent) orelse return error.InvalidTorrent;
 
     const path_val = value.dictGet("path") orelse return error.MissingField;
     const path_list = path_val.asList() orelse return error.InvalidTorrent;
@@ -241,53 +243,6 @@ fn parseFileEntry(allocator: Allocator, value: Value) MetainfoError!FileInfo {
         .length = length,
         .path = path.toOwnedSlice(allocator) catch return error.OutOfMemory,
     };
-}
-
-/// Extract the raw bencoded bytes of the info dictionary value from the
-/// torrent file. This is needed to compute the info_hash (SHA-1 of the
-/// bencoded info dict).
-fn extractRawInfo(allocator: Allocator, data: []const u8) ![]const u8 {
-    const needle = "4:info";
-    var i: usize = 0;
-    while (i + needle.len < data.len) : (i += 1) {
-        if (std.mem.eql(u8, data[i .. i + needle.len], needle)) {
-            const info_start = i + needle.len;
-            if (info_start >= data.len) continue;
-            if (data[info_start] != 'd') continue;
-
-            var pos: usize = info_start;
-            var depth: usize = 0;
-            while (pos < data.len) {
-                switch (data[pos]) {
-                    'd', 'l' => {
-                        depth += 1;
-                        pos += 1;
-                    },
-                    'e' => {
-                        depth -= 1;
-                        pos += 1;
-                        if (depth == 0) break;
-                    },
-                    'i' => {
-                        pos += 1;
-                        while (pos < data.len and data[pos] != 'e') : (pos += 1) {}
-                        pos += 1;
-                    },
-                    '0'...'9' => {
-                        const len_start = pos;
-                        while (pos < data.len and data[pos] >= '0' and data[pos] <= '9') : (pos += 1) {}
-                        if (pos >= data.len or data[pos] != ':') return error.UnexpectedByte;
-                        const slen = std.fmt.parseUnsigned(usize, data[len_start..pos], 10) catch return error.InvalidStringLength;
-                        pos += 1 + slen;
-                    },
-                    else => return error.UnexpectedByte,
-                }
-            }
-
-            return allocator.dupe(u8, data[info_start..pos]);
-        }
-    }
-    return error.MissingField;
 }
 
 /// Compute the SHA-1 info_hash from the raw info dictionary bytes.

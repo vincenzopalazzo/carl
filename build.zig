@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Library module (bencode + metainfo)
+    // Library module
     const lib_mod = b.addModule("carl", .{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
