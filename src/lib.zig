@@ -17,4 +17,5 @@ test {
     _ = piece;
     _ = storage;
     _ = peer;
+    _ = @import("integration_test.zig");
 }

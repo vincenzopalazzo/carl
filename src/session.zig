@@ -18,7 +18,7 @@ const unchoke_interval_secs: i64 = 10;
 const optimistic_interval_secs: i64 = 30;
 
 /// Global flag for graceful shutdown on SIGINT.
-var shutdown_requested: bool = false;
+pub var shutdown_requested: bool = false;
 
 fn sigintHandler(_: i32) callconv(.c) void {
     shutdown_requested = true;
@@ -147,8 +147,8 @@ pub const Session = struct {
             .piece_len = meta.piece_length,
             .num_pieces = num_pieces,
             .running = true,
-            .last_unchoke_time = now,
-            .last_optimistic_time = now,
+            .last_unchoke_time = now - unchoke_interval_secs, // trigger immediately on first tick
+            .last_optimistic_time = now - optimistic_interval_secs,
             .optimistic_peer = null,
             .endgame_active = false,
             .start_time = now,
@@ -837,6 +837,62 @@ pub const Session = struct {
                 self.allocator.destroy(p);
                 continue;
             };
+        }
+    }
+
+    /// Connect directly to a peer address, bypassing the tracker.
+    /// Useful for testing and for manual peer addition.
+    pub fn connectDirectPeer(self: *Session, addr: std.net.Address) !void {
+        if (self.peers.items.len >= max_peers) return;
+
+        const p = self.allocator.create(peer_mod.PeerConnection) catch return error.OutOfMemory;
+        p.* = peer_mod.PeerConnection.init(self.allocator, addr);
+
+        p.connect() catch {
+            p.deinit();
+            self.allocator.destroy(p);
+            return error.ConnectionFailed;
+        };
+
+        p.sendHandshake(self.info_hash, self.peer_id) catch {
+            p.deinit();
+            self.allocator.destroy(p);
+            return error.OutOfMemory;
+        };
+
+        self.peers.append(self.allocator, p) catch {
+            p.deinit();
+            self.allocator.destroy(p);
+            return error.OutOfMemory;
+        };
+    }
+
+    /// Run a single iteration of the event loop (for testing).
+    pub fn tick(self: *Session) !void {
+        if (self.mode == .download and self.our_bitfield.isComplete()) {
+            self.running = false;
+            return;
+        }
+
+        var fds: [max_peers + 1]std.posix.pollfd = undefined;
+        const nfds = self.buildPollFds(&fds);
+        _ = std.posix.poll(fds[0..nfds], 50) catch 0;
+        self.processPollResults(fds[0..nfds]) catch {};
+        self.scheduleRequests() catch {};
+        // Run choking + cleanup (needed for unchoking peers in tests)
+        self.runChokingAlgorithm();
+        // Clean up disconnected peers
+        var i: usize = 0;
+        while (i < self.peers.items.len) {
+            if (self.peers.items[i].state == .disconnected) {
+                const p = self.peers.items[i];
+                if (p.peer_bitfield) |*bf| self.removeAvailability(bf);
+                p.deinit();
+                self.allocator.destroy(p);
+                _ = self.peers.orderedRemove(i);
+            } else {
+                i += 1;
+            }
         }
     }
 
