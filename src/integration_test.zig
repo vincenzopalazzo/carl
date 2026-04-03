@@ -81,6 +81,7 @@ fn buildTestMetainfo(
             .creation_date = null,
             .created_by = null,
             .raw_info = raw_info,
+            .url_list = null,
         },
         .allocator = allocator,
     };

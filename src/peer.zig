@@ -3,6 +3,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const wire = @import("wire.zig");
 const piece_mod = @import("piece.zig");
+const extension = @import("extension.zig");
 
 pub const PeerState = enum {
     connecting,
@@ -28,6 +29,11 @@ pub const PeerConnection = struct {
 
     peer_bitfield: ?piece_mod.Bitfield,
     peer_id: ?[20]u8,
+
+    // BEP 10 extension state
+    supports_extensions: bool,
+    peer_ut_metadata_id: ?u8, // peer's assigned ID for ut_metadata
+    peer_metadata_size: ?u32,
 
     // Buffers
     recv_buf: std.ArrayList(u8),
@@ -57,6 +63,9 @@ pub const PeerConnection = struct {
             .peer_interested = false,
             .peer_bitfield = null,
             .peer_id = null,
+            .supports_extensions = false,
+            .peer_ut_metadata_id = null,
+            .peer_metadata_size = null,
             .recv_buf = .empty,
             .send_buf = .empty,
             .send_pos = 0,
@@ -98,7 +107,7 @@ pub const PeerConnection = struct {
 
         // Blocking connect with timeout
         std.posix.connect(sock, &self.address.any, @sizeOf(std.posix.sockaddr.in)) catch {
-            std.posix.close(sock);
+            // errdefer above handles closing the socket
             self.state = .disconnected;
             return error.ConnectionFailed;
         };
@@ -109,8 +118,10 @@ pub const PeerConnection = struct {
 
     /// Queue the handshake for sending.
     pub fn sendHandshake(self: *PeerConnection, info_hash: [20]u8, peer_id: [20]u8) !void {
+        var reserved = [_]u8{0} ** 8;
+        extension.setExtensionBit(&reserved); // advertise BEP 10
         const hs = wire.Handshake{
-            .reserved = [_]u8{0} ** 8,
+            .reserved = reserved,
             .info_hash = info_hash,
             .peer_id = peer_id,
         };

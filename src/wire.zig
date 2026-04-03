@@ -54,6 +54,7 @@ pub const MessageId = enum(u8) {
     request = 6,
     piece = 7,
     cancel = 8,
+    extended = 20, // BEP 10
 
     pub fn fromByte(b: u8) ParseError!MessageId {
         return std.meta.intToEnum(MessageId, b) catch return error.UnknownMessageId;
@@ -72,6 +73,8 @@ pub const Message = union(enum) {
     request: BlockRequest,
     piece: PieceData,
     cancel: BlockRequest,
+    /// BEP 10 extension message. Payload includes extension ID + data.
+    extended: []const u8,
 
     pub const BlockRequest = struct {
         index: u32,
@@ -89,10 +92,13 @@ pub const Message = union(enum) {
     /// messages returned by `parseMessage`, which allocates bitfield and
     /// piece block data. Do NOT call on caller-constructed messages passed
     /// to `serializeMessage` -- those borrow their data.
+    /// Free heap-allocated data owned by this message. Only call on
+    /// messages returned by `parseMessage`, not caller-constructed ones.
     pub fn deinit(self: Message, allocator: Allocator) void {
         switch (self) {
             .bitfield => |data| allocator.free(data),
             .piece => |pd| allocator.free(pd.block),
+            .extended => |data| allocator.free(data),
             else => {},
         }
     }
@@ -140,6 +146,14 @@ pub fn serializeMessage(allocator: Allocator, msg: Message) error{OutOfMemory}![
         },
         .request => |br| return serializeBlockRequest(allocator, .request, br),
         .cancel => |br| return serializeBlockRequest(allocator, .cancel, br),
+        .extended => |ext_payload| {
+            const total: u32 = std.math.cast(u32, 1 + ext_payload.len) orelse return error.OutOfMemory;
+            const buf = allocator.alloc(u8, 4 + 1 + ext_payload.len) catch return error.OutOfMemory;
+            std.mem.writeInt(u32, buf[0..4], total, .big);
+            buf[4] = @intFromEnum(MessageId.extended);
+            @memcpy(buf[5..][0..ext_payload.len], ext_payload);
+            return buf;
+        },
         .piece => |pd| {
             const payload_len: u32 = std.math.cast(u32, 1 + 4 + 4 + pd.block.len) orelse return error.OutOfMemory;
             const buf = allocator.alloc(u8, 4 + 1 + 4 + 4 + pd.block.len) catch return error.OutOfMemory;
@@ -216,6 +230,11 @@ pub fn parseMessage(allocator: Allocator, buf: []const u8) ParseError!?struct { 
         .cancel => blk: {
             if (payload.len != 12) return error.InvalidLength;
             break :blk .{ .cancel = parseBlockRequest(payload) };
+        },
+        .extended => blk: {
+            const data = allocator.alloc(u8, payload.len) catch return error.OutOfMemory;
+            @memcpy(data, payload);
+            break :blk .{ .extended = data };
         },
     };
 

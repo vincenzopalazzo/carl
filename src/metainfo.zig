@@ -33,6 +33,8 @@ pub const Metainfo = struct {
     created_by: ?[]const u8,
     /// The raw bencoded info dictionary bytes, for computing info_hash.
     raw_info: []const u8,
+    /// Optional web seed URLs (BEP 19).
+    url_list: ?[]const []const u8,
 
     /// Free all memory owned by this struct.
     pub fn deinit(self: Metainfo, allocator: Allocator) void {
@@ -54,6 +56,10 @@ pub const Metainfo = struct {
         if (self.comment) |c| allocator.free(c);
         if (self.created_by) |c| allocator.free(c);
         allocator.free(self.raw_info);
+        if (self.url_list) |urls| {
+            for (urls) |url| allocator.free(url);
+            allocator.free(urls);
+        }
     }
 };
 
@@ -68,9 +74,14 @@ pub fn parse(allocator: Allocator, data: []const u8) MetainfoError!Metainfo {
     const root = bencode.decode(allocator, data) catch return error.InvalidTorrent;
     defer root.deinit(allocator);
 
-    const announce_val = root.dictGet("announce") orelse return error.MissingField;
-    const announce_str = announce_val.asString() orelse return error.InvalidTorrent;
-    const announce = allocator.dupe(u8, announce_str) catch return error.OutOfMemory;
+    // announce is optional -- many modern torrents only have announce-list
+    var announce: []const u8 = if (root.dictGet("announce")) |av|
+        if (av.asString()) |s|
+            allocator.dupe(u8, s) catch return error.OutOfMemory
+        else
+            allocator.dupe(u8, "") catch return error.OutOfMemory
+    else
+        allocator.dupe(u8, "") catch return error.OutOfMemory;
     errdefer allocator.free(announce);
 
     const announce_list = if (root.dictGet("announce-list")) |al_val| blk: {
@@ -114,6 +125,16 @@ pub fn parse(allocator: Allocator, data: []const u8) MetainfoError!Metainfo {
         }
         allocator.free(tiers);
     };
+
+    // If announce is empty, use first tracker from announce-list
+    if (announce.len == 0) {
+        if (announce_list) |tiers| {
+            if (tiers.len > 0 and tiers[0].len > 0) {
+                allocator.free(announce);
+                announce = allocator.dupe(u8, tiers[0][0]) catch return error.OutOfMemory;
+            }
+        }
+    }
 
     const info_val = root.dictGet("info") orelse return error.MissingField;
 
@@ -203,6 +224,35 @@ pub fn parse(allocator: Allocator, data: []const u8) MetainfoError!Metainfo {
     else
         null;
 
+    // Parse url-list (BEP 19 web seeds)
+    const url_list = if (root.dictGet("url-list")) |ul_val| blk: {
+        if (ul_val.asList()) |urls_list| {
+            var urls: std.ArrayList([]const u8) = .empty;
+            errdefer {
+                for (urls.items) |u| allocator.free(u);
+                urls.deinit(allocator);
+            }
+            for (urls_list) |url_val| {
+                const url_str = url_val.asString() orelse continue;
+                const url = allocator.dupe(u8, url_str) catch return error.OutOfMemory;
+                urls.append(allocator, url) catch {
+                    allocator.free(url);
+                    return error.OutOfMemory;
+                };
+            }
+            break :blk @as(?[]const []const u8, urls.toOwnedSlice(allocator) catch return error.OutOfMemory);
+        } else if (ul_val.asString()) |single_url| {
+            // Single URL string (not a list)
+            const url = allocator.dupe(u8, single_url) catch return error.OutOfMemory;
+            const urls = allocator.alloc([]const u8, 1) catch {
+                allocator.free(url);
+                return error.OutOfMemory;
+            };
+            urls[0] = url;
+            break :blk @as(?[]const []const u8, urls);
+        } else break :blk null;
+    } else null;
+
     return .{
         .announce = announce,
         .announce_list = announce_list,
@@ -214,6 +264,7 @@ pub fn parse(allocator: Allocator, data: []const u8) MetainfoError!Metainfo {
         .creation_date = creation_date,
         .created_by = created_by,
         .raw_info = raw_info,
+        .url_list = url_list,
     };
 }
 
@@ -311,7 +362,15 @@ test "info_hash computation" {
     try std.testing.expectEqualSlices(u8, &hash, &hash2);
 }
 
-test "missing announce rejects" {
+test "torrent without announce succeeds with empty announce" {
     const allocator = std.testing.allocator;
-    try std.testing.expectError(error.MissingField, parse(allocator, "d4:infod6:lengthi1e4:name4:test12:piece lengthi1e6:pieces0:ee"));
+    // Modern torrents may lack "announce" -- should parse successfully
+    const mi = try parse(allocator, "d4:infod6:lengthi1e4:name4:test12:piece lengthi1e6:pieces0:ee");
+    defer mi.deinit(allocator);
+    try std.testing.expectEqualStrings("", mi.announce);
+}
+
+test "missing info rejects" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.MissingField, parse(allocator, "d8:announce3:fooe"));
 }
