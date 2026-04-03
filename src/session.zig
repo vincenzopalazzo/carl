@@ -12,6 +12,8 @@ const piece_mod = @import("piece.zig");
 const storage_mod = @import("storage.zig");
 const peer_mod = @import("peer.zig");
 
+const log = std.log.scoped(.session);
+
 const max_peers: usize = 50;
 const unchoke_slots: usize = 4;
 const unchoke_interval_secs: i64 = 10;
@@ -101,8 +103,7 @@ pub const Session = struct {
 
         // Verify existing pieces (resume + seed)
         {
-            const stderr = std.fs.File.stderr().deprecatedWriter();
-            stderr.print("verifying existing pieces...\n", .{}) catch {};
+            log.info("verifying existing pieces...", .{});
             for (0..num_pieces) |i| {
                 const idx: u32 = @intCast(i);
                 const plen = piece_mod.pieceLength(idx, meta.piece_length, total_length);
@@ -115,7 +116,7 @@ pub const Session = struct {
             }
             const verified = our_bitfield.count();
             if (verified > 0) {
-                stderr.print("resume: {d}/{d} pieces already verified\n", .{ verified, num_pieces }) catch {};
+                log.info("resume: {d}/{d} pieces already verified", .{ verified, num_pieces });
             }
         }
 
@@ -179,9 +180,6 @@ pub const Session = struct {
     }
 
     pub fn run(self: *Session) !void {
-        const stdout = std.fs.File.stdout().deprecatedWriter();
-        const stderr = std.fs.File.stderr().deprecatedWriter();
-
         const act = std.posix.Sigaction{
             .handler = .{ .handler = sigintHandler },
             .mask = std.posix.sigemptyset(),
@@ -190,23 +188,23 @@ pub const Session = struct {
         std.posix.sigaction(std.posix.SIG.INT, &act, null);
 
         // Multi-tracker announce (BEP 12)
-        stderr.print("announcing to tracker...\n", .{}) catch {};
+        log.info("announcing to tracker...", .{});
         self.doMultiTrackerAnnounce(.started) catch |err| {
-            stderr.print("all trackers failed: {}\n", .{err}) catch {};
+            log.warn("all trackers failed: {}", .{err});
         };
 
-        stdout.print("session started: {d} pieces, {d} bytes\n", .{ self.num_pieces, self.total_length }) catch {};
+        log.info("session started: {d} pieces, {d} bytes", .{ self.num_pieces, self.total_length });
 
         while (self.running and !shutdown_requested.load(.acquire)) {
             if (self.mode == .download and self.our_bitfield.isComplete()) {
-                stdout.print("\ndownload complete!\n", .{}) catch {};
+                log.info("download complete!", .{});
                 self.doMultiTrackerAnnounce(.completed) catch {};
                 if (self.listener == null) {
                     const addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, self.listen_port);
                     self.listener = addr.listen(.{ .reuse_address = true }) catch null;
                 }
                 self.mode = .seed;
-                stdout.print("now seeding on port {d}...\n", .{self.listen_port}) catch {};
+                log.info("now seeding on port {d}...", .{self.listen_port});
             }
 
             var fds: [max_peers + 1]std.posix.pollfd = undefined;
@@ -226,10 +224,10 @@ pub const Session = struct {
         }
 
         if (shutdown_requested.load(.acquire)) {
-            stderr.print("\nshutting down gracefully...\n", .{}) catch {};
+            log.info("shutting down gracefully...", .{});
         }
         self.doMultiTrackerAnnounce(.stopped) catch {};
-        stderr.print("sent stopped announce to tracker\n", .{}) catch {};
+        log.info("sent stopped announce to tracker", .{});
     }
 
     fn buildPollFds(self: *Session, fds: *[max_peers + 1]std.posix.pollfd) usize {
@@ -536,8 +534,7 @@ pub const Session = struct {
         }
         if (missing > 0 and missing == active and missing <= 5) {
             self.endgame_active = true;
-            const stderr = std.fs.File.stderr().deprecatedWriter();
-            stderr.print("endgame mode: {d} pieces remaining\n", .{missing}) catch {};
+            log.info("endgame mode: {d} pieces remaining", .{missing});
         }
     }
 
@@ -782,19 +779,18 @@ pub const Session = struct {
         defer resp.deinit(self.allocator);
 
         if (resp.failure_reason) |reason| {
-            const stderr = std.fs.File.stderr().deprecatedWriter();
-            stderr.print("tracker error: {s}\n", .{reason}) catch {};
+            log.warn("tracker error: {s}", .{reason});
             return;
         }
 
         self.tracker_interval = resp.interval;
         self.last_announce_time = std.time.timestamp();
 
-        const stderr = std.fs.File.stderr().deprecatedWriter();
-        stderr.print("tracker: {d} peers", .{resp.peers.len}) catch {};
-        if (resp.complete) |c| stderr.print(", {d} seeders", .{c}) catch {};
-        if (resp.incomplete) |ic| stderr.print(", {d} leechers", .{ic}) catch {};
-        stderr.print("\n", .{}) catch {};
+        log.info("tracker: {d} peers, {d} seeders, {d} leechers", .{
+            resp.peers.len,
+            resp.complete orelse 0,
+            resp.incomplete orelse 0,
+        });
 
         self.connectToPeers(resp.peers) catch {};
     }
@@ -903,7 +899,6 @@ pub const Session = struct {
     }
 
     fn printProgress(self: *Session) !void {
-        const stdout = std.fs.File.stdout().deprecatedWriter();
         const now = std.time.timestamp();
         const have = self.our_bitfield.count();
         const pct = if (self.num_pieces > 0) (have * 100) / self.num_pieces else 0;
@@ -919,30 +914,13 @@ pub const Session = struct {
         const remaining_bytes = self.total_length - @min(self.downloaded, self.total_length);
         const eta_secs: u64 = if (speed > 0) remaining_bytes / speed else 0;
 
-        const active_peers = blk: {
-            var n: u32 = 0;
-            for (self.peers.items) |p| {
-                if (p.state == .active) n += 1;
-            }
-            break :blk n;
-        };
-
-        if (speed > 1024 * 1024) {
-            stdout.print("\r[{d}/{d}] {d}%  {d}.{d} MB/s  ETA {d}m{d}s  peers:{d}   ", .{
-                have,                  self.num_pieces,                              pct,
-                speed / (1024 * 1024), (speed % (1024 * 1024)) * 10 / (1024 * 1024), eta_secs / 60,
-                eta_secs % 60,         active_peers,
-            }) catch {};
-        } else if (speed > 1024) {
-            stdout.print("\r[{d}/{d}] {d}%  {d} KB/s  ETA {d}m{d}s  peers:{d}   ", .{
-                have,         self.num_pieces, pct,
-                speed / 1024, eta_secs / 60,   eta_secs % 60,
-                active_peers,
-            }) catch {};
-        } else {
-            stdout.print("\r[{d}/{d}] {d}%  {d} B/s  ETA {d}m{d}s  peers:{d}   ", .{
-                have, self.num_pieces, pct, speed, eta_secs / 60, eta_secs % 60, active_peers,
-            }) catch {};
+        var active_peers: u32 = 0;
+        for (self.peers.items) |p| {
+            if (p.state == .active) active_peers += 1;
         }
+
+        log.info("[{d}/{d}] {d}%  {d} KB/s  ETA {d}m{d}s  peers:{d}", .{
+            have, self.num_pieces, pct, speed / 1024, eta_secs / 60, eta_secs % 60, active_peers,
+        });
     }
 };
