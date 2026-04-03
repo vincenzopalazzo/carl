@@ -39,7 +39,7 @@ pub fn main() !void {
         try cmdAnnounce(allocator, stdout, args[2]);
     } else if (std.mem.eql(u8, command, "download")) {
         if (args.len < 3) {
-            log.err("usage: carl download <file.torrent> [--output-dir <dir>] [--port <port>]", .{});
+            log.err("usage: carl download <source> [--output-dir <dir>] [--port <port>]", .{});
             std.process.exit(1);
         }
         const output_dir = parseFlag(args[3..], "--output-dir") orelse ".";
@@ -66,7 +66,8 @@ fn printUsage() void {
         \\commands:
         \\  info <file.torrent>                      show torrent metadata
         \\  announce <file.torrent>                  query tracker for peers
-        \\  download <file.torrent> [--output-dir d] [--port p] download torrent
+        \\  download <source> [--output-dir d] [--port p]     download torrent
+        \\           source: file.torrent, magnet:?..., or http(s):// URL
         \\  seed <file.torrent> <data-dir> [--port p]          seed existing data
         \\
     , .{}) catch {};
@@ -160,22 +161,156 @@ fn cmdAnnounce(allocator: std.mem.Allocator, stdout: anytype, path: []const u8) 
     }
 }
 
-fn cmdDownload(allocator: std.mem.Allocator, torrent_path: []const u8, output_dir: []const u8, port: u16) !void {
-    const mi = readTorrent(allocator, torrent_path);
-    defer mi.deinit(allocator);
+fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []const u8, port: u16) !void {
+    if (std.mem.startsWith(u8, source, "magnet:")) {
+        // Magnet link
+        const ml = carl.magnet.parse(allocator, source) catch |err| {
+            log.err("invalid magnet link: {}", .{err});
+            std.process.exit(1);
+        };
+        defer ml.deinit(allocator);
 
+        log.info("magnet link parsed", .{});
+        if (ml.name) |n| log.info("name: {s}", .{n});
+
+        const announce = if (ml.trackers.len > 0)
+            allocator.dupe(u8, ml.trackers[0]) catch {
+                std.process.exit(1);
+            }
+        else blk: {
+            // Trackerless magnet -- will use DHT for peer discovery
+            log.info("no trackers in magnet link, will use DHT", .{});
+            break :blk allocator.dupe(u8, "") catch {
+                std.process.exit(1);
+            };
+        };
+
+        const name = if (ml.name) |n|
+            allocator.dupe(u8, n) catch {
+                std.process.exit(1);
+            }
+        else
+            allocator.dupe(u8, "unknown") catch {
+                std.process.exit(1);
+            };
+
+        var announce_list: ?[]const []const []const u8 = null;
+        if (ml.trackers.len > 1) {
+            const tier = allocator.alloc([]const u8, ml.trackers.len) catch {
+                std.process.exit(1);
+            };
+            for (ml.trackers, 0..) |t, i| {
+                tier[i] = allocator.dupe(u8, t) catch {
+                    std.process.exit(1);
+                };
+            }
+            const tiers = allocator.alloc([]const []const u8, 1) catch {
+                std.process.exit(1);
+            };
+            tiers[0] = tier;
+            announce_list = tiers;
+        }
+
+        const empty_path = allocator.alloc([]const u8, 1) catch {
+            std.process.exit(1);
+        };
+        empty_path[0] = allocator.dupe(u8, name) catch {
+            std.process.exit(1);
+        };
+        const empty_files = allocator.alloc(carl.metainfo.FileInfo, 1) catch {
+            std.process.exit(1);
+        };
+        empty_files[0] = .{ .length = 0, .path = empty_path };
+
+        const mi = carl.metainfo.Metainfo{
+            .announce = announce,
+            .announce_list = announce_list,
+            .name = name,
+            .piece_length = 0,
+            .pieces = &.{},
+            .files = empty_files,
+            .comment = null,
+            .creation_date = null,
+            .created_by = null,
+            .raw_info = &.{},
+            .url_list = null,
+        };
+        defer mi.deinit(allocator);
+
+        std.fs.cwd().makePath(output_dir) catch {};
+        var session = carl.session.Session.init(allocator, mi, output_dir, .download, port) catch |err| {
+            log.err("failed to initialize session: {}", .{err});
+            std.process.exit(1);
+        };
+        defer session.deinit();
+        session.info_hash = ml.info_hash; // Use magnet's hash, not SHA1("")
+        session.metadata_download = carl.extension.MetadataDownload.init(allocator, ml.info_hash);
+        session.metadata_only = true;
+        session.run() catch |err| {
+            log.err("session failed: {}", .{err});
+            std.process.exit(1);
+        };
+    } else if (std.mem.startsWith(u8, source, "http://") or std.mem.startsWith(u8, source, "https://")) {
+        // HTTP URL
+        log.info("downloading torrent from {s}...", .{source});
+        const torrent_data = fetchUrl(allocator, source) catch |err| {
+            log.err("failed to download torrent: {}", .{err});
+            std.process.exit(1);
+        };
+        defer allocator.free(torrent_data);
+
+        const mi = carl.metainfo.parse(allocator, torrent_data) catch |err| {
+            log.err("invalid torrent file: {}", .{err});
+            std.process.exit(1);
+        };
+        defer mi.deinit(allocator);
+        startDownload(allocator, mi, output_dir, port);
+    } else {
+        // File path
+        const mi = readTorrent(allocator, source);
+        defer mi.deinit(allocator);
+        startDownload(allocator, mi, output_dir, port);
+    }
+}
+
+fn startDownload(allocator: std.mem.Allocator, mi: carl.metainfo.Metainfo, output_dir: []const u8, port: u16) void {
     std.fs.cwd().makePath(output_dir) catch {};
-
     var session = carl.session.Session.init(allocator, mi, output_dir, .download, port) catch |err| {
         log.err("failed to initialize session: {}", .{err});
         std.process.exit(1);
     };
     defer session.deinit();
-
     session.run() catch |err| {
         log.err("session failed: {}", .{err});
         std.process.exit(1);
     };
+}
+
+fn fetchUrl(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
+    var client: std.http.Client = .{ .allocator = allocator };
+    defer client.deinit();
+    var response_body: std.ArrayList(u8) = .empty;
+    defer response_body.deinit(allocator);
+    var adapt_buf: [4096]u8 = undefined;
+    const deprecated_writer = response_body.writer(allocator);
+    var adapter = deprecated_writer.adaptToNewApi(&adapt_buf);
+    const result = client.fetch(.{
+        .location = .{ .url = url },
+        .response_writer = &adapter.new_interface,
+    }) catch |err| {
+        log.err("HTTP fetch error: {}", .{err});
+        return error.HttpFailed;
+    };
+
+    // Flush any remaining buffered data from the adapter
+    const buffered = adapter.new_interface.buffered();
+    if (buffered.len > 0) {
+        response_body.appendSlice(allocator, buffered) catch return error.HttpFailed;
+    }
+
+    if (result.status != .ok) return error.HttpFailed;
+    if (response_body.items.len == 0) return error.HttpFailed;
+    return response_body.toOwnedSlice(allocator);
 }
 
 fn cmdSeed(allocator: std.mem.Allocator, torrent_path: []const u8, data_dir: []const u8, port: u16) !void {

@@ -324,6 +324,7 @@ test "storage write and read roundtrip" {
         .creation_date = null,
         .created_by = null,
         .raw_info = &.{},
+        .url_list = null,
     };
 
     var store = Storage.init(allocator, meta, tmp_path, true) catch return;

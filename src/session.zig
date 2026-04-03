@@ -11,6 +11,9 @@ const wire = @import("wire.zig");
 const piece_mod = @import("piece.zig");
 const storage_mod = @import("storage.zig");
 const peer_mod = @import("peer.zig");
+const extension = @import("extension.zig");
+const bencode = @import("bencode.zig");
+const dht_mod = @import("dht.zig");
 
 const log = std.log.scoped(.session);
 
@@ -45,6 +48,7 @@ pub const Session = struct {
 
     listener: ?std.net.Server,
     listen_port: u16,
+    output_dir: []const u8,
     mode: Mode,
 
     // Tracker state
@@ -68,6 +72,13 @@ pub const Session = struct {
 
     // Endgame mode
     endgame_active: bool,
+
+    // BEP 9 metadata download (magnet link mode)
+    metadata_download: ?extension.MetadataDownload,
+    metadata_only: bool, // true when started from magnet link
+
+    // BEP 5 DHT
+    dht_instance: ?dht_mod.Dht,
 
     // Progress tracking
     start_time: i64,
@@ -103,7 +114,8 @@ pub const Session = struct {
 
         // Verify existing pieces (resume + seed)
         {
-            log.info("verifying existing pieces...", .{});
+            const stderr = std.fs.File.stderr().deprecatedWriter();
+            stderr.print("verifying existing pieces...\n", .{}) catch {};
             for (0..num_pieces) |i| {
                 const idx: u32 = @intCast(i);
                 const plen = piece_mod.pieceLength(idx, meta.piece_length, total_length);
@@ -116,7 +128,7 @@ pub const Session = struct {
             }
             const verified = our_bitfield.count();
             if (verified > 0) {
-                log.info("resume: {d}/{d} pieces already verified", .{ verified, num_pieces });
+                stderr.print("resume: {d}/{d} pieces already verified\n", .{ verified, num_pieces }) catch {};
             }
         }
 
@@ -140,6 +152,7 @@ pub const Session = struct {
             .piece_availability = piece_availability,
             .listener = listener,
             .listen_port = listen_port,
+            .output_dir = output_dir,
             .mode = mode,
             .tracker_interval = 1800,
             .last_announce_time = 0,
@@ -153,6 +166,9 @@ pub const Session = struct {
             .last_optimistic_time = now - optimistic_interval_secs,
             .optimistic_peer = null,
             .endgame_active = false,
+            .metadata_download = null,
+            .metadata_only = false,
+            .dht_instance = null,
             .start_time = now,
             .last_progress_time = now,
             .last_progress_bytes = 0,
@@ -174,12 +190,17 @@ pub const Session = struct {
         }
         self.peers.deinit(self.allocator);
 
+        if (self.dht_instance) |*d| d.deinit();
+        if (self.metadata_download) |*md| md.deinit();
         if (self.listener) |*l| l.deinit();
         self.our_bitfield.deinit(self.allocator);
         self.store.deinit();
     }
 
     pub fn run(self: *Session) !void {
+        const stdout = std.fs.File.stdout().deprecatedWriter();
+        const stderr = std.fs.File.stderr().deprecatedWriter();
+
         const act = std.posix.Sigaction{
             .handler = .{ .handler = sigintHandler },
             .mask = std.posix.sigemptyset(),
@@ -188,23 +209,23 @@ pub const Session = struct {
         std.posix.sigaction(std.posix.SIG.INT, &act, null);
 
         // Multi-tracker announce (BEP 12)
-        log.info("announcing to tracker...", .{});
+        stderr.print("announcing to tracker...\n", .{}) catch {};
         self.doMultiTrackerAnnounce(.started) catch |err| {
-            log.warn("all trackers failed: {}", .{err});
+            stderr.print("all trackers failed: {}\n", .{err}) catch {};
         };
 
-        log.info("session started: {d} pieces, {d} bytes", .{ self.num_pieces, self.total_length });
+        stdout.print("session started: {d} pieces, {d} bytes\n", .{ self.num_pieces, self.total_length }) catch {};
 
         while (self.running and !shutdown_requested.load(.acquire)) {
-            if (self.mode == .download and self.our_bitfield.isComplete()) {
-                log.info("download complete!", .{});
+            if (self.mode == .download and !self.metadata_only and self.num_pieces > 0 and self.our_bitfield.isComplete()) {
+                stdout.print("\ndownload complete!\n", .{}) catch {};
                 self.doMultiTrackerAnnounce(.completed) catch {};
                 if (self.listener == null) {
                     const addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, self.listen_port);
                     self.listener = addr.listen(.{ .reuse_address = true }) catch null;
                 }
                 self.mode = .seed;
-                log.info("now seeding on port {d}...", .{self.listen_port});
+                stdout.print("now seeding on port {d}...\n", .{self.listen_port}) catch {};
             }
 
             var fds: [max_peers + 1]std.posix.pollfd = undefined;
@@ -213,6 +234,11 @@ pub const Session = struct {
             _ = std.posix.poll(fds[0..nfds], 1000) catch 0;
 
             self.processPollResults(fds[0..nfds]) catch {};
+
+            // Try web seed downloads if available
+            if (self.mode == .download and !self.metadata_only) {
+                self.tryWebSeedDownload() catch {};
+            }
 
             // Check endgame activation
             if (self.mode == .download and !self.endgame_active) {
@@ -224,10 +250,10 @@ pub const Session = struct {
         }
 
         if (shutdown_requested.load(.acquire)) {
-            log.info("shutting down gracefully...", .{});
+            stderr.print("\nshutting down gracefully...\n", .{}) catch {};
         }
         self.doMultiTrackerAnnounce(.stopped) catch {};
-        log.info("sent stopped announce to tracker", .{});
+        stderr.print("sent stopped announce to tracker\n", .{}) catch {};
     }
 
     fn buildPollFds(self: *Session, fds: *[max_peers + 1]std.posix.pollfd) usize {
@@ -290,6 +316,20 @@ pub const Session = struct {
                         }
                         p.peer_id = hs.peer_id;
                         p.state = .active;
+                        p.supports_extensions = extension.supportsExtensions(hs.reserved);
+
+                        // Send BEP 10 extension handshake if peer supports it
+                        if (p.supports_extensions) {
+                            const ms = if (self.meta.raw_info.len > 0)
+                                std.math.cast(u32, self.meta.raw_info.len)
+                            else
+                                null;
+                            const ext_hs = extension.buildExtensionHandshake(self.allocator, ms, self.listen_port) catch null;
+                            if (ext_hs) |hs_payload| {
+                                defer self.allocator.free(hs_payload);
+                                p.enqueueMessage(.{ .extended = hs_payload }) catch {};
+                            }
+                        }
 
                         if (self.our_bitfield.count() > 0) {
                             p.enqueueMessage(.{ .bitfield = self.our_bitfield.rawBytes() }) catch {};
@@ -385,6 +425,9 @@ pub const Session = struct {
             },
             .cancel => {},
             .keep_alive => {},
+            .extended => |ext_data| {
+                self.handleExtension(p, ext_data) catch {};
+            },
         }
     }
 
@@ -446,6 +489,202 @@ pub const Session = struct {
 
         self.uploaded += req.length;
         p.bytes_uploaded += req.length;
+    }
+
+    // --- BEP 10/9 Extension handling ---
+
+    fn handleExtension(self: *Session, p: *peer_mod.PeerConnection, ext_data: []const u8) !void {
+        if (ext_data.len < 1) return;
+
+        if (ext_data[0] == extension.handshake_ext_id) {
+            // Extension handshake
+            var hs = extension.parseExtensionHandshake(self.allocator, ext_data) catch return;
+            defer hs.deinit(self.allocator);
+
+            p.peer_ut_metadata_id = hs.ut_metadata_id;
+            p.peer_metadata_size = hs.metadata_size;
+
+            if (hs.client_name) |name| {
+                log.debug("peer extension handshake: {s}", .{name});
+            }
+
+            // If we're in metadata download mode, set size and request pieces
+            if (self.metadata_download) |*md| {
+                if (hs.metadata_size) |ms| {
+                    md.setSize(ms) catch return;
+                    log.info("metadata size: {d} bytes ({d} pieces)", .{ ms, md.num_pieces });
+                    self.requestMetadataPieces(p) catch {};
+                }
+            }
+        } else {
+            // Check if this is a ut_metadata message (our assigned ID is 1)
+            if (ext_data[0] == 1) {
+                self.handleMetadataMessage(p, ext_data) catch {};
+            }
+        }
+    }
+
+    fn handleMetadataMessage(self: *Session, p: *peer_mod.PeerConnection, ext_data: []const u8) !void {
+        var md = &(self.metadata_download orelse return);
+
+        var msg = extension.parseMetadataMessage(self.allocator, ext_data) catch return;
+        defer msg.deinit(self.allocator);
+
+        switch (msg.msg_type) {
+            .data => {
+                if (msg.data) |data| {
+                    if (msg.total_size) |ts| {
+                        md.setSize(ts) catch return;
+                    }
+
+                    const complete = md.addPiece(msg.piece, data) catch return;
+                    log.info("metadata piece {d}/{d}", .{ md.received_count, md.num_pieces });
+
+                    if (!complete) {
+                        // Request more pieces from this peer
+                        self.requestMetadataPieces(p) catch {};
+                    } else if (complete) {
+                        log.info("all metadata pieces received, verifying...", .{});
+                        if (md.assemble() catch null) |raw_info| {
+                            log.info("metadata verified! parsing torrent info...", .{});
+                            self.onMetadataComplete(raw_info) catch {
+                                self.allocator.free(raw_info);
+                            };
+                        } else {
+                            log.warn("metadata hash mismatch, retrying...", .{});
+                            // Reset and try again
+                            md.deinit();
+                            self.metadata_download = extension.MetadataDownload.init(self.allocator, self.info_hash);
+                        }
+                    }
+                }
+            },
+            .reject => {
+                log.debug("metadata piece {d} rejected by peer", .{msg.piece});
+            },
+            .request => {
+                // Serve our metadata if we have it
+                if (self.meta.raw_info.len > 0) {
+                    self.serveMetadataPiece(p, msg.piece) catch {};
+                }
+            },
+        }
+    }
+
+    fn requestMetadataPieces(self: *Session, p: *peer_mod.PeerConnection) !void {
+        const md = &(self.metadata_download orelse return);
+        const peer_id = p.peer_ut_metadata_id orelse return;
+
+        // Request up to 5 pieces at a time to avoid flooding
+        var requested: u32 = 0;
+        for (0..md.num_pieces) |i| {
+            const idx: u32 = @intCast(i);
+            if (md.pieces.len > idx and md.pieces[idx] != null) continue; // already have it
+
+            const req_payload = extension.buildMetadataRequest(self.allocator, peer_id, idx) catch return;
+            defer self.allocator.free(req_payload);
+            p.enqueueMessage(.{ .extended = req_payload }) catch return;
+
+            requested += 1;
+            if (requested >= 5) break;
+        }
+    }
+
+    fn serveMetadataPiece(self: *Session, p: *peer_mod.PeerConnection, piece_idx: u32) !void {
+        // Serving metadata to peers -- simplified for now
+        _ = self;
+        _ = p;
+        _ = piece_idx;
+    }
+
+    fn onMetadataComplete(self: *Session, raw_info: []const u8) !void {
+        // Parse the info dict to build a Metainfo struct
+        const info_val = bencode.decode(self.allocator, raw_info) catch return error.InvalidMetadata;
+        defer info_val.deinit(self.allocator);
+
+        // Extract fields from info dict
+        const name_val = info_val.dictGet("name") orelse return error.InvalidMetadata;
+        const name_str = name_val.asString() orelse return error.InvalidMetadata;
+
+        const pl_val = info_val.dictGet("piece length") orelse return error.InvalidMetadata;
+        const piece_length = std.math.cast(u64, pl_val.asInt() orelse return error.InvalidMetadata) orelse return error.InvalidMetadata;
+
+        const pieces_val = info_val.dictGet("pieces") orelse return error.InvalidMetadata;
+        const pieces_str = pieces_val.asString() orelse return error.InvalidMetadata;
+
+        // Build file list
+        const files = if (info_val.dictGet("files")) |_|
+            // Multi-file magnet torrents not yet supported
+            return error.InvalidMetadata
+        else blk: {
+            const length_val = info_val.dictGet("length") orelse return error.InvalidMetadata;
+            const length = std.math.cast(u64, length_val.asInt() orelse return error.InvalidMetadata) orelse return error.InvalidMetadata;
+
+            const path_comp = self.allocator.dupe(u8, name_str) catch return error.OutOfMemory;
+            const path = self.allocator.alloc([]const u8, 1) catch {
+                self.allocator.free(path_comp);
+                return error.OutOfMemory;
+            };
+            path[0] = path_comp;
+
+            const file_slice = self.allocator.alloc(metainfo.FileInfo, 1) catch {
+                self.allocator.free(path_comp);
+                self.allocator.free(path);
+                return error.OutOfMemory;
+            };
+            file_slice[0] = .{ .length = length, .path = path };
+            break :blk @as([]const metainfo.FileInfo, file_slice);
+        };
+
+        const name = self.allocator.dupe(u8, name_str) catch return error.OutOfMemory;
+        const pieces = self.allocator.dupe(u8, pieces_str) catch {
+            self.allocator.free(name);
+            return error.OutOfMemory;
+        };
+        const raw_info_dup = self.allocator.dupe(u8, raw_info) catch {
+            self.allocator.free(name);
+            self.allocator.free(pieces);
+            return error.OutOfMemory;
+        };
+
+        // Update session with the new metadata
+        self.meta = .{
+            .announce = self.meta.announce,
+            .announce_list = self.meta.announce_list,
+            .name = name,
+            .piece_length = piece_length,
+            .pieces = pieces,
+            .files = files,
+            .comment = null,
+            .creation_date = null,
+            .created_by = null,
+            .raw_info = raw_info_dup,
+            .url_list = null,
+        };
+
+        // Now initialize storage and piece tracking
+        self.total_length = piece_mod.totalLength(self.meta.files);
+        self.num_pieces = piece_mod.numPieces(self.total_length, piece_length);
+        self.piece_len = piece_length;
+
+        self.our_bitfield.deinit(self.allocator);
+        self.our_bitfield = piece_mod.Bitfield.init(self.allocator, self.num_pieces) catch return error.OutOfMemory;
+
+        self.allocator.free(self.piece_availability);
+        self.piece_availability = self.allocator.alloc(u32, self.num_pieces) catch return error.OutOfMemory;
+        @memset(self.piece_availability, 0);
+
+        // Reinitialize storage with the real metadata
+        self.store.deinit();
+        self.store = storage_mod.Storage.init(self.allocator, self.meta, self.output_dir, true) catch
+            return error.StorageInitFailed;
+
+        // Switch from metadata-only to download mode
+        self.metadata_only = false;
+        if (self.metadata_download) |*md| md.deinit();
+        self.metadata_download = null;
+
+        log.info("metadata complete: '{s}', {d} pieces, {d} bytes", .{ name, self.num_pieces, self.total_length });
     }
 
     // --- Piece selection: rarest-first ---
@@ -534,7 +773,8 @@ pub const Session = struct {
         }
         if (missing > 0 and missing == active and missing <= 5) {
             self.endgame_active = true;
-            log.info("endgame mode: {d} pieces remaining", .{missing});
+            const stderr = std.fs.File.stderr().deprecatedWriter();
+            stderr.print("endgame mode: {d} pieces remaining\n", .{missing}) catch {};
         }
     }
 
@@ -759,19 +999,33 @@ pub const Session = struct {
         }
 
         // Fall back to primary announce URL
-        if (self.tryAnnounceUrl(self.meta.announce, req)) |resp| {
-            self.handleAnnounceResponse(resp);
-            return;
+        if (self.meta.announce.len > 0) {
+            if (self.tryAnnounceUrl(self.meta.announce, req)) |resp| {
+                self.handleAnnounceResponse(resp);
+                return;
+            }
         }
+
+        // Fall back to DHT (BEP 5)
+        self.tryDhtPeerDiscovery() catch {};
+        if (self.peers.items.len > 0) return;
 
         return error.TrackerFailed;
     }
 
     fn tryAnnounceUrl(self: *Session, url: []const u8, req: tracker_mod.AnnounceRequest) ?tracker_mod.AnnounceResponse {
         if (std.mem.startsWith(u8, url, "udp://")) {
-            return udp_tracker.announce(self.allocator, url, req) catch null;
+            return udp_tracker.announce(self.allocator, url, req) catch |err| {
+                log.warn("UDP tracker {s} failed: {}", .{ url, err });
+                return null;
+            };
+        } else if (url.len > 0) {
+            return tracker_mod.announce(self.allocator, url, req) catch |err| {
+                log.warn("HTTP tracker {s} failed: {}", .{ url, err });
+                return null;
+            };
         } else {
-            return tracker_mod.announce(self.allocator, url, req) catch null;
+            return null;
         }
     }
 
@@ -779,18 +1033,19 @@ pub const Session = struct {
         defer resp.deinit(self.allocator);
 
         if (resp.failure_reason) |reason| {
-            log.warn("tracker error: {s}", .{reason});
+            const stderr = std.fs.File.stderr().deprecatedWriter();
+            stderr.print("tracker error: {s}\n", .{reason}) catch {};
             return;
         }
 
         self.tracker_interval = resp.interval;
         self.last_announce_time = std.time.timestamp();
 
-        log.info("tracker: {d} peers, {d} seeders, {d} leechers", .{
-            resp.peers.len,
-            resp.complete orelse 0,
-            resp.incomplete orelse 0,
-        });
+        const stderr = std.fs.File.stderr().deprecatedWriter();
+        stderr.print("tracker: {d} peers", .{resp.peers.len}) catch {};
+        if (resp.complete) |c| stderr.print(", {d} seeders", .{c}) catch {};
+        if (resp.incomplete) |ic| stderr.print(", {d} leechers", .{ic}) catch {};
+        stderr.print("\n", .{}) catch {};
 
         self.connectToPeers(resp.peers) catch {};
     }
@@ -871,7 +1126,7 @@ pub const Session = struct {
 
     /// Run a single iteration of the event loop (for testing).
     pub fn tick(self: *Session) !void {
-        if (self.mode == .download and self.our_bitfield.isComplete()) {
+        if (self.mode == .download and !self.metadata_only and self.num_pieces > 0 and self.our_bitfield.isComplete()) {
             self.running = false;
             return;
         }
@@ -898,7 +1153,140 @@ pub const Session = struct {
         }
     }
 
+    // --- BEP 5: DHT peer discovery ---
+
+    fn tryDhtPeerDiscovery(self: *Session) !void {
+        // Initialize DHT on first use
+        if (self.dht_instance == null) {
+            var d = dht_mod.Dht.init(self.allocator, self.listen_port + 1);
+            d.start() catch {
+                log.warn("DHT failed to start", .{});
+                return;
+            };
+            self.dht_instance = d;
+            log.info("DHT started, querying for peers...", .{});
+        }
+
+        var d = &(self.dht_instance orelse return);
+        const peers = d.getPeers(self.allocator, self.info_hash) catch return;
+        defer self.allocator.free(peers);
+
+        if (peers.len > 0) {
+            log.info("DHT found {d} peers", .{peers.len});
+            self.connectToPeers(peers) catch {};
+        }
+    }
+
+    // --- BEP 19: Web seed downloads ---
+
+    fn tryWebSeedDownload(self: *Session) !void {
+        const urls = self.meta.url_list orelse return;
+        if (urls.len == 0) return;
+        if (self.num_pieces == 0) return;
+
+        // Find a piece we need
+        for (0..self.num_pieces) |i| {
+            const idx: u32 = @intCast(i);
+            if (self.our_bitfield.hasPiece(idx)) continue;
+            if (self.active_pieces.contains(idx)) continue;
+
+            // Try each web seed URL
+            for (urls) |base_url| {
+                if (self.downloadWebSeedPiece(base_url, idx) catch false) {
+                    return;
+                } else {
+                    continue; // Try next URL
+                }
+            }
+            return; // Don't try more pieces if all URLs failed
+        }
+    }
+
+    fn downloadWebSeedPiece(self: *Session, base_url: []const u8, piece_idx: u32) !bool {
+        const plen = piece_mod.pieceLength(piece_idx, self.piece_len, self.total_length);
+        if (plen == 0) return false;
+
+        const start = @as(u64, piece_idx) * self.piece_len;
+        const end = start + plen - 1;
+
+        // Build URL -- for single-file torrents, url-list points directly to the file
+        // Append the filename if the URL ends with /
+        var url_buf: [4096]u8 = undefined;
+        var url_len: usize = 0;
+        if (base_url.len > url_buf.len) return false;
+        @memcpy(url_buf[0..base_url.len], base_url);
+        url_len = base_url.len;
+
+        if (base_url.len > 0 and base_url[base_url.len - 1] == '/') {
+            // Append filename
+            if (url_len + self.meta.name.len > url_buf.len) return false;
+            @memcpy(url_buf[url_len .. url_len + self.meta.name.len], self.meta.name);
+            url_len += self.meta.name.len;
+        }
+
+        const url = url_buf[0..url_len];
+
+        // Build Range header value
+        var range_buf: [64]u8 = undefined;
+        const range_str = std.fmt.bufPrint(&range_buf, "bytes={d}-{d}", .{ start, end }) catch return false;
+
+        // HTTP request with Range header
+        var client: std.http.Client = .{ .allocator = self.allocator };
+        defer client.deinit();
+
+        var response_body: std.ArrayList(u8) = .empty;
+        defer response_body.deinit(self.allocator);
+
+        var adapt_buf: [4096]u8 = undefined;
+        const deprecated_writer = response_body.writer(self.allocator);
+        var adapter = deprecated_writer.adaptToNewApi(&adapt_buf);
+
+        const extra_headers = [_]std.http.Header{
+            .{ .name = "Range", .value = range_str },
+        };
+
+        const result = client.fetch(.{
+            .location = .{ .url = url },
+            .response_writer = &adapter.new_interface,
+            .extra_headers = &extra_headers,
+        }) catch return false;
+
+        // 206 Partial Content or 200 OK
+        if (result.status != .partial_content and result.status != .ok) return false;
+
+        // Flush remaining buffered data from the adapter
+        const buffered = adapter.new_interface.buffered();
+        if (buffered.len > 0) {
+            response_body.appendSlice(self.allocator, buffered) catch return false;
+        }
+
+        const data = response_body.items;
+        if (data.len != plen) return false;
+
+        // Verify SHA-1
+        const hash = piece_mod.pieceHash(self.meta.pieces, piece_idx) orelse return false;
+        if (!piece_mod.verifyPiece(data, hash)) return false;
+
+        // Write to disk
+        self.store.writePiece(piece_idx, data) catch return false;
+        self.our_bitfield.setPiece(piece_idx);
+        self.downloaded += plen;
+
+        self.printProgress() catch {};
+
+        // Broadcast have to all peers
+        for (self.peers.items) |p| {
+            if (p.state == .active) {
+                p.enqueueMessage(.{ .have = piece_idx }) catch {};
+            }
+        }
+
+        log.info("web seed: piece {d}/{d} from {s}", .{ piece_idx + 1, self.num_pieces, url });
+        return true;
+    }
+
     fn printProgress(self: *Session) !void {
+        const stdout = std.fs.File.stdout().deprecatedWriter();
         const now = std.time.timestamp();
         const have = self.our_bitfield.count();
         const pct = if (self.num_pieces > 0) (have * 100) / self.num_pieces else 0;
@@ -914,13 +1302,30 @@ pub const Session = struct {
         const remaining_bytes = self.total_length - @min(self.downloaded, self.total_length);
         const eta_secs: u64 = if (speed > 0) remaining_bytes / speed else 0;
 
-        var active_peers: u32 = 0;
-        for (self.peers.items) |p| {
-            if (p.state == .active) active_peers += 1;
-        }
+        const active_peers = blk: {
+            var n: u32 = 0;
+            for (self.peers.items) |p| {
+                if (p.state == .active) n += 1;
+            }
+            break :blk n;
+        };
 
-        log.info("[{d}/{d}] {d}%  {d} KB/s  ETA {d}m{d}s  peers:{d}", .{
-            have, self.num_pieces, pct, speed / 1024, eta_secs / 60, eta_secs % 60, active_peers,
-        });
+        if (speed > 1024 * 1024) {
+            stdout.print("\r[{d}/{d}] {d}%  {d}.{d} MB/s  ETA {d}m{d}s  peers:{d}   ", .{
+                have,                  self.num_pieces,                              pct,
+                speed / (1024 * 1024), (speed % (1024 * 1024)) * 10 / (1024 * 1024), eta_secs / 60,
+                eta_secs % 60,         active_peers,
+            }) catch {};
+        } else if (speed > 1024) {
+            stdout.print("\r[{d}/{d}] {d}%  {d} KB/s  ETA {d}m{d}s  peers:{d}   ", .{
+                have,         self.num_pieces, pct,
+                speed / 1024, eta_secs / 60,   eta_secs % 60,
+                active_peers,
+            }) catch {};
+        } else {
+            stdout.print("\r[{d}/{d}] {d}%  {d} B/s  ETA {d}m{d}s  peers:{d}   ", .{
+                have, self.num_pieces, pct, speed, eta_secs / 60, eta_secs % 60, active_peers,
+            }) catch {};
+        }
     }
 };
