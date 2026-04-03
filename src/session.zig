@@ -10,6 +10,13 @@ const peer_mod = @import("peer.zig");
 
 const max_peers: usize = 50;
 
+/// Global flag for graceful shutdown on SIGINT.
+var shutdown_requested: bool = false;
+
+fn sigintHandler(_: i32) callconv(.c) void {
+    shutdown_requested = true;
+}
+
 pub const Mode = enum { download, seed };
 
 pub const Session = struct {
@@ -42,11 +49,17 @@ pub const Session = struct {
     // Control
     running: bool,
 
+    // Progress tracking
+    start_time: i64,
+    last_progress_time: i64,
+    last_progress_bytes: u64,
+
     pub fn init(
         allocator: Allocator,
         meta: metainfo.Metainfo,
         output_dir: []const u8,
         mode: Mode,
+        listen_port: u16,
     ) !Session {
         const total_length = piece_mod.totalLength(meta.files);
         const num_pieces = piece_mod.numPieces(total_length, meta.piece_length);
@@ -64,10 +77,10 @@ pub const Session = struct {
             return error.StorageInitFailed;
         errdefer store.deinit();
 
-        // For seed mode, verify existing pieces
-        if (mode == .seed) {
+        // Verify existing pieces (enables resume for downloads, required for seeding)
+        {
             const stderr = std.fs.File.stderr().deprecatedWriter();
-            stderr.print("verifying pieces...\n", .{}) catch {};
+            stderr.print("verifying existing pieces...\n", .{}) catch {};
             for (0..num_pieces) |i| {
                 const idx: u32 = @intCast(i);
                 const plen = piece_mod.pieceLength(idx, meta.piece_length, total_length);
@@ -78,12 +91,17 @@ pub const Session = struct {
                     our_bitfield.setPiece(idx);
                 }
             }
-            stderr.print("verified: {d}/{d} pieces\n", .{ our_bitfield.count(), num_pieces }) catch {};
+            const verified = our_bitfield.count();
+            if (verified > 0) {
+                stderr.print("resume: {d}/{d} pieces already verified\n", .{ verified, num_pieces }) catch {};
+            }
+            if (verified == num_pieces and mode == .download) {
+                stderr.print("all pieces verified -- nothing to download\n", .{}) catch {};
+            }
         }
 
         // Start listener for seeding
         var listener: ?std.net.Server = null;
-        const listen_port: u16 = 6881;
         if (mode == .seed or our_bitfield.count() > 0) {
             const addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, listen_port);
             listener = addr.listen(.{ .reuse_address = true }) catch null;
@@ -110,6 +128,9 @@ pub const Session = struct {
             .piece_len = meta.piece_length,
             .num_pieces = num_pieces,
             .running = true,
+            .start_time = std.time.timestamp(),
+            .last_progress_time = std.time.timestamp(),
+            .last_progress_bytes = 0,
         };
     }
 
@@ -139,15 +160,23 @@ pub const Session = struct {
         const stdout = std.fs.File.stdout().deprecatedWriter();
         const stderr = std.fs.File.stderr().deprecatedWriter();
 
+        // Install SIGINT handler for graceful shutdown
+        const act = std.posix.Sigaction{
+            .handler = .{ .handler = sigintHandler },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.INT, &act, null);
+
         // Initial announce
         stderr.print("announcing to tracker...\n", .{}) catch {};
         self.doAnnounce(.started) catch |err| {
             stderr.print("tracker announce failed: {}\n", .{err}) catch {};
         };
 
-        stdout.print("download started: {d} pieces, {d} bytes\n", .{ self.num_pieces, self.total_length }) catch {};
+        stdout.print("session started: {d} pieces, {d} bytes\n", .{ self.num_pieces, self.total_length }) catch {};
 
-        while (self.running) {
+        while (self.running and !shutdown_requested) {
             // Check completion
             if (self.mode == .download and self.our_bitfield.isComplete()) {
                 stdout.print("\ndownload complete!\n", .{}) catch {};
@@ -182,7 +211,11 @@ pub const Session = struct {
         }
 
         // Final announce
+        if (shutdown_requested) {
+            stderr.print("\nshutting down gracefully...\n", .{}) catch {};
+        }
         self.doAnnounce(.stopped) catch {};
+        stderr.print("sent stopped announce to tracker\n", .{}) catch {};
     }
 
     fn buildPollFds(self: *Session, fds: *[max_peers + 1]std.posix.pollfd) usize {
@@ -360,10 +393,7 @@ pub const Session = struct {
                 self.our_bitfield.setPiece(pd.index);
                 self.downloaded += pp_ptr.piece_len;
 
-                const stdout = std.fs.File.stdout().deprecatedWriter();
-                stdout.print("[{d}/{d}] piece {d} verified\n", .{
-                    self.our_bitfield.count(), self.num_pieces, pd.index,
-                }) catch {};
+                self.printProgress() catch {};
 
                 // Broadcast have to all active peers
                 for (self.peers.items) |peer| {
@@ -617,5 +647,42 @@ pub const Session = struct {
 
     fn isComplete(self: Session) bool {
         return self.our_bitfield.isComplete();
+    }
+
+    fn printProgress(self: *Session) !void {
+        const stdout = std.fs.File.stdout().deprecatedWriter();
+        const now = std.time.timestamp();
+        const have = self.our_bitfield.count();
+        const pct = if (self.num_pieces > 0) (have * 100) / self.num_pieces else 0;
+
+        // Calculate speed (bytes/sec over last interval)
+        const dt = now - self.last_progress_time;
+        const speed: u64 = if (dt > 0)
+            (self.downloaded - self.last_progress_bytes) / @as(u64, @intCast(dt))
+        else
+            0;
+        self.last_progress_time = now;
+        self.last_progress_bytes = self.downloaded;
+
+        // ETA
+        const remaining_bytes = self.total_length - @min(self.downloaded, self.total_length);
+        const eta_secs: u64 = if (speed > 0) remaining_bytes / speed else 0;
+
+        if (speed > 1024 * 1024) {
+            stdout.print("\r[{d}/{d}] {d}%  {d}.{d} MB/s  ETA {d}m{d}s   ", .{
+                have,                  self.num_pieces,                              pct,
+                speed / (1024 * 1024), (speed % (1024 * 1024)) * 10 / (1024 * 1024), eta_secs / 60,
+                eta_secs % 60,
+            }) catch {};
+        } else if (speed > 1024) {
+            stdout.print("\r[{d}/{d}] {d}%  {d} KB/s  ETA {d}m{d}s   ", .{
+                have,         self.num_pieces, pct,
+                speed / 1024, eta_secs / 60,   eta_secs % 60,
+            }) catch {};
+        } else {
+            stdout.print("\r[{d}/{d}] {d}%  {d} B/s  ETA {d}m{d}s   ", .{
+                have, self.num_pieces, pct, speed, eta_secs / 60, eta_secs % 60,
+            }) catch {};
+        }
     }
 };

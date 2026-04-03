@@ -70,12 +70,34 @@ pub const PeerConnection = struct {
         self.pending_requests.deinit(self.allocator);
     }
 
-    /// Initiate TCP connection (blocking).
+    /// Connect timeout in seconds.
+    pub const connect_timeout_secs: u32 = 5;
+
+    /// Initiate TCP connection with a timeout.
     pub fn connect(self: *PeerConnection) !void {
-        self.stream = std.net.tcpConnectToAddress(self.address) catch {
+        // Create socket
+        const sock = std.posix.socket(
+            std.posix.AF.INET,
+            std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
+            std.posix.IPPROTO.TCP,
+        ) catch {
             self.state = .disconnected;
             return error.ConnectionFailed;
         };
+        errdefer std.posix.close(sock);
+
+        // Set send timeout to limit blocking connect duration
+        const timeout = std.posix.timeval{ .sec = connect_timeout_secs, .usec = 0 };
+        std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
+
+        // Blocking connect with timeout
+        std.posix.connect(sock, &self.address.any, @sizeOf(std.posix.sockaddr.in)) catch {
+            std.posix.close(sock);
+            self.state = .disconnected;
+            return error.ConnectionFailed;
+        };
+
+        self.stream = .{ .handle = sock };
         self.state = .handshaking;
     }
 

@@ -19,8 +19,8 @@ pub fn main() !void {
             \\commands:
             \\  info <file.torrent>                      show torrent metadata
             \\  announce <file.torrent>                  query tracker for peers
-            \\  download <file.torrent> [--output-dir d] download torrent
-            \\  seed <file.torrent> <data-dir>           seed existing data
+            \\  download <file.torrent> [--output-dir d] [--port p] download torrent
+            \\  seed <file.torrent> <data-dir> [--port p]          seed existing data
             \\
         , .{});
         std.process.exit(1);
@@ -42,17 +42,19 @@ pub fn main() !void {
         try cmdAnnounce(allocator, stdout, args[2]);
     } else if (std.mem.eql(u8, command, "download")) {
         if (args.len < 3) {
-            try stderr.print("usage: carl download <file.torrent> [--output-dir <dir>]\n", .{});
+            try stderr.print("usage: carl download <file.torrent> [--output-dir <dir>] [--port <port>]\n", .{});
             std.process.exit(1);
         }
-        const output_dir = parseOutputDir(args[3..]);
-        try cmdDownload(allocator, args[2], output_dir);
+        const output_dir = parseFlag(args[3..], "--output-dir") orelse ".";
+        const port = parsePort(args[3..]);
+        try cmdDownload(allocator, args[2], output_dir, port);
     } else if (std.mem.eql(u8, command, "seed")) {
         if (args.len < 4) {
-            try stderr.print("usage: carl seed <file.torrent> <data-dir>\n", .{});
+            try stderr.print("usage: carl seed <file.torrent> <data-dir> [--port <port>]\n", .{});
             std.process.exit(1);
         }
-        try cmdSeed(allocator, args[2], args[3]);
+        const port = parsePort(args[4..]);
+        try cmdSeed(allocator, args[2], args[3], port);
     } else {
         try stderr.print("unknown command: {s}\n", .{command});
         std.process.exit(1);
@@ -156,7 +158,7 @@ fn cmdAnnounce(allocator: std.mem.Allocator, stdout: anytype, path: []const u8) 
     }
 }
 
-fn cmdDownload(allocator: std.mem.Allocator, torrent_path: []const u8, output_dir: []const u8) !void {
+fn cmdDownload(allocator: std.mem.Allocator, torrent_path: []const u8, output_dir: []const u8, port: u16) !void {
     const stderr = std.fs.File.stderr().deprecatedWriter();
 
     const data = std.fs.cwd().readFileAlloc(allocator, torrent_path, 10 * 1024 * 1024) catch |err| {
@@ -174,7 +176,7 @@ fn cmdDownload(allocator: std.mem.Allocator, torrent_path: []const u8, output_di
     // Ensure output directory exists
     std.fs.cwd().makePath(output_dir) catch {};
 
-    var session = carl.session.Session.init(allocator, mi, output_dir, .download) catch |err| {
+    var session = carl.session.Session.init(allocator, mi, output_dir, .download, port) catch |err| {
         try stderr.print("error: failed to initialize session: {}\n", .{err});
         std.process.exit(1);
     };
@@ -186,7 +188,7 @@ fn cmdDownload(allocator: std.mem.Allocator, torrent_path: []const u8, output_di
     };
 }
 
-fn cmdSeed(allocator: std.mem.Allocator, torrent_path: []const u8, data_dir: []const u8) !void {
+fn cmdSeed(allocator: std.mem.Allocator, torrent_path: []const u8, data_dir: []const u8, port: u16) !void {
     const stderr = std.fs.File.stderr().deprecatedWriter();
 
     const data = std.fs.cwd().readFileAlloc(allocator, torrent_path, 10 * 1024 * 1024) catch |err| {
@@ -201,7 +203,7 @@ fn cmdSeed(allocator: std.mem.Allocator, torrent_path: []const u8, data_dir: []c
     };
     defer mi.deinit(allocator);
 
-    var session = carl.session.Session.init(allocator, mi, data_dir, .seed) catch |err| {
+    var session = carl.session.Session.init(allocator, mi, data_dir, .seed, port) catch |err| {
         try stderr.print("error: failed to initialize session: {}\n", .{err});
         std.process.exit(1);
     };
@@ -213,14 +215,19 @@ fn cmdSeed(allocator: std.mem.Allocator, torrent_path: []const u8, data_dir: []c
     };
 }
 
-fn parseOutputDir(extra_args: []const [:0]u8) []const u8 {
+fn parseFlag(extra_args: []const [:0]u8, flag: []const u8) ?[]const u8 {
     var i: usize = 0;
     while (i + 1 < extra_args.len) : (i += 1) {
-        if (std.mem.eql(u8, extra_args[i], "--output-dir")) {
+        if (std.mem.eql(u8, extra_args[i], flag)) {
             return extra_args[i + 1];
         }
     }
-    return ".";
+    return null;
+}
+
+fn parsePort(extra_args: []const [:0]u8) u16 {
+    const port_str = parseFlag(extra_args, "--port") orelse return 6881;
+    return std.fmt.parseUnsigned(u16, port_str, 10) catch 6881;
 }
 
 test {
