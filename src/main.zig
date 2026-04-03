@@ -1,6 +1,13 @@
 const std = @import("std");
 const carl = @import("carl");
 
+const log = std.log.scoped(.cli);
+
+/// Configure std.log: show info and above, use default stderr output.
+pub const std_options: std.Options = .{
+    .log_level = .debug,
+};
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -10,19 +17,9 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     const stdout = std.fs.File.stdout().deprecatedWriter();
-    const stderr = std.fs.File.stderr().deprecatedWriter();
 
     if (args.len < 2) {
-        try stderr.print(
-            \\usage: carl <command> [args]
-            \\
-            \\commands:
-            \\  info <file.torrent>                      show torrent metadata
-            \\  announce <file.torrent>                  query tracker for peers
-            \\  download <file.torrent> [--output-dir d] [--port p] download torrent
-            \\  seed <file.torrent> <data-dir> [--port p]          seed existing data
-            \\
-        , .{});
+        printUsage();
         std.process.exit(1);
     }
 
@@ -30,19 +27,19 @@ pub fn main() !void {
 
     if (std.mem.eql(u8, command, "info")) {
         if (args.len < 3) {
-            try stderr.print("usage: carl info <file.torrent>\n", .{});
+            log.err("usage: carl info <file.torrent>", .{});
             std.process.exit(1);
         }
         try cmdInfo(allocator, stdout, args[2]);
     } else if (std.mem.eql(u8, command, "announce")) {
         if (args.len < 3) {
-            try stderr.print("usage: carl announce <file.torrent>\n", .{});
+            log.err("usage: carl announce <file.torrent>", .{});
             std.process.exit(1);
         }
         try cmdAnnounce(allocator, stdout, args[2]);
     } else if (std.mem.eql(u8, command, "download")) {
         if (args.len < 3) {
-            try stderr.print("usage: carl download <file.torrent> [--output-dir <dir>] [--port <port>]\n", .{});
+            log.err("usage: carl download <file.torrent> [--output-dir <dir>] [--port <port>]", .{});
             std.process.exit(1);
         }
         const output_dir = parseFlag(args[3..], "--output-dir") orelse ".";
@@ -50,30 +47,46 @@ pub fn main() !void {
         try cmdDownload(allocator, args[2], output_dir, port);
     } else if (std.mem.eql(u8, command, "seed")) {
         if (args.len < 4) {
-            try stderr.print("usage: carl seed <file.torrent> <data-dir> [--port <port>]\n", .{});
+            log.err("usage: carl seed <file.torrent> <data-dir> [--port <port>]", .{});
             std.process.exit(1);
         }
         const port = parsePort(args[4..]);
         try cmdSeed(allocator, args[2], args[3], port);
     } else {
-        try stderr.print("unknown command: {s}\n", .{command});
+        log.err("unknown command: {s}", .{command});
         std.process.exit(1);
     }
 }
 
-fn cmdInfo(allocator: std.mem.Allocator, stdout: anytype, path: []const u8) !void {
+fn printUsage() void {
     const stderr = std.fs.File.stderr().deprecatedWriter();
+    stderr.print(
+        \\usage: carl <command> [args]
+        \\
+        \\commands:
+        \\  info <file.torrent>                      show torrent metadata
+        \\  announce <file.torrent>                  query tracker for peers
+        \\  download <file.torrent> [--output-dir d] [--port p] download torrent
+        \\  seed <file.torrent> <data-dir> [--port p]          seed existing data
+        \\
+    , .{}) catch {};
+}
 
+fn readTorrent(allocator: std.mem.Allocator, path: []const u8) carl.metainfo.Metainfo {
     const data = std.fs.cwd().readFileAlloc(allocator, path, 10 * 1024 * 1024) catch |err| {
-        try stderr.print("error: cannot read '{s}': {}\n", .{ path, err });
+        log.err("cannot read '{s}': {}", .{ path, err });
         std.process.exit(1);
     };
     defer allocator.free(data);
 
-    const mi = carl.metainfo.parse(allocator, data) catch |err| {
-        try stderr.print("error: invalid torrent file: {}\n", .{err});
+    return carl.metainfo.parse(allocator, data) catch |err| {
+        log.err("invalid torrent file: {}", .{err});
         std.process.exit(1);
     };
+}
+
+fn cmdInfo(allocator: std.mem.Allocator, stdout: anytype, path: []const u8) !void {
+    const mi = readTorrent(allocator, path);
     defer mi.deinit(allocator);
 
     try stdout.print("name:         {s}\n", .{mi.name});
@@ -104,18 +117,7 @@ fn cmdInfo(allocator: std.mem.Allocator, stdout: anytype, path: []const u8) !voi
 }
 
 fn cmdAnnounce(allocator: std.mem.Allocator, stdout: anytype, path: []const u8) !void {
-    const stderr = std.fs.File.stderr().deprecatedWriter();
-
-    const data = std.fs.cwd().readFileAlloc(allocator, path, 10 * 1024 * 1024) catch |err| {
-        try stderr.print("error: cannot read '{s}': {}\n", .{ path, err });
-        std.process.exit(1);
-    };
-    defer allocator.free(data);
-
-    const mi = carl.metainfo.parse(allocator, data) catch |err| {
-        try stderr.print("error: invalid torrent file: {}\n", .{err});
-        std.process.exit(1);
-    };
+    const mi = readTorrent(allocator, path);
     defer mi.deinit(allocator);
 
     const info_hash = carl.metainfo.infoHash(mi.raw_info);
@@ -124,7 +126,7 @@ fn cmdAnnounce(allocator: std.mem.Allocator, stdout: anytype, path: []const u8) 
     @memcpy(peer_id[0..8], "-CA0010-");
     std.crypto.random.bytes(peer_id[8..]);
 
-    try stdout.print("announcing to {s}...\n", .{mi.announce});
+    log.info("announcing to {s}...", .{mi.announce});
 
     const resp = carl.tracker.announce(allocator, mi.announce, .{
         .info_hash = info_hash,
@@ -136,13 +138,13 @@ fn cmdAnnounce(allocator: std.mem.Allocator, stdout: anytype, path: []const u8) 
         .compact = true,
         .event = .started,
     }) catch |err| {
-        try stderr.print("error: tracker announce failed: {}\n", .{err});
+        log.err("tracker announce failed: {}", .{err});
         std.process.exit(1);
     };
     defer resp.deinit(allocator);
 
     if (resp.failure_reason) |reason| {
-        try stderr.print("tracker error: {s}\n", .{reason});
+        log.err("tracker error: {s}", .{reason});
         std.process.exit(1);
     }
 
@@ -159,58 +161,35 @@ fn cmdAnnounce(allocator: std.mem.Allocator, stdout: anytype, path: []const u8) 
 }
 
 fn cmdDownload(allocator: std.mem.Allocator, torrent_path: []const u8, output_dir: []const u8, port: u16) !void {
-    const stderr = std.fs.File.stderr().deprecatedWriter();
-
-    const data = std.fs.cwd().readFileAlloc(allocator, torrent_path, 10 * 1024 * 1024) catch |err| {
-        try stderr.print("error: cannot read '{s}': {}\n", .{ torrent_path, err });
-        std.process.exit(1);
-    };
-    defer allocator.free(data);
-
-    const mi = carl.metainfo.parse(allocator, data) catch |err| {
-        try stderr.print("error: invalid torrent file: {}\n", .{err});
-        std.process.exit(1);
-    };
+    const mi = readTorrent(allocator, torrent_path);
     defer mi.deinit(allocator);
 
-    // Ensure output directory exists
     std.fs.cwd().makePath(output_dir) catch {};
 
     var session = carl.session.Session.init(allocator, mi, output_dir, .download, port) catch |err| {
-        try stderr.print("error: failed to initialize session: {}\n", .{err});
+        log.err("failed to initialize session: {}", .{err});
         std.process.exit(1);
     };
     defer session.deinit();
 
     session.run() catch |err| {
-        try stderr.print("error: session failed: {}\n", .{err});
+        log.err("session failed: {}", .{err});
         std.process.exit(1);
     };
 }
 
 fn cmdSeed(allocator: std.mem.Allocator, torrent_path: []const u8, data_dir: []const u8, port: u16) !void {
-    const stderr = std.fs.File.stderr().deprecatedWriter();
-
-    const data = std.fs.cwd().readFileAlloc(allocator, torrent_path, 10 * 1024 * 1024) catch |err| {
-        try stderr.print("error: cannot read '{s}': {}\n", .{ torrent_path, err });
-        std.process.exit(1);
-    };
-    defer allocator.free(data);
-
-    const mi = carl.metainfo.parse(allocator, data) catch |err| {
-        try stderr.print("error: invalid torrent file: {}\n", .{err});
-        std.process.exit(1);
-    };
+    const mi = readTorrent(allocator, torrent_path);
     defer mi.deinit(allocator);
 
     var session = carl.session.Session.init(allocator, mi, data_dir, .seed, port) catch |err| {
-        try stderr.print("error: failed to initialize session: {}\n", .{err});
+        log.err("failed to initialize session: {}", .{err});
         std.process.exit(1);
     };
     defer session.deinit();
 
     session.run() catch |err| {
-        try stderr.print("error: session failed: {}\n", .{err});
+        log.err("session failed: {}", .{err});
         std.process.exit(1);
     };
 }
