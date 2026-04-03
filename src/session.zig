@@ -79,6 +79,7 @@ pub const Session = struct {
 
     // BEP 5 DHT
     dht_instance: ?dht_mod.Dht,
+    dht_failed: bool,
 
     // Progress tracking
     start_time: i64,
@@ -169,6 +170,7 @@ pub const Session = struct {
             .metadata_download = null,
             .metadata_only = false,
             .dht_instance = null,
+            .dht_failed = false,
             .start_time = now,
             .last_progress_time = now,
             .last_progress_bytes = 0,
@@ -208,10 +210,15 @@ pub const Session = struct {
         };
         std.posix.sigaction(std.posix.SIG.INT, &act, null);
 
-        // Multi-tracker announce (BEP 12)
-        stderr.print("announcing to tracker...\n", .{}) catch {};
+        // Multi-tracker announce (BEP 12) / DHT peer discovery
+        const has_trackers = (self.meta.announce.len > 0) or (self.meta.announce_list != null);
+        if (has_trackers) {
+            stderr.print("announcing to tracker...\n", .{}) catch {};
+        }
         self.doMultiTrackerAnnounce(.started) catch |err| {
-            stderr.print("all trackers failed: {}\n", .{err}) catch {};
+            if (has_trackers) {
+                stderr.print("all trackers failed: {}\n", .{err}) catch {};
+            }
         };
 
         stdout.print("session started: {d} pieces, {d} bytes\n", .{ self.num_pieces, self.total_length }) catch {};
@@ -965,10 +972,15 @@ pub const Session = struct {
         // Run choking algorithm
         self.runChokingAlgorithm();
 
-        // Re-announce
+        // Re-announce to trackers at the tracker-provided interval
         const interval_secs = std.math.cast(i64, self.tracker_interval) orelse 1800;
         if (now - self.last_announce_time > interval_secs) {
             self.doMultiTrackerAnnounce(.none) catch {};
+        }
+
+        // DHT: retry more aggressively when we have zero peers
+        if (self.peers.items.len == 0 and now - self.last_announce_time > 30) {
+            self.tryDhtPeerDiscovery() catch {};
         }
     }
 
@@ -1156,11 +1168,15 @@ pub const Session = struct {
     // --- BEP 5: DHT peer discovery ---
 
     fn tryDhtPeerDiscovery(self: *Session) !void {
+        // Don't retry if DHT previously failed to start (e.g. port busy)
+        if (self.dht_failed) return;
+
         // Initialize DHT on first use
         if (self.dht_instance == null) {
             var d = dht_mod.Dht.init(self.allocator, self.listen_port + 1);
             d.start() catch {
                 log.warn("DHT failed to start", .{});
+                self.dht_failed = true;
                 return;
             };
             self.dht_instance = d;

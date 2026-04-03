@@ -42,9 +42,25 @@ pub fn main() !void {
             log.err("usage: carl download <source> [--output-dir <dir>] [--port <port>]", .{});
             std.process.exit(1);
         }
+        // Reassemble magnet URIs that the shell may have split on '&'.
+        // e.g. magnet:?xt=...&dn=... becomes multiple argv entries when unquoted.
+        // Note: consumed fragments remain in args[3..] but are harmless —
+        // parseFlag only matches "--output-dir" / "--port" which can't collide.
+        const source = blk: {
+            if (!std.mem.startsWith(u8, args[2], "magnet:")) break :blk args[2];
+            var parts: std.ArrayList(u8) = .empty;
+            defer parts.deinit(allocator);
+            parts.appendSlice(allocator, args[2]) catch @panic("OOM");
+            for (args[3..]) |a| {
+                if (std.mem.startsWith(u8, a, "--")) break;
+                parts.append(allocator, '&') catch @panic("OOM");
+                parts.appendSlice(allocator, a) catch @panic("OOM");
+            }
+            break :blk @as([]const u8, allocator.dupe(u8, parts.items) catch @panic("OOM"));
+        };
         const output_dir = parseFlag(args[3..], "--output-dir") orelse ".";
         const port = parsePort(args[3..]);
-        try cmdDownload(allocator, args[2], output_dir, port);
+        try cmdDownload(allocator, source, output_dir, port);
     } else if (std.mem.eql(u8, command, "seed")) {
         if (args.len < 4) {
             log.err("usage: carl seed <file.torrent> <data-dir> [--port <port>]", .{});
