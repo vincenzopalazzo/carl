@@ -17,11 +17,12 @@ const unchoke_slots: usize = 4;
 const unchoke_interval_secs: i64 = 10;
 const optimistic_interval_secs: i64 = 30;
 
-/// Global flag for graceful shutdown on SIGINT.
-pub var shutdown_requested: bool = false;
+/// Global flag for graceful shutdown on SIGINT. Atomic because it's
+/// written from a signal handler and read from event loop / test threads.
+pub var shutdown_requested = std.atomic.Value(bool).init(false);
 
 fn sigintHandler(_: i32) callconv(.c) void {
-    shutdown_requested = true;
+    shutdown_requested.store(true, .release);
 }
 
 pub const Mode = enum { download, seed };
@@ -196,7 +197,7 @@ pub const Session = struct {
 
         stdout.print("session started: {d} pieces, {d} bytes\n", .{ self.num_pieces, self.total_length }) catch {};
 
-        while (self.running and !shutdown_requested) {
+        while (self.running and !shutdown_requested.load(.acquire)) {
             if (self.mode == .download and self.our_bitfield.isComplete()) {
                 stdout.print("\ndownload complete!\n", .{}) catch {};
                 self.doMultiTrackerAnnounce(.completed) catch {};
@@ -224,7 +225,7 @@ pub const Session = struct {
             self.maintenance() catch {};
         }
 
-        if (shutdown_requested) {
+        if (shutdown_requested.load(.acquire)) {
             stderr.print("\nshutting down gracefully...\n", .{}) catch {};
         }
         self.doMultiTrackerAnnounce(.stopped) catch {};

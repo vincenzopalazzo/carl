@@ -103,7 +103,8 @@ pub const PieceProgress = struct {
     /// Record a received block. Returns true if piece is now complete.
     pub fn addBlock(self: *PieceProgress, begin: u32, block: []const u8) bool {
         if (begin >= self.piece_len) return false;
-        const end = begin + @as(u32, @intCast(block.len));
+        const block_len = std.math.cast(u32, block.len) orelse return false;
+        const end = begin + block_len;
         if (end > self.piece_len) return false;
 
         @memcpy(self.data[begin..end], block);

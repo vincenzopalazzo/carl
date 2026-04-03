@@ -21,8 +21,10 @@ pub const FileMap = struct {
     pub fn init(allocator: Allocator, files: []const metainfo.FileInfo) error{OutOfMemory}!FileMap {
         const n = std.math.cast(u32, files.len) orelse return error.OutOfMemory;
         const starts = allocator.alloc(u64, files.len) catch return error.OutOfMemory;
-        errdefer allocator.free(starts);
-        const lengths = allocator.alloc(u64, files.len) catch return error.OutOfMemory;
+        const lengths = allocator.alloc(u64, files.len) catch {
+            allocator.free(starts);
+            return error.OutOfMemory;
+        };
 
         var offset: u64 = 0;
         for (files, 0..) |f, i| {

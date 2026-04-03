@@ -251,7 +251,7 @@ fn seederThread(args: SeederArgs) void {
 
     // Run tick-based loop (avoids tracker announce which would block)
     var ticks: usize = 0;
-    while (ticks < 300 and !session_mod.shutdown_requested) : (ticks += 1) {
+    while (ticks < 300 and !session_mod.shutdown_requested.load(.acquire)) : (ticks += 1) {
         sess.tick() catch break;
     }
 }
@@ -302,7 +302,7 @@ test "full session seed and download over loopback" {
     @memcpy(seeder_path_z, seeder_path);
 
     // Reset shutdown flag
-    session_mod.shutdown_requested = false;
+    session_mod.shutdown_requested.store(false, .release);
 
     const seeder_handle = std.Thread.spawn(.{}, seederThread, .{SeederArgs{
         .meta = tm.meta,
@@ -321,7 +321,7 @@ test "full session seed and download over loopback" {
         .download,
         test_port + 1,
     ) catch {
-        session_mod.shutdown_requested = true;
+        session_mod.shutdown_requested.store(true, .release);
         seeder_handle.join();
         return;
     };
@@ -329,7 +329,7 @@ test "full session seed and download over loopback" {
 
     // Connect directly to seeder
     dl_sess.connectDirectPeer(std.net.Address.initIp4(.{ 127, 0, 0, 1 }, test_port)) catch {
-        session_mod.shutdown_requested = true;
+        session_mod.shutdown_requested.store(true, .release);
         seeder_handle.join();
         return;
     };
@@ -341,9 +341,9 @@ test "full session seed and download over loopback" {
     }
 
     // Stop seeder
-    session_mod.shutdown_requested = true;
+    session_mod.shutdown_requested.store(true, .release);
     seeder_handle.join();
-    session_mod.shutdown_requested = false;
+    session_mod.shutdown_requested.store(false, .release);
 
     // Verify download completed
     try std.testing.expect(dl_sess.our_bitfield.isComplete());
