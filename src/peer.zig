@@ -37,6 +37,10 @@ pub const PeerConnection = struct {
     // Request pipeline
     pending_requests: std.ArrayList(wire.Message.BlockRequest),
 
+    // Stats for choking algorithm
+    bytes_downloaded: u64,
+    bytes_uploaded: u64,
+
     // Timestamps
     last_recv_time: i64,
     last_send_time: i64,
@@ -57,6 +61,8 @@ pub const PeerConnection = struct {
             .send_buf = .empty,
             .send_pos = 0,
             .pending_requests = .empty,
+            .bytes_downloaded = 0,
+            .bytes_uploaded = 0,
             .last_recv_time = std.time.timestamp(),
             .last_send_time = std.time.timestamp(),
         };
