@@ -35,8 +35,16 @@ pub fn announce(
         return error.DnsResolveFailed;
     defer addr_list.deinit();
 
-    if (addr_list.addrs.len == 0) return error.DnsResolveFailed;
-    const addr = addr_list.addrs[0];
+    // Find an IPv4 address (UDP tracker protocol uses AF_INET)
+    var addr: ?std.net.Address = null;
+    for (addr_list.addrs) |a| {
+        if (a.any.family == std.posix.AF.INET) {
+            addr = a;
+            break;
+        }
+    }
+    if (addr == null) return error.DnsResolveFailed;
+    const resolved_addr = addr.?;
 
     // Create UDP socket
     const sock = std.posix.socket(
@@ -57,10 +65,10 @@ pub fn announce(
     std.mem.writeInt(u32, connect_buf[8..12], action_connect, .big);
     std.mem.writeInt(u32, connect_buf[12..16], txn_id1, .big);
 
-    _ = std.posix.sendto(sock, &connect_buf, 0, &addr.any, @sizeOf(std.posix.sockaddr.in)) catch
+    _ = std.posix.sendto(sock, &connect_buf, 0, &resolved_addr.any, @sizeOf(std.posix.sockaddr.in)) catch
         return error.SendFailed;
 
-    var recv_buf: [1024]u8 = undefined;
+    var recv_buf: [8192]u8 = undefined; // 8KB: holds ~1360 peers in compact format
     const connect_len = recvWithTimeout(sock, &recv_buf) catch return error.Timeout;
 
     if (connect_len < 16) return error.InvalidResponse;
@@ -87,7 +95,7 @@ pub fn announce(
     std.mem.writeInt(i32, ann_buf[92..96], -1, .big); // num_want = -1 (default)
     std.mem.writeInt(u16, ann_buf[96..98], req.port, .big);
 
-    _ = std.posix.sendto(sock, &ann_buf, 0, &addr.any, @sizeOf(std.posix.sockaddr.in)) catch
+    _ = std.posix.sendto(sock, &ann_buf, 0, &resolved_addr.any, @sizeOf(std.posix.sockaddr.in)) catch
         return error.SendFailed;
 
     const ann_len = recvWithTimeout(sock, &recv_buf) catch return error.Timeout;

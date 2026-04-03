@@ -401,7 +401,12 @@ pub const Session = struct {
             const hash = piece_mod.pieceHash(self.meta.pieces, pd.index) orelse return;
 
             if (piece_mod.verifyPiece(pp_ptr.data, hash)) {
-                self.store.writePiece(pd.index, pp_ptr.data) catch {};
+                self.store.writePiece(pd.index, pp_ptr.data) catch {
+                    // Write failed (disk full, I/O error) -- don't mark as complete.
+                    // Reset the piece so it can be re-downloaded.
+                    pp_ptr.reset();
+                    return;
+                };
                 self.our_bitfield.setPiece(pd.index);
                 self.downloaded += pp_ptr.piece_len;
 

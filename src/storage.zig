@@ -48,7 +48,8 @@ pub const FileMap = struct {
 
     /// Map a (torrent_offset, length) range to FileSlice entries.
     /// Writes into the provided scratch buffer and returns the used portion.
-    pub fn mapRange(self: FileMap, torrent_offset: u64, length: u64, scratch: []FileSlice) []FileSlice {
+    /// Returns error if the scratch buffer is too small to hold all slices.
+    pub fn mapRange(self: FileMap, torrent_offset: u64, length: u64, scratch: []FileSlice) error{ScratchExhausted}![]FileSlice {
         var start = torrent_offset;
         var remaining = length;
         var count: usize = 0;
@@ -59,7 +60,9 @@ pub const FileMap = struct {
             if (self.file_starts[fi] + self.file_lengths[fi] > start) break;
         }
 
-        while (remaining > 0 and fi < self.num_files and count < scratch.len) {
+        while (remaining > 0 and fi < self.num_files) {
+            if (count >= scratch.len) return error.ScratchExhausted;
+
             const file_offset = start - self.file_starts[fi];
             const avail = self.file_lengths[fi] - file_offset;
             const chunk = @min(remaining, avail);
@@ -114,6 +117,13 @@ pub const Storage = struct {
         }
 
         const dir = std.fs.cwd().openDir(output_dir_path, .{}) catch return error.FileOpenFailed;
+
+        // Validate all path components before creating any files (path traversal defense)
+        for (meta.files) |file_info| {
+            for (file_info.path) |comp| {
+                if (!isValidPathComponent(comp)) return error.FileOpenFailed;
+            }
+        }
 
         for (meta.files, 0..) |file_info, i| {
             // Build path from components
@@ -175,7 +185,7 @@ pub const Storage = struct {
     pub fn writePiece(self: *Storage, index: u32, data: []const u8) IoError!void {
         const torrent_offset = @as(u64, index) * self.piece_len;
         var scratch: [64]FileSlice = undefined;
-        const slices = self.file_map.mapRange(torrent_offset, data.len, &scratch);
+        const slices = self.file_map.mapRange(torrent_offset, data.len, &scratch) catch return error.WriteFailed;
 
         var data_pos: usize = 0;
         for (slices) |s| {
@@ -193,7 +203,7 @@ pub const Storage = struct {
         errdefer allocator.free(buf);
 
         var scratch: [64]FileSlice = undefined;
-        const slices = self.file_map.mapRange(torrent_offset, length, &scratch);
+        const slices = self.file_map.mapRange(torrent_offset, length, &scratch) catch return error.ReadFailed;
 
         var buf_pos: usize = 0;
         for (slices) |s| {
@@ -206,6 +216,20 @@ pub const Storage = struct {
         return buf;
     }
 };
+
+/// Reject path components that could escape the output directory.
+fn isValidPathComponent(comp: []const u8) bool {
+    if (comp.len == 0) return false;
+    if (std.mem.eql(u8, comp, "..")) return false;
+    if (std.mem.eql(u8, comp, ".")) return false;
+    // Reject absolute paths and embedded separators
+    if (comp[0] == '/') return false;
+    if (std.mem.indexOfScalar(u8, comp, '/') != null) return false;
+    if (std.mem.indexOfScalar(u8, comp, 0) != null) return false;
+    // Reject backslash (Windows path separator)
+    if (std.mem.indexOfScalar(u8, comp, '\\') != null) return false;
+    return true;
+}
 
 // --- Tests ---
 
@@ -221,7 +245,7 @@ test "file map single file" {
     try std.testing.expectEqual(@as(u64, 0), fm.file_starts[0]);
 
     var scratch: [4]FileSlice = undefined;
-    const slices = fm.mapRange(100, 200, &scratch);
+    const slices = try fm.mapRange(100, 200, &scratch);
     try std.testing.expectEqual(@as(usize, 1), slices.len);
     try std.testing.expectEqual(@as(u32, 0), slices[0].file_index);
     try std.testing.expectEqual(@as(u64, 100), slices[0].file_offset);
@@ -242,7 +266,7 @@ test "file map multi file spanning" {
 
     // Range that spans file a (last 50 bytes) and file b (first 100 bytes)
     var scratch: [4]FileSlice = undefined;
-    const slices = fm.mapRange(50, 150, &scratch);
+    const slices = try fm.mapRange(50, 150, &scratch);
     try std.testing.expectEqual(@as(usize, 2), slices.len);
 
     // First slice: file a, offset 50, length 50
@@ -268,7 +292,7 @@ test "file map three file span" {
 
     // Span all three files
     var scratch: [4]FileSlice = undefined;
-    const slices = fm.mapRange(5, 20, &scratch);
+    const slices = try fm.mapRange(5, 20, &scratch);
     try std.testing.expectEqual(@as(usize, 3), slices.len);
     try std.testing.expectEqual(@as(u64, 5), slices[0].length); // a: 5 bytes
     try std.testing.expectEqual(@as(u64, 10), slices[1].length); // b: all 10
