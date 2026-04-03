@@ -167,45 +167,61 @@ pub const Dht = struct {
             }
         }
 
-        // Collect responses
+        // Iterative lookup: collect responses and query closer nodes we discover.
         var recv_buf: [8192]u8 = undefined;
         const sock = self.sock orelse return peers.toOwnedSlice(allocator) catch return error.OutOfMemory;
 
-        var rounds: usize = 0;
-        while (rounds < 5) : (rounds += 1) {
-            var src_addr: std.posix.sockaddr = undefined;
-            var addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
-            const n = std.posix.recvfrom(sock, &recv_buf, 0, &src_addr, &addr_len) catch break;
-            if (n == 0) break;
+        var iterations: usize = 0;
+        while (iterations < 3) : (iterations += 1) {
+            // Drain responses for this iteration
+            var rounds: usize = 0;
+            while (rounds < 8) : (rounds += 1) {
+                var src_addr: std.posix.sockaddr = undefined;
+                var addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
+                const n = std.posix.recvfrom(sock, &recv_buf, 0, &src_addr, &addr_len) catch break;
+                if (n == 0) break;
 
-            // Parse response
-            const resp = bencode.decode(allocator, recv_buf[0..n]) catch continue;
-            defer resp.deinit(allocator);
+                // Parse response
+                const resp = bencode.decode(allocator, recv_buf[0..n]) catch continue;
+                defer resp.deinit(allocator);
 
-            // Check for "values" (peers)
-            if (resp.dictGet("r")) |r_dict| {
-                if (r_dict.dictGet("values")) |values| {
-                    if (values.asList()) |peer_list| {
-                        for (peer_list) |peer_val| {
-                            if (peer_val.asString()) |compact| {
-                                if (compact.len == 6) {
-                                    const peer = tracker_mod.Peer{
-                                        .ip = .{ compact[0], compact[1], compact[2], compact[3] },
-                                        .port = @as(u16, compact[4]) << 8 | @as(u16, compact[5]),
-                                    };
-                                    peers.append(allocator, peer) catch continue;
+                // Check for "values" (peers)
+                if (resp.dictGet("r")) |r_dict| {
+                    if (r_dict.dictGet("values")) |values| {
+                        if (values.asList()) |peer_list| {
+                            for (peer_list) |peer_val| {
+                                if (peer_val.asString()) |compact| {
+                                    if (compact.len == 6) {
+                                        const peer = tracker_mod.Peer{
+                                            .ip = .{ compact[0], compact[1], compact[2], compact[3] },
+                                            .port = @as(u16, compact[4]) << 8 | @as(u16, compact[5]),
+                                        };
+                                        peers.append(allocator, peer) catch continue;
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                // Process "nodes" for routing table
-                if (r_dict.dictGet("nodes")) |nodes_val| {
-                    if (nodes_val.asString()) |compact_nodes| {
-                        self.addCompactNodes(compact_nodes);
+                    // Process "nodes" for routing table
+                    if (r_dict.dictGet("nodes")) |nodes_val| {
+                        if (nodes_val.asString()) |compact_nodes| {
+                            self.addCompactNodes(compact_nodes);
+                        }
                     }
                 }
+            }
+
+            // If we found peers, we're done
+            if (peers.items.len > 0) break;
+
+            // Otherwise, query the closer nodes we just learned about
+            var next_closest = self.findClosest(info_hash, k);
+            defer next_closest.deinit(self.allocator);
+            if (next_closest.items.len == 0) break;
+
+            for (next_closest.items) |node| {
+                self.sendGetPeers(node.address, info_hash) catch continue;
             }
         }
 
