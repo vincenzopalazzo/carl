@@ -44,6 +44,8 @@ pub fn main() !void {
         }
         // Reassemble magnet URIs that the shell may have split on '&'.
         // e.g. magnet:?xt=...&dn=... becomes multiple argv entries when unquoted.
+        // Note: consumed fragments remain in args[3..] but are harmless —
+        // parseFlag only matches "--output-dir" / "--port" which can't collide.
         const source = blk: {
             if (!std.mem.startsWith(u8, args[2], "magnet:")) break :blk args[2];
             var parts: std.ArrayList(u8) = .empty;

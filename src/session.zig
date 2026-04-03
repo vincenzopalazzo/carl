@@ -972,12 +972,15 @@ pub const Session = struct {
         // Run choking algorithm
         self.runChokingAlgorithm();
 
-        // Re-announce / DHT retry
-        // Use a shorter interval when we have no peers (e.g. DHT-only magnet)
-        const base_interval = std.math.cast(i64, self.tracker_interval) orelse 1800;
-        const interval_secs = if (self.peers.items.len == 0) @min(base_interval, 30) else base_interval;
+        // Re-announce to trackers at the tracker-provided interval
+        const interval_secs = std.math.cast(i64, self.tracker_interval) orelse 1800;
         if (now - self.last_announce_time > interval_secs) {
             self.doMultiTrackerAnnounce(.none) catch {};
+        }
+
+        // DHT: retry more aggressively when we have zero peers
+        if (self.peers.items.len == 0 and now - self.last_announce_time > 30) {
+            self.tryDhtPeerDiscovery() catch {};
         }
     }
 

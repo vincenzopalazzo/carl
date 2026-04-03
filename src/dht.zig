@@ -217,12 +217,15 @@ pub const Dht = struct {
 
             // Otherwise, query the closer nodes we just learned about
             var next_closest = self.findClosest(info_hash, k);
-            defer next_closest.deinit(self.allocator);
-            if (next_closest.items.len == 0) break;
+            if (next_closest.items.len == 0) {
+                next_closest.deinit(self.allocator);
+                break;
+            }
 
             for (next_closest.items) |node| {
                 self.sendGetPeers(node.address, info_hash) catch continue;
             }
+            next_closest.deinit(self.allocator);
         }
 
         return peers.toOwnedSlice(allocator) catch return error.OutOfMemory;
