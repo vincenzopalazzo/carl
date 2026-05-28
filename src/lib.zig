@@ -10,6 +10,14 @@ pub const session = @import("session.zig");
 pub const magnet = @import("magnet.zig");
 pub const extension = @import("extension.zig");
 pub const dht = @import("dht.zig");
+pub const secp = @import("secp.zig");
+pub const ws = @import("ws.zig");
+pub const nip19 = @import("nip19.zig");
+pub const nostr = @import("nostr.zig");
+pub const nip35 = @import("nip35.zig");
+pub const peer_announce = @import("peer_announce.zig");
+pub const relay = @import("relay.zig");
+pub const nostr_config = @import("nostr_config.zig");
 
 test {
     _ = bencode;
@@ -23,5 +31,13 @@ test {
     _ = magnet;
     _ = extension;
     _ = dht;
+    _ = secp;
+    _ = ws;
+    _ = nip19;
+    _ = nostr;
+    _ = nip35;
+    _ = peer_announce;
+    _ = relay;
+    _ = nostr_config;
     _ = @import("integration_test.zig");
 }
