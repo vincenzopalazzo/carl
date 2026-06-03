@@ -204,6 +204,16 @@ pub const Conn = struct {
                         return error.ProtocolError;
                     }
                     self.fragment_opcode = frame.opcode;
+                    // Enforce the per-message cap across fragments. Without this
+                    // a relay could send many continuation frames each under
+                    // `max_payload_len` but whose sum exceeds it, defeating the
+                    // cap that `readFrame` enforces per-frame.
+                    if (self.fragment_buf.items.len + frame.payload.len > max_payload_len) {
+                        self.allocator.free(frame.payload);
+                        self.fragment_buf.clearRetainingCapacity();
+                        self.fragment_opcode = null;
+                        return error.PayloadTooLarge;
+                    }
                     self.fragment_buf.appendSlice(self.allocator, frame.payload) catch {
                         self.allocator.free(frame.payload);
                         return error.OutOfMemory;
@@ -220,6 +230,12 @@ pub const Conn = struct {
                     if (self.fragment_opcode == null) {
                         self.allocator.free(frame.payload);
                         return error.ProtocolError;
+                    }
+                    if (self.fragment_buf.items.len + frame.payload.len > max_payload_len) {
+                        self.allocator.free(frame.payload);
+                        self.fragment_buf.clearRetainingCapacity();
+                        self.fragment_opcode = null;
+                        return error.PayloadTooLarge;
                     }
                     self.fragment_buf.appendSlice(self.allocator, frame.payload) catch {
                         self.allocator.free(frame.payload);

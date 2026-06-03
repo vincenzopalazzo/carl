@@ -57,6 +57,13 @@ pub fn writeSecretKey(allocator: Allocator, sk: secp.SecretKey) ![]u8 {
 
     var file = try std.fs.cwd().createFile(path, .{ .truncate = true, .mode = 0o600 });
     defer file.close();
+    // `createFile`'s mode is only used when the file is newly created. If an
+    // earlier-keygen left the file world- or group-readable, overwriting it
+    // doesn't tighten the perms. Explicitly fchmod every write so the
+    // documented 0600 invariant actually holds. `chmod` errors are surfaced
+    // because a key file we can't restrict is a real security problem the
+    // user needs to know about.
+    try file.chmod(0o600);
     try file.writeAll(nsec);
     try file.writeAll("\n");
     return nsec;
@@ -95,20 +102,26 @@ pub fn readSecretKey(allocator: Allocator) !secp.SecretKey {
     return parseNsecFile(buf[0..n]);
 }
 
-/// Read the relay list from `<config>/relays` (one per line). If absent or
-/// empty, return the default relay list. Caller owns the slice and each entry.
+/// Read the relay list from `<config>/relays` (one per line). Fall back to
+/// the default public relay set ONLY when the file is genuinely absent or
+/// the user wrote an empty file — any other I/O error (permissions, partial
+/// read, etc.) surfaces. A user who configured only private relays must not
+/// have their announce/search silently routed to the public defaults if
+/// their config file is unreadable for some reason. Caller owns the slice
+/// and each entry.
 pub fn readRelays(allocator: Allocator) ![][]const u8 {
     const dir = try configDir(allocator);
     defer allocator.free(dir);
     const path = try std.fmt.allocPrint(allocator, "{s}/relays", .{dir});
     defer allocator.free(path);
 
-    var file = std.fs.cwd().openFile(path, .{}) catch {
-        return dupeDefaults(allocator);
+    var file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return dupeDefaults(allocator),
+        else => return err,
     };
     defer file.close();
 
-    const data = file.readToEndAlloc(allocator, 64 * 1024) catch return dupeDefaults(allocator);
+    const data = try file.readToEndAlloc(allocator, 64 * 1024);
     defer allocator.free(data);
 
     var list: std.ArrayList([]const u8) = .empty;

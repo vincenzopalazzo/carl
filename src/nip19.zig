@@ -199,26 +199,15 @@ pub fn decodeTlv(allocator: Allocator, input: []const u8) Error!TlvDecoded {
     // Parse TLV records: type (1B), length (1B), value.
     var list: std.ArrayList(Tlv) = .empty;
     errdefer list.deinit(allocator);
+    errdefer allocator.free(owned);
     var off: usize = 0;
     while (off < owned.len) {
-        if (off + 2 > owned.len) {
-            list.deinit(allocator);
-            allocator.free(owned);
-            return error.BadTlv;
-        }
+        if (off + 2 > owned.len) return error.BadTlv;
         const t = owned[off];
         const len = owned[off + 1];
         off += 2;
-        if (off + len > owned.len) {
-            list.deinit(allocator);
-            allocator.free(owned);
-            return error.BadTlv;
-        }
-        list.append(allocator, .{ .type = t, .value = owned[off .. off + len] }) catch {
-            list.deinit(allocator);
-            allocator.free(owned);
-            return error.OutOfMemory;
-        };
+        if (off + len > owned.len) return error.BadTlv;
+        try list.append(allocator, .{ .type = t, .value = owned[off .. off + len] });
         off += len;
     }
 

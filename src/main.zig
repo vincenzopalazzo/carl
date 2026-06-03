@@ -473,8 +473,14 @@ fn cmdSearch(
         seen.deinit();
     }
 
+    // `--limit n` is the global cap on printed results across ALL relays, not
+    // a per-relay multiplier. With 3 default relays this prevents `--limit 10`
+    // from printing up to 30 unique results.
+    var printed: u32 = 0;
     var found_any = false;
-    for (relay_urls) |url| {
+    relay_loop: for (relay_urls) |url| {
+        if (printed >= limit) break;
+
         var r = carl.relay.Relay.connect(allocator, url) catch |err| {
             log.warn("relay {s}: {}", .{ url, err });
             continue;
@@ -516,6 +522,8 @@ fn cmdSearch(
 
             found_any = true;
             try printSearchResult(stdout, entry);
+            printed += 1;
+            if (printed >= limit) break :relay_loop;
         }
     }
 

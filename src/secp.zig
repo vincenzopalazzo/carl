@@ -11,6 +11,12 @@ const std = @import("std");
 const c = @cImport({
     @cDefine("ENABLE_MODULE_SCHNORRSIG", "1");
     @cDefine("ENABLE_MODULE_EXTRAKEYS", "1");
+    // libsecp256k1 marks its public API as `__declspec(dllimport)` on
+    // MSVC/MinGW unless SECP256K1_STATIC is defined. We always link it as a
+    // static library via build.zig, so the import-style declarations would
+    // cause Windows cross-builds to fail looking for `__imp_*` symbols.
+    // Setting the macro is a no-op on POSIX, so it's safe to set everywhere.
+    @cDefine("SECP256K1_STATIC", "1");
     @cInclude("secp256k1.h");
     @cInclude("secp256k1_extrakeys.h");
     @cInclude("secp256k1_schnorrsig.h");
