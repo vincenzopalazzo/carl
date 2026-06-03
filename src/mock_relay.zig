@@ -79,8 +79,11 @@ pub const MockRelay = struct {
     }
 
     /// Block until the client connects, then perform the WS server handshake.
-    /// On success, `self.stream` is set.
+    /// On success, `self.stream` is set. Single-use: a second call returns
+    /// `error.AcceptFailed` rather than silently overwriting (and leaking)
+    /// the prior connection.
     pub fn accept(self: *MockRelay) Error!void {
+        if (self.stream != null) return error.AcceptFailed;
         const accepted = self.server.accept() catch return error.AcceptFailed;
         self.stream = accepted.stream;
         try self.performHandshake();

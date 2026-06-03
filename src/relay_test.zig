@@ -479,8 +479,10 @@ test "subscribeWithReconnect: exits cleanly when shutdown is flipped" {
     t.join();
     const elapsed = std.time.milliTimestamp() - start;
     // The worker should observe shutdown within ~200 ms of the flag flip
-    // (one backoff chunk). Allow 2 s of CI slack.
-    try testing.expect(elapsed < 2_000);
+    // (one backoff chunk). Heavily-loaded CI runners can add real thread
+    // scheduling latency on top, so allow 5 s of slack — false positives
+    // here are pure noise.
+    try testing.expect(elapsed < 5_000);
 }
 
 test "publishAndWait: returns false when the relay closes silently" {

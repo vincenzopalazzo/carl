@@ -305,7 +305,12 @@ pub fn subscribeWithReconnect(
         var relay = Relay.connect(allocator, url) catch |err| {
             log.warn("reconnect to {s} failed: {} (attempt {d})", .{ url, err, attempt });
             attempt += 1;
-            const elapsed: u64 = @intCast(std.time.milliTimestamp() - last_success_ms);
+            // `milliTimestamp` is wall-clock, so an NTP step or manual clock
+            // adjustment can drift it backward across reconnect attempts.
+            // Clamp at 0 so we don't underflow into a huge u64 that
+            // immediately trips the abandon condition.
+            const raw = std.time.milliTimestamp() - last_success_ms;
+            const elapsed: u64 = if (raw < 0) 0 else @intCast(raw);
             if (elapsed > opts.backoff.abandon_after_ms) {
                 log.err("relay {s} unreachable for {d}ms; aborting subscription", .{ url, elapsed });
                 return error.SubscribeFailed;
