@@ -119,23 +119,26 @@ pub fn parse(event: nostr.Event) Error!PeerAnnounce {
     const port = std.fmt.parseUnsigned(u16, port_str, 10) catch return error.BadPort;
     if (port == 0) return error.BadPort;
 
-    if (event.firstTagValue("ip")) |ip_str| {
-        const ip = parseIpv4(ip_str) orelse return error.BadIp;
-        if (!isRoutable(ip)) return error.UnsafeIp;
-        return .{
-            .info_hash = info_hash,
-            .endpoint = .{ .ipv4 = .{ .ip = ip, .port = port } },
-            .pubkey = event.pubkey,
-            .created_at = event.created_at,
-        };
+    // Prefer a valid `host` (.onion) over `ip` when both are present so a signed
+    // event cannot smuggle a clearnet endpoint alongside an onion hostname.
+    if (event.firstTagValue("host")) |host| {
+        if (isValidV3OnionHost(host)) {
+            return .{
+                .info_hash = info_hash,
+                .endpoint = .{ .onion = .{ .host = host, .port = port } },
+                .pubkey = event.pubkey,
+                .created_at = event.created_at,
+            };
+        }
+        return error.BadHost;
     }
 
-    const host = event.firstTagValue("host") orelse return error.BadHost;
-    if (!isValidV3OnionHost(host)) return error.BadHost;
-
+    const ip_str = event.firstTagValue("ip") orelse return error.BadIp;
+    const ip = parseIpv4(ip_str) orelse return error.BadIp;
+    if (!isRoutable(ip)) return error.UnsafeIp;
     return .{
         .info_hash = info_hash,
-        .endpoint = .{ .onion = .{ .host = host, .port = port } },
+        .endpoint = .{ .ipv4 = .{ .ip = ip, .port = port } },
         .pubkey = event.pubkey,
         .created_at = event.created_at,
     };

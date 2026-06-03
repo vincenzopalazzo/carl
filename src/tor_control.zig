@@ -111,6 +111,11 @@ fn connectControl(allocator: Allocator, addr_str: []const u8) !std.net.Stream {
     const host = addr_str[0..colon];
     const port = std.fmt.parseUnsigned(u16, addr_str[colon + 1 ..], 10) catch return error.ConnectFailed;
 
+    if (!isLoopbackControlHost(host)) {
+        log.err("refusing non-loopback Tor control host '{s}' (use 127.0.0.1 or localhost)", .{host});
+        return error.ConnectFailed;
+    }
+
     const list = std.net.getAddressList(allocator, host, port) catch return error.ConnectFailed;
     defer list.deinit();
 
@@ -131,9 +136,10 @@ fn authenticate(allocator: Allocator, stream: std.net.Stream, cookie_path: []con
         hex_buf.writer(allocator).print("{x:0>2}", .{b}) catch return error.AuthFailed;
     }
 
-    var cmd_buf: [512]u8 = undefined;
-    const cmd = std.fmt.bufPrint(&cmd_buf, "AUTHENTICATE {s}\r\n", .{hex_buf.items}) catch return error.AuthFailed;
-    sendCommand(stream, cmd) catch return error.AuthFailed;
+    var cmd_list: std.ArrayList(u8) = .empty;
+    defer cmd_list.deinit(allocator);
+    cmd_list.writer(allocator).print("AUTHENTICATE {s}\r\n", .{hex_buf.items}) catch return error.AuthFailed;
+    sendCommand(stream, cmd_list.items) catch return error.AuthFailed;
     const reply = readReply(stream) catch return error.AuthFailed;
     if (!std.mem.startsWith(u8, reply, "250")) return error.AuthFailed;
 }
@@ -183,11 +189,34 @@ pub fn parseServiceId(allocator: Allocator, reply: []const u8) Error![]u8 {
         const prefix = "250-ServiceID=";
         if (std.mem.startsWith(u8, line, prefix)) {
             const id = line[prefix.len..];
-            if (id.len == 0) return error.InvalidResponse;
+            if (!isValidServiceId(id)) return error.InvalidResponse;
             return try allocator.dupe(u8, id);
         }
     }
     return error.InvalidResponse;
+}
+
+/// Tor v3 hidden-service service id: 56-char base32 (same alphabet as onion label).
+fn isValidServiceId(id: []const u8) bool {
+    if (id.len != 56) return false;
+    for (id) |c| {
+        const ok = (c >= 'a' and c <= 'z') or (c >= '2' and c <= '7');
+        if (!ok) return false;
+    }
+    return true;
+}
+
+fn isLoopbackControlHost(host: []const u8) bool {
+    if (std.mem.eql(u8, host, "localhost")) return true;
+    if (std.net.Ip4Address.parse(host, 0)) |addr| {
+        const o = std.mem.asBytes(&addr.sa.addr);
+        return o[0] == 127;
+    } else |_| {}
+    if (std.net.Ip6Address.parse(host, 0)) |addr| {
+        const o = std.mem.asBytes(&addr.sa.addr);
+        return std.mem.eql(u8, o, &[_]u8{0} ** 15 ++ .{1});
+    } else |_| {}
+    return false;
 }
 
 fn isValidV3OnionHost(host: []const u8) bool {

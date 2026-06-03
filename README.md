@@ -161,10 +161,11 @@ carl seed file.torrent /path/to/data --tor-seed --nostr \
 carl download file.torrent --nostr --proxy socks5h://127.0.0.1:9050
 ```
 
-Carl creates an ephemeral v3 onion, listens on `127.0.0.1`, publishes the
-`.onion` endpoint in kind 30078 (no public IPv4), and routes Nostr `wss`
-through `--tor-socks` (default `socks5h://127.0.0.1:9050`). Tracker/DHT
-announces are disabled in this mode so your real IP is not leaked to trackers.
+Carl creates an ephemeral v3 onion, listens on `127.0.0.1`, and publishes the
+`.onion` endpoint in kind 30078 (no public IPv4). Leechers dial the onion via
+`--proxy socks5h://127.0.0.1:9050`. Nostr relay `wss` uses clearnet today
+(proxied `wss` is not implemented); tracker/DHT announces are disabled in
+tor-seed mode so your real IP is not leaked to trackers.
 
 ### Download using Nostr peer-discovery
 

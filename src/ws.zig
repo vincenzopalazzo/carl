@@ -122,19 +122,21 @@ pub const Conn = struct {
         connection: *std.http.Client.Connection,
     };
 
+    const tls_io_buf_len = tls.max_ciphertext_record_len;
+
     const TlsProxyIo = struct {
         stream: std.net.Stream,
+        socket_reader: std.net.Stream.Reader,
+        socket_writer: std.net.Stream.Writer,
         tls: tls.Client,
-        socket_read_buf: []u8,
-        socket_write_buf: []u8,
-        tls_read_buf: []u8,
-        tls_write_buf: []u8,
+        ca_bundle: std.crypto.Certificate.Bundle,
+        socket_read_buf: [tls_io_buf_len]u8,
+        socket_write_buf: [tls_io_buf_len]u8,
+        tls_read_buf: [tls_io_buf_len]u8,
+        tls_write_buf: [tls_io_buf_len]u8,
 
         fn deinit(self: *TlsProxyIo, allocator: Allocator) void {
-            allocator.free(self.socket_read_buf);
-            allocator.free(self.socket_write_buf);
-            allocator.free(self.tls_read_buf);
-            allocator.free(self.tls_write_buf);
+            self.ca_bundle.deinit(allocator);
             self.stream.close();
             allocator.destroy(self);
         }
@@ -144,8 +146,9 @@ pub const Conn = struct {
         const url = try parseUrl(url_input);
 
         if (url.secure) {
-            if (options.proxy) |px| {
-                return connectWssProxied(allocator, url, px);
+            if (options.proxy != null) {
+                log.warn("wss over proxy is not supported; use relay.connect or clearnet", .{});
+                return error.ConnectFailed;
             }
             const client = try allocator.create(std.http.Client);
             client.* = .{ .allocator = allocator };
@@ -323,57 +326,6 @@ pub const Conn = struct {
     fn performHandshake(self: *Conn, url: Url) Error!void {
         if (self.http) |h| return performHandshakeHttps(self, url, h);
         return performHandshakePlain(self, url);
-    }
-
-    fn connectWssProxied(allocator: Allocator, url: Url, px: proxy_mod.Proxy) Error!Conn {
-        const stream = proxy_mod.connectThroughProxyHost(allocator, px, url.host, url.port) catch {
-            log.warn("proxy connect to {s}:{d} failed", .{ url.host, url.port });
-            return error.ConnectFailed;
-        };
-        errdefer stream.close();
-
-        const min = tls.Client.min_buffer_len;
-        const tp = try allocator.create(TlsProxyIo);
-        errdefer allocator.destroy(tp);
-
-        tp.socket_read_buf = try allocator.alloc(u8, min);
-        errdefer allocator.free(tp.socket_read_buf);
-        tp.socket_write_buf = try allocator.alloc(u8, min);
-        errdefer allocator.free(tp.socket_write_buf);
-        tp.tls_read_buf = try allocator.alloc(u8, min);
-        errdefer allocator.free(tp.tls_read_buf);
-        tp.tls_write_buf = try allocator.alloc(u8, min);
-        errdefer allocator.free(tp.tls_write_buf);
-
-        tp.stream = stream;
-        var sr = stream.reader(tp.socket_read_buf);
-        var sw = stream.writer(tp.socket_write_buf);
-
-        var ca_bundle: std.crypto.Certificate.Bundle = .{};
-        ca_bundle.rescan(allocator) catch return error.TlsInitFailed;
-        defer ca_bundle.deinit(allocator);
-
-        tp.tls = tls.Client.init(sr.interface(), &sw.interface, .{
-            .host = .{ .explicit = url.host },
-            .ca = .{ .bundle = ca_bundle },
-            .read_buffer = tp.tls_read_buf,
-            .write_buffer = tp.tls_write_buf,
-            .allow_truncation_attacks = true,
-        }) catch return error.TlsInitFailed;
-
-        var conn = Conn{
-            .allocator = allocator,
-            .stream = stream,
-            .http = null,
-            .tls_proxy = tp,
-            .fragment_buf = .empty,
-            .fragment_opcode = null,
-        };
-        errdefer conn.deinit();
-
-        try conn.performHandshake(url);
-        setRecvTimeout(conn.stream, 30);
-        return conn;
     }
 
     /// `wss://` upgrade via `std.http.Client` — the same stack as HTTPS
@@ -596,8 +548,7 @@ pub const Conn = struct {
         } else if (self.tls_proxy) |t| {
             t.tls.writer.writeAll(buf) catch return error.SendFailed;
             t.tls.writer.flush() catch return error.SendFailed;
-            var sw = t.stream.writer(t.socket_write_buf);
-            sw.interface.flush() catch return error.SendFailed;
+            t.socket_writer.interface.flush() catch return error.SendFailed;
         } else {
             var off: usize = 0;
             while (off < buf.len) {
