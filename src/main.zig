@@ -60,14 +60,28 @@ pub fn main() !void {
         };
         const output_dir = parseFlag(args[3..], "--output-dir") orelse ".";
         const port = parsePort(args[3..]);
-        try cmdDownload(allocator, source, output_dir, port, parseProxy(args[3..]));
+        const want_nostr = parseFlagPresent(args[3..], "--nostr");
+        try cmdDownload(allocator, source, output_dir, port, parseProxy(args[3..]), want_nostr);
     } else if (std.mem.eql(u8, command, "seed")) {
         if (args.len < 4) {
-            log.err("usage: carl seed <file.torrent> <data-dir> [--port <port>]", .{});
+            log.err("usage: carl seed <file.torrent> <data-dir> [--port <port>] [--nostr] [--external-ip <ip>]", .{});
             std.process.exit(1);
         }
         const port = parsePort(args[4..]);
-        try cmdSeed(allocator, args[2], args[3], port, parseProxy(args[4..]));
+        const want_nostr = parseFlagPresent(args[4..], "--nostr");
+        const external_ip = parseFlag(args[4..], "--external-ip");
+        const description = parseFlag(args[4..], "--description") orelse "";
+        try cmdSeed(allocator, args[2], args[3], port, parseProxy(args[4..]), want_nostr, external_ip, description);
+    } else if (std.mem.eql(u8, command, "search")) {
+        if (args.len < 3) {
+            log.err("usage: carl search <query> [--limit <n>] [--relay <url>]", .{});
+            std.process.exit(1);
+        }
+        const limit = parseUnsignedFlag(args[3..], "--limit", 50);
+        const single_relay = parseFlag(args[3..], "--relay");
+        try cmdSearch(allocator, stdout, args[2], limit, single_relay);
+    } else if (std.mem.eql(u8, command, "nostr-keygen")) {
+        try cmdNostrKeygen(allocator, stdout);
     } else {
         log.err("unknown command: {s}", .{command});
         std.process.exit(1);
@@ -80,11 +94,17 @@ fn printUsage() void {
         \\usage: carl <command> [args]
         \\
         \\commands:
-        \\  info <file.torrent>                      show torrent metadata
-        \\  announce <file.torrent> [--proxy url]    query tracker for peers
-        \\  download <source> [--output-dir d] [--port p] [--proxy url]  download torrent
+        \\  info <file.torrent>                              show torrent metadata
+        \\  announce <file.torrent> [--proxy url]            query tracker for peers
+        \\  download <source> [--output-dir d] [--port p] [--proxy url] [--nostr]
         \\           source: file.torrent, magnet:?..., or http(s):// URL
-        \\  seed <file.torrent> <data-dir> [--port p] [--proxy url]      seed existing data
+        \\           --nostr: also subscribe to nostr peer-announce events
+        \\  seed <file.torrent> <data-dir> [--port p] [--proxy url] [--nostr] [--external-ip <ip>] [--description "..."]
+        \\           --nostr: publish NIP-35 torrent event + peer-announce
+        \\           --external-ip: required with --nostr; the IP peers should dial
+        \\  search <query> [--limit n] [--relay <wss://...>]
+        \\           search nostr relays for kind-2003 torrent events
+        \\  nostr-keygen                                     generate a fresh nostr key
         \\
         \\  --proxy url   route peers and HTTP trackers through a proxy. Forms:
         \\                socks5h://[user:pass@]host:port  (remote DNS, no leak)
@@ -184,7 +204,7 @@ fn cmdAnnounce(allocator: std.mem.Allocator, stdout: anytype, path: []const u8, 
     }
 }
 
-fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []const u8, port: u16, proxy: ?carl.proxy.Proxy) !void {
+fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []const u8, port: u16, proxy: ?carl.proxy.Proxy, want_nostr: bool) !void {
     if (std.mem.startsWith(u8, source, "magnet:")) {
         // Magnet link
         const ml = carl.magnet.parse(allocator, source) catch |err| {
@@ -269,6 +289,9 @@ fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []c
         session.info_hash = ml.info_hash; // Use magnet's hash, not SHA1("")
         session.metadata_download = carl.extension.MetadataDownload.init(allocator, ml.info_hash);
         session.metadata_only = true;
+        if (want_nostr) {
+            collectNostrPeers(allocator, ml.info_hash, &session);
+        }
         session.run() catch |err| {
             log.err("session failed: {}", .{err});
             std.process.exit(1);
@@ -287,22 +310,26 @@ fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []c
             std.process.exit(1);
         };
         defer mi.deinit(allocator);
-        startDownload(allocator, mi, output_dir, port, proxy);
+        startDownload(allocator, mi, output_dir, port, proxy, want_nostr);
     } else {
         // File path
         const mi = readTorrent(allocator, source);
         defer mi.deinit(allocator);
-        startDownload(allocator, mi, output_dir, port, proxy);
+        startDownload(allocator, mi, output_dir, port, proxy, want_nostr);
     }
 }
 
-fn startDownload(allocator: std.mem.Allocator, mi: carl.metainfo.Metainfo, output_dir: []const u8, port: u16, proxy: ?carl.proxy.Proxy) void {
+fn startDownload(allocator: std.mem.Allocator, mi: carl.metainfo.Metainfo, output_dir: []const u8, port: u16, proxy: ?carl.proxy.Proxy, want_nostr: bool) void {
     std.fs.cwd().makePath(output_dir) catch {};
     var session = carl.session.Session.init(allocator, mi, output_dir, .download, port, proxy) catch |err| {
         log.err("failed to initialize session: {}", .{err});
         std.process.exit(1);
     };
     defer session.deinit();
+    if (want_nostr) {
+        const info_hash = carl.metainfo.infoHash(mi.raw_info);
+        collectNostrPeers(allocator, info_hash, &session);
+    }
     session.run() catch |err| {
         log.err("session failed: {}", .{err});
         std.process.exit(1);
@@ -345,9 +372,32 @@ fn fetchUrl(allocator: std.mem.Allocator, url: []const u8, proxy: ?carl.proxy.Pr
     return response_body.toOwnedSlice(allocator);
 }
 
-fn cmdSeed(allocator: std.mem.Allocator, torrent_path: []const u8, data_dir: []const u8, port: u16, proxy: ?carl.proxy.Proxy) !void {
+fn cmdSeed(
+    allocator: std.mem.Allocator,
+    torrent_path: []const u8,
+    data_dir: []const u8,
+    port: u16,
+    proxy: ?carl.proxy.Proxy,
+    want_nostr: bool,
+    external_ip: ?[]const u8,
+    description: []const u8,
+) !void {
     const mi = readTorrent(allocator, torrent_path);
     defer mi.deinit(allocator);
+
+    if (want_nostr) {
+        if (external_ip == null) {
+            log.err("--nostr requires --external-ip <ip> so peers know how to dial you", .{});
+            std.process.exit(1);
+        }
+        const ip = parseIpv4(external_ip.?) orelse {
+            log.err("invalid --external-ip: {s}", .{external_ip.?});
+            std.process.exit(1);
+        };
+        publishNostr(allocator, mi, ip, port, description) catch |err| {
+            log.warn("nostr publish failed: {} (continuing seed)", .{err});
+        };
+    }
 
     var session = carl.session.Session.init(allocator, mi, data_dir, .seed, port, proxy) catch |err| {
         log.err("failed to initialize session: {}", .{err});
@@ -359,6 +409,289 @@ fn cmdSeed(allocator: std.mem.Allocator, torrent_path: []const u8, data_dir: []c
         log.err("session failed: {}", .{err});
         std.process.exit(1);
     };
+}
+
+// -------------------------------------------------------------------------
+// `carl search`
+// -------------------------------------------------------------------------
+
+fn cmdSearch(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    query: []const u8,
+    limit: u32,
+    single_relay: ?[]const u8,
+) !void {
+    var relay_urls: [][]const u8 = undefined;
+    var relays_owned = false;
+    if (single_relay) |r| {
+        const arr = try allocator.alloc([]const u8, 1);
+        arr[0] = r;
+        relay_urls = arr;
+    } else {
+        relay_urls = carl.nostr_config.readRelays(allocator) catch |err| {
+            log.err("could not read relay config: {}", .{err});
+            std.process.exit(1);
+        };
+        relays_owned = true;
+    }
+    defer {
+        if (relays_owned) {
+            carl.nostr_config.freeRelays(allocator, relay_urls);
+        } else {
+            allocator.free(relay_urls);
+        }
+    }
+
+    log.info("searching {d} relays for '{s}' (limit {d})", .{ relay_urls.len, query, limit });
+
+    // Use the relay's NIP-50 `search` filter where available; if a relay
+    // doesn't support it, it'll just return events matching `kinds` and we
+    // filter client-side.
+    const filter: carl.nostr.Filter = .{
+        .kinds = &[_]u32{carl.nip35.kind_torrent},
+        .limit = limit,
+        .search = query,
+    };
+
+    var seen = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = seen.iterator();
+        while (it.next()) |e| allocator.free(e.key_ptr.*);
+        seen.deinit();
+    }
+
+    var found_any = false;
+    for (relay_urls) |url| {
+        var r = carl.relay.Relay.connect(allocator, url) catch |err| {
+            log.warn("relay {s}: {}", .{ url, err });
+            continue;
+        };
+        defer r.deinit();
+
+        const events = carl.relay.subscribeAndCollect(allocator, &r, filter, .{
+            .timeout_ms = 15_000,
+            .max_events = @as(usize, @intCast(limit)) * 4,
+            .verify_signatures = true,
+        }) catch |err| {
+            log.warn("relay {s} search failed: {}", .{ url, err });
+            continue;
+        };
+        defer {
+            for (events) |e| e.deinit(allocator);
+            allocator.free(events);
+        }
+
+        for (events) |ev| {
+            // Dedupe by event id.
+            var id_hex_buf: [carl.nostr.event_id_len * 2]u8 = undefined;
+            carl.secp.toHex(&ev.id, &id_hex_buf);
+            const id_hex_owned = try allocator.dupe(u8, &id_hex_buf);
+            const gop = seen.getOrPut(id_hex_owned) catch {
+                allocator.free(id_hex_owned);
+                continue;
+            };
+            if (gop.found_existing) {
+                allocator.free(id_hex_owned);
+                continue;
+            }
+
+            const entry = carl.nip35.parseEvent(allocator, ev) catch continue;
+            defer entry.deinit(allocator);
+
+            // Filter client-side too in case the relay ignored `search`.
+            if (!textMatches(entry.title, query) and !textMatches(entry.description, query)) continue;
+
+            found_any = true;
+            try printSearchResult(stdout, entry);
+        }
+    }
+
+    if (!found_any) {
+        try stdout.print("no results\n", .{});
+    }
+}
+
+fn textMatches(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    // Case-insensitive ASCII substring search.
+    if (haystack.len < needle.len) return false;
+    const max_off = haystack.len - needle.len + 1;
+    var off: usize = 0;
+    while (off < max_off) : (off += 1) {
+        var match = true;
+        for (needle, 0..) |n, i| {
+            const h = std.ascii.toLower(haystack[off + i]);
+            const l = std.ascii.toLower(n);
+            if (h != l) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
+fn printSearchResult(stdout: anytype, entry: carl.nip35.TorrentEntry) !void {
+    var ih_hex: [40]u8 = undefined;
+    carl.secp.toHex(&entry.info_hash, &ih_hex);
+
+    var total: u64 = 0;
+    for (entry.files) |f| total += f.size;
+
+    try stdout.print("─" ** 60 ++ "\n", .{});
+    try stdout.print("title:     {s}\n", .{entry.title});
+    try stdout.print("infohash:  {s}\n", .{ih_hex});
+    try stdout.print("files:     {d}, total {d} bytes\n", .{ entry.files.len, total });
+    try stdout.print("trackers:  {d}\n", .{entry.trackers.len});
+    if (entry.description.len > 0) {
+        try stdout.print("desc:      {s}\n", .{entry.description});
+    }
+    try stdout.print("magnet:    magnet:?xt=urn:btih:{s}\n", .{ih_hex});
+}
+
+// -------------------------------------------------------------------------
+// `carl nostr-keygen`
+// -------------------------------------------------------------------------
+
+fn cmdNostrKeygen(allocator: std.mem.Allocator, stdout: anytype) !void {
+    const sk = carl.secp.generateSecretKey() catch {
+        log.err("failed to generate secret key", .{});
+        std.process.exit(1);
+    };
+    const pk = carl.secp.publicKeyFromSecret(sk) catch {
+        log.err("failed to derive public key", .{});
+        std.process.exit(1);
+    };
+
+    const nsec = carl.nostr_config.writeSecretKey(allocator, sk) catch |err| {
+        log.err("failed to save key: {}", .{err});
+        std.process.exit(1);
+    };
+    defer allocator.free(nsec);
+
+    const npub = try carl.nip19.encode32(allocator, .npub, pk);
+    defer allocator.free(npub);
+
+    try stdout.print("wrote nsec (secret key) to your config dir\n", .{});
+    try stdout.print("npub: {s}\n", .{npub});
+    try stdout.print("\nkeep your nsec private. anyone with it can publish as you.\n", .{});
+}
+
+// -------------------------------------------------------------------------
+// Nostr helpers for seed/download
+// -------------------------------------------------------------------------
+
+fn publishNostr(
+    allocator: std.mem.Allocator,
+    mi: carl.metainfo.Metainfo,
+    external_ip: [4]u8,
+    port: u16,
+    description: []const u8,
+) !void {
+    const sk = carl.nostr_config.readSecretKey(allocator) catch |err| {
+        switch (err) {
+            error.NoKey => {
+                log.err("no nostr key configured. run `carl nostr-keygen` first", .{});
+                return error.NoKey;
+            },
+            else => return err,
+        }
+    };
+    const pk = try carl.secp.publicKeyFromSecret(sk);
+    const info_hash = carl.metainfo.infoHash(mi.raw_info);
+
+    var torrent_ev = try carl.nip35.buildFromMetainfo(allocator, sk, pk, mi, info_hash, description);
+    defer torrent_ev.deinit(allocator);
+    var announce_ev = try carl.peer_announce.build(allocator, sk, pk, info_hash, external_ip, port);
+    defer announce_ev.deinit(allocator);
+
+    const relay_urls = try carl.nostr_config.readRelays(allocator);
+    defer carl.nostr_config.freeRelays(allocator, relay_urls);
+
+    var published: usize = 0;
+    for (relay_urls) |url| {
+        var r = carl.relay.Relay.connect(allocator, url) catch |err| {
+            log.warn("nostr publish: {s}: {}", .{ url, err });
+            continue;
+        };
+        defer r.deinit();
+        if (carl.relay.publishAndWait(allocator, &r, torrent_ev, 5_000)) {
+            log.info("published kind-2003 to {s}", .{url});
+            published += 1;
+        }
+        if (carl.relay.publishAndWait(allocator, &r, announce_ev, 5_000)) {
+            log.info("published kind-30078 peer-announce to {s}", .{url});
+        }
+    }
+    log.info("published torrent event to {d}/{d} relays", .{ published, relay_urls.len });
+}
+
+fn collectNostrPeers(
+    allocator: std.mem.Allocator,
+    info_hash: [20]u8,
+    session: *carl.session.Session,
+) void {
+    var ih_hex: [40]u8 = undefined;
+    carl.secp.toHex(&info_hash, &ih_hex);
+
+    const relay_urls = carl.nostr_config.readRelays(allocator) catch return;
+    defer carl.nostr_config.freeRelays(allocator, relay_urls);
+
+    var values_arr = [_][]const u8{&ih_hex};
+    var tag_filters = [_]carl.nostr.Filter.TagFilter{.{ .letter = 'd', .values = &values_arr }};
+    const filter: carl.nostr.Filter = .{
+        .kinds = &[_]u32{carl.peer_announce.kind_peer_announce},
+        .tags = &tag_filters,
+        .limit = 200,
+    };
+
+    var added: usize = 0;
+    for (relay_urls) |url| {
+        var r = carl.relay.Relay.connect(allocator, url) catch |err| {
+            log.debug("nostr peer-discover: {s}: {}", .{ url, err });
+            continue;
+        };
+        defer r.deinit();
+        const events = carl.relay.subscribeAndCollect(allocator, &r, filter, .{
+            .timeout_ms = 10_000,
+            .max_events = 200,
+            .verify_signatures = true,
+        }) catch continue;
+        defer {
+            for (events) |e| e.deinit(allocator);
+            allocator.free(events);
+        }
+        for (events) |ev| {
+            const ann = carl.peer_announce.parse(ev) catch continue;
+            if (!std.mem.eql(u8, &ann.info_hash, &info_hash)) continue;
+            if (added >= 50) break; // cap how many nostr peers we proactively dial
+            const addr = std.net.Address.initIp4(ann.ip, ann.port);
+            session.connectDirectPeer(addr) catch continue;
+            added += 1;
+        }
+    }
+    if (added > 0) log.info("added {d} peers from nostr", .{added});
+}
+
+fn parseIpv4(s: []const u8) ?[4]u8 {
+    var result: [4]u8 = undefined;
+    var octet: usize = 0;
+    var start: usize = 0;
+    for (s, 0..) |c, i| {
+        if (c == '.') {
+            if (octet >= 3) return null;
+            const v = std.fmt.parseUnsigned(u8, s[start..i], 10) catch return null;
+            result[octet] = v;
+            octet += 1;
+            start = i + 1;
+        }
+    }
+    if (octet != 3) return null;
+    const v = std.fmt.parseUnsigned(u8, s[start..], 10) catch return null;
+    result[3] = v;
+    return result;
 }
 
 fn parseFlag(extra_args: []const [:0]u8, flag: []const u8) ?[]const u8 {
@@ -396,6 +729,16 @@ fn parseProxy(extra_args: []const [:0]u8) ?carl.proxy.Proxy {
         log.err("invalid --proxy URL '{s}': {}", .{ url, err });
         std.process.exit(1);
     };
+}
+
+fn parseFlagPresent(extra_args: []const [:0]u8, flag: []const u8) bool {
+    for (extra_args) |a| if (std.mem.eql(u8, a, flag)) return true;
+    return false;
+}
+
+fn parseUnsignedFlag(extra_args: []const [:0]u8, flag: []const u8, default: u32) u32 {
+    const s = parseFlag(extra_args, flag) orelse return default;
+    return std.fmt.parseUnsigned(u32, s, 10) catch default;
 }
 
 test {

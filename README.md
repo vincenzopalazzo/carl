@@ -1,6 +1,6 @@
 # carl
 
-A BitTorrent client written in pure Zig with zero external dependencies. Carl implements the core BitTorrent protocol and several extensions for decentralized peer discovery, metadata exchange, and web seeding.
+A BitTorrent client written in pure Zig. The BitTorrent core has zero Zig package dependencies; the optional Nostr integration vendors [libsecp256k1](https://github.com/bitcoin-core/secp256k1) (C) for BIP-340 Schnorr signatures.
 
 ## Features
 
@@ -12,6 +12,7 @@ A BitTorrent client written in pure Zig with zero external dependencies. Carl im
 - **Multi-file torrents** -- single and multi-file torrent support with proper file mapping
 - **Seeding** -- upload mode with incoming connection support
 - **Proxy / anonymous mode** -- route peers and trackers through a SOCKS5/SOCKS5h or HTTP proxy, hiding your real IP from the swarm ([docs](docs/proxy.md))
+- **Nostr discovery** -- publish torrents you seed as NIP-35 events and find others' torrents via `carl search`; per-seeder peer-announces over a custom kind 30078 feed peers into download sessions
 
 ## Protocol Support
 
@@ -25,9 +26,18 @@ A BitTorrent client written in pure Zig with zero external dependencies. Carl im
 | [15](https://www.bittorrent.org/beps/bep_0015.html) | UDP Tracker Protocol | Binary UDP tracker communication |
 | [19](https://www.bittorrent.org/beps/bep_0019.html) | WebSeed - HTTP/FTP Seeding | HTTP piece downloads via `url-list` |
 
+### Nostr (optional discovery layer)
+
+| Spec | Purpose |
+|------|---------|
+| [NIP-01](https://github.com/nostr-protocol/nips/blob/master/01.md) | Events, relay protocol, REQ/EVENT/CLOSE messages |
+| [NIP-19](https://github.com/nostr-protocol/nips/blob/master/19.md) | bech32 encoding (`npub`, `nsec`, `note`) |
+| [NIP-35](https://github.com/nostr-protocol/nips/blob/master/35.md) | Kind 2003 torrent index events |
+| custom kind 30078 | Carl's NIP-33-parameterized peer-announce events (one per `(pubkey, infohash)`) |
+
 ## Building
 
-Requires **Zig 0.15+**. No other dependencies.
+Requires **Zig 0.15+**. The build fetches `libsecp256k1` via `build.zig.zon` on first run; everything else is pure Zig.
 
 ```sh
 zig build          # compile
@@ -115,6 +125,45 @@ incoming listener are disabled so nothing bypasses the proxy. `http://` and
 stream); UDP trackers are not. See [docs/proxy.md](docs/proxy.md) for proxy
 setup on Linux/macOS and how to verify there are no leaks.
 
+### Discover torrents on Nostr
+
+```sh
+# Generate a keypair (written to ~/.config/carl/nsec with 0600 perms)
+carl nostr-keygen
+
+# Search public relays for kind-2003 torrent events
+carl search "ubuntu" --limit 20
+
+# Use a specific relay
+carl search "linux iso" --relay wss://relay.damus.io
+```
+
+### Seed and announce on Nostr
+
+```sh
+# Publish a NIP-35 (kind 2003) torrent event and a kind 30078 peer-announce
+# every time you start seeding. Peers using `carl download --nostr` will see
+# your announce and dial you directly.
+carl seed file.torrent /path/to/data --nostr --external-ip 203.0.113.7 \
+    --description "My release notes"
+```
+
+### Download using Nostr peer-discovery
+
+```sh
+# Subscribes to kind 30078 events filtered by infohash and feeds the IPs
+# back into the session alongside tracker/DHT peers. Routable IPs only —
+# private/loopback/multicast addresses from relays are rejected.
+carl download file.torrent --nostr
+```
+
+The relay list lives at `~/.config/carl/relays` (one URL per line, `#` for
+comments); if absent, carl falls back to three well-known public relays.
+
+**Privacy note:** publishing peer-announce events ties your Nostr pubkey to
+the infohashes you seed. If that bothers you, generate a fresh key per
+seeding session and don't share it.
+
 ## Architecture
 
 ```
@@ -134,6 +183,16 @@ src/
   dht.zig          Kademlia DHT (BEP 5)
   extension.zig    Extension protocol / metadata exchange (BEP 9/10)
   proxy.zig        SOCKS5/SOCKS5h + HTTP CONNECT proxy tunneling
+
+  # Nostr (optional discovery layer)
+  secp.zig         BIP-340 Schnorr wrapper over vendored libsecp256k1
+  ws.zig           Minimal RFC 6455 WebSocket client (TLS via std.crypto.tls)
+  nostr.zig        NIP-01 events, canonical id hashing, sign/verify, filters
+  nip19.zig        Bech32 codec for npub/nsec/note + TLV decoder
+  nip35.zig        Kind 2003 torrent index event builder/parser
+  peer_announce.zig  Kind 30078 peer-announce builder/parser + IP safety filter
+  relay.zig        Connect to a relay, subscribe-collect-until-EOSE, publish-and-wait
+  nostr_config.zig  ~/.config/carl/{nsec,relays} read/write
 ```
 
 ### Session internals
