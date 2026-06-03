@@ -101,6 +101,24 @@ pub fn subscribeAndCollect(
     }
     const sub_id: []const u8 = &sub_id_hex;
 
+    // Tighten the underlying socket's recv timeout so opts.timeout_ms is a
+    // true upper bound, not just a soft per-iteration check. Without this,
+    // a relay that opens then goes silent could keep us inside a single
+    // recv() up to ws.Conn's default 30 s, even when the caller asked for
+    // a shorter budget.
+    if (opts.timeout_ms > 0) {
+        const tv: std.posix.timeval = .{
+            .sec = @intCast(opts.timeout_ms / 1000),
+            .usec = @intCast((opts.timeout_ms % 1000) * 1000),
+        };
+        std.posix.setsockopt(
+            relay.conn.stream.handle,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.RCVTIMEO,
+            std.mem.asBytes(&tv),
+        ) catch {};
+    }
+
     try relay.subscribe(sub_id, &[_]nostr.Filter{filter});
 
     const start = std.time.milliTimestamp();
@@ -131,6 +149,13 @@ pub fn subscribeAndCollect(
                     e.event.deinit(allocator);
                     continue;
                 }
+                // Cap-check BEFORE signature verification so a relay that
+                // floods us with events can't make us burn O(N) Schnorr
+                // verifications past the max we're willing to collect.
+                if (events.items.len >= opts.max_events) {
+                    e.event.deinit(allocator);
+                    break;
+                }
                 if (opts.verify_signatures and !nostr.verify(e.event, allocator)) {
                     log.debug("relay {s}: dropped event with bad signature", .{relay.url});
                     e.event.deinit(allocator);
@@ -140,7 +165,6 @@ pub fn subscribeAndCollect(
                     e.event.deinit(allocator);
                     return error.OutOfMemory;
                 };
-                if (events.items.len >= opts.max_events) break;
             },
             .eose => |s| {
                 defer allocator.free(s);
@@ -222,20 +246,22 @@ pub const default_relays: []const []const u8 = &.{
 // ===========================================================================
 // Tests
 // ===========================================================================
+// Relay & subscribeAndCollect themselves can't be tested without a live
+// network or a mock relay (deferred to a follow-up); the unit tests here
+// cover what's testable in isolation.
 
-test "Relay struct compiles and exposes expected API" {
-    // We can't make real network calls in unit tests; this is a compile-time
-    // sanity check that the types line up.
-    const T = Relay;
-    _ = T;
-}
-
-test "subscribeAndCollect signature is well-formed" {
-    const T = @TypeOf(subscribeAndCollect);
-    _ = T;
-}
-
-test "default_relays is non-empty" {
+test "default_relays is non-empty and all wss://" {
     try std.testing.expect(default_relays.len >= 1);
     for (default_relays) |r| try std.testing.expect(std.mem.startsWith(u8, r, "wss://"));
+}
+
+test "SearchOptions defaults are sensible" {
+    const opts: SearchOptions = .{};
+    // Default timeout long enough to round-trip several relays, short enough
+    // that `carl search` doesn't appear hung.
+    try std.testing.expect(opts.timeout_ms >= 5_000 and opts.timeout_ms <= 60_000);
+    // Default max_events bounded — we don't want to silently accept floods.
+    try std.testing.expect(opts.max_events > 0 and opts.max_events <= 10_000);
+    // Verification on by default — incoming events are untrusted.
+    try std.testing.expect(opts.verify_signatures);
 }
