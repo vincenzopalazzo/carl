@@ -7,6 +7,11 @@
 - BEP 7 (IPv6 Tracker Extension): https://www.bittorrent.org/beps/bep_0007.html
 - BEP 5 (DHT Protocol): https://www.bittorrent.org/beps/bep_0005.html
 - BEP 10 (Extension Protocol): https://www.bittorrent.org/beps/bep_0010.html
+- NIP-01 (Nostr basic protocol): https://github.com/nostr-protocol/nips/blob/master/01.md
+- NIP-19 (bech32 entities): https://github.com/nostr-protocol/nips/blob/master/19.md
+- NIP-35 (Torrents): https://github.com/nostr-protocol/nips/blob/master/35.md
+- BIP-340 (Schnorr): https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki
+- RFC 6455 (WebSocket): https://datatracker.ietf.org/doc/html/rfc6455
 
 ## Build
 
