@@ -376,10 +376,22 @@ fn parsePort(extra_args: []const [:0]u8) u16 {
     return std.fmt.parseUnsigned(u16, port_str, 10) catch 6881;
 }
 
-/// Parse `--proxy <url>`. Exits with an error if the URL is malformed, so a
-/// typo never silently falls back to a direct (de-anonymized) connection.
+/// Parse `--proxy <url>`. Exits with an error if the URL is malformed or the
+/// flag is given without a value, so a typo never silently falls back to a
+/// direct (de-anonymized) connection.
 fn parseProxy(extra_args: []const [:0]u8) ?carl.proxy.Proxy {
-    const url = parseFlag(extra_args, "--proxy") orelse return null;
+    const url = parseFlag(extra_args, "--proxy") orelse {
+        // `--proxy` as the last argument has no value, so parseFlag returns
+        // null. Fail closed rather than running unproxied (which would leak
+        // the real IP) -- distinguish "flag absent" from "flag without value".
+        for (extra_args) |a| {
+            if (std.mem.eql(u8, a, "--proxy")) {
+                log.err("--proxy requires a URL value (e.g. socks5h://host:1080)", .{});
+                std.process.exit(1);
+            }
+        }
+        return null;
+    };
     return carl.proxy.parseUrl(url) catch |err| {
         log.err("invalid --proxy URL '{s}': {}", .{ url, err });
         std.process.exit(1);

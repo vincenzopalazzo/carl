@@ -168,6 +168,10 @@ pub fn connectThroughProxyHost(allocator: Allocator, proxy: Proxy, host: []const
 /// the caller). Only plaintext `http://` URLs are supported; `https://` returns
 /// `error.UnsupportedHttps` so callers fail closed rather than leak via a direct
 /// TLS handshake.
+///
+/// We build the request by hand rather than using `std.http.Client`: its proxy
+/// support (0.15.2) covers HTTP/HTTPS proxies only, not SOCKS, so routing GETs
+/// over our own tunnel keeps a single code path for every proxy scheme.
 pub fn httpGet(allocator: Allocator, proxy: Proxy, url: []const u8, extra_headers: ?[]const Header) ProxyError![]u8 {
     const u = parseHttpUrl(url) orelse return error.InvalidUrl;
     if (u.is_https) return error.UnsupportedHttps;
@@ -363,7 +367,12 @@ fn readSocks5Reply(stream: std.net.Stream) ProxyError!void {
     var head: [4]u8 = undefined;
     try readN(stream, &head);
     if (head[0] != 0x05) return error.InvalidResponse;
-    if (head[1] != 0x00) return error.HandshakeFailed; // REP != succeeded
+    if (head[1] != 0x00) {
+        // REP != succeeded: log the reason (0x05 refused, 0x04 host unreachable,
+        // 0x02 not allowed by ruleset, ...) so proxy failures are debuggable.
+        log.warn("SOCKS5 CONNECT rejected: REP=0x{x:0>2}", .{head[1]});
+        return error.HandshakeFailed;
+    }
 
     // BND.ADDR length depends on ATYP, then 2 bytes of BND.PORT.
     var trailer: usize = switch (head[3]) {
