@@ -457,13 +457,12 @@ fn cmdSearch(
 
     log.info("searching {d} relays for '{s}' (limit {d})", .{ relay_urls.len, query, limit });
 
-    // Use the relay's NIP-50 `search` filter where available; if a relay
-    // doesn't support it, it'll just return events matching `kinds` and we
-    // filter client-side.
+    // Many public relays (damus, nos.lol, …) reject NIP-50 `search` with
+    // CLOSED rather than ignoring it. Subscribe to recent kind-2003 events
+    // and match client-side instead.
     const filter: carl.nostr.Filter = .{
         .kinds = &[_]u32{carl.nip35.kind_torrent},
-        .limit = limit,
-        .search = query,
+        .limit = @max(limit, 100),
     };
 
     var seen = std.StringHashMap(void).init(allocator);
@@ -517,7 +516,6 @@ fn cmdSearch(
             const entry = carl.nip35.parseEvent(allocator, ev) catch continue;
             defer entry.deinit(allocator);
 
-            // Filter client-side too in case the relay ignored `search`.
             if (!textMatches(entry.title, query) and !textMatches(entry.description, query)) continue;
 
             found_any = true;

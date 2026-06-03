@@ -94,65 +94,96 @@ pub fn parseUrl(input: []const u8) Error!Url {
     return .{ .secure = secure, .host = host, .port = port, .path = path };
 }
 
-/// A live WebSocket connection. Internally owns either a plain TCP socket or
-/// a TLS session over that socket.
+/// A live WebSocket connection. `wss://` uses `std.http.Client` for TLS (same
+/// stack as our HTTPS tracker client). `ws://` uses a plain TCP socket.
 pub const Conn = struct {
     allocator: Allocator,
+    /// Socket handle for `setsockopt` (recv timeout). Closed via `deinit`.
     stream: std.net.Stream,
-
-    // TLS state (heap-allocated because std.crypto.tls.Client embeds large
-    // buffers and a Reader/Writer that must not be moved after init).
-    tls_state: ?*TlsState,
+    /// Non-null for `wss://`; owns the TLS session used for reads/writes.
+    http: ?HttpIo = null,
 
     /// Buffer used to accumulate the payload of an in-progress message when
     /// the relay fragments. Owned by the Conn.
     fragment_buf: std.ArrayList(u8),
     fragment_opcode: ?Opcode,
 
+    const HttpIo = struct {
+        client: *std.http.Client,
+        connection: *std.http.Client.Connection,
+    };
+
     pub fn connect(allocator: Allocator, url_input: []const u8) Error!Conn {
         const url = try parseUrl(url_input);
 
-        // Resolve and open TCP.
-        const stream = std.net.tcpConnectToHost(allocator, url.host, url.port) catch |err| {
+        if (url.secure) {
+            const client = try allocator.create(std.http.Client);
+            client.* = .{ .allocator = allocator };
+
+            {
+                client.ca_bundle_mutex.lock();
+                defer client.ca_bundle_mutex.unlock();
+                client.ca_bundle.rescan(allocator) catch {
+                    client.deinit();
+                    allocator.destroy(client);
+                    return error.TlsInitFailed;
+                };
+            }
+
+            const connection = client.connectTcp(url.host, url.port, .tls) catch |err| {
+                log.warn("tls connect to {s}:{d} failed: {}", .{ url.host, url.port, err });
+                client.deinit();
+                allocator.destroy(client);
+                return httpConnectError(err);
+            };
+
+            var conn = Conn{
+                .allocator = allocator,
+                .stream = connection.stream_reader.getStream(),
+                .http = .{
+                    .client = client,
+                    .connection = connection,
+                },
+                .fragment_buf = .empty,
+                .fragment_opcode = null,
+            };
+            errdefer conn.deinit();
+
+            try conn.performHandshake(url);
+            setRecvTimeout(conn.stream, 30);
+            return conn;
+        }
+
+        const stream = tcpConnect(allocator, url.host, url.port) catch |err| {
             log.warn("tcp connect to {s}:{d} failed: {}", .{ url.host, url.port, err });
             return error.ConnectFailed;
         };
 
-        // Apply a recv timeout so reads can fail instead of hanging forever.
-        const tv: posix.timeval = .{ .sec = 30, .usec = 0 };
-        posix.setsockopt(
-            stream.handle,
-            posix.SOL.SOCKET,
-            posix.SO.RCVTIMEO,
-            std.mem.asBytes(&tv),
-        ) catch {};
-
-        // Take ownership of the socket via the Conn. From here on, any error
-        // path runs through `conn.deinit()` exactly once — that closes the
-        // stream, releases TLS state if present, and frees fragment_buf.
-        var conn: Conn = .{
+        var conn = Conn{
             .allocator = allocator,
             .stream = stream,
-            .tls_state = null,
+            .http = null,
             .fragment_buf = .empty,
             .fragment_opcode = null,
         };
         errdefer conn.deinit();
 
-        if (url.secure) {
-            conn.tls_state = TlsState.init(allocator, stream, url.host) catch |err| {
-                log.warn("tls init for {s} failed: {}", .{ url.host, err });
-                return error.TlsInitFailed;
-            };
-        }
-
         try conn.performHandshake(url);
+        setRecvTimeout(conn.stream, 30);
         return conn;
     }
 
     pub fn deinit(self: *Conn) void {
-        if (self.tls_state) |t| t.deinit(self.allocator);
-        self.stream.close();
+        if (self.http) |h| {
+            // `connectTcp` registers the connection in the client's pool.
+            // Mark closing and release so `client.deinit()` does not panic.
+            h.connection.closing = true;
+            h.client.connection_pool.release(h.connection);
+            h.client.deinit();
+            self.allocator.destroy(h.client);
+        } else {
+            self.stream.close();
+        }
         self.fragment_buf.deinit(self.allocator);
     }
 
@@ -258,13 +289,84 @@ pub const Conn = struct {
     // -------------------------------------------------------------------
 
     fn performHandshake(self: *Conn, url: Url) Error!void {
-        // Generate a random 16-byte key, base64-encode it.
+        if (self.http) |h| return performHandshakeHttps(self, url, h);
+        return performHandshakePlain(self, url);
+    }
+
+    /// `wss://` upgrade via `std.http.Client` — the same stack as HTTPS
+    /// trackers. Hand-writing TLS application data and reading it back with
+    /// `tls.Client.reader` deadlocks on Zig 0.15 for Nostr relays.
+    fn performHandshakeHttps(self: *Conn, url: Url, h: HttpIo) Error!void {
         var key_raw: [16]u8 = undefined;
         std.crypto.random.bytes(&key_raw);
         var key_b64: [24]u8 = undefined;
         _ = std.base64.standard.Encoder.encode(&key_b64, &key_raw);
 
-        // Build the HTTP/1.1 upgrade request.
+        const uri_str = std.fmt.allocPrint(self.allocator, "https://{s}{s}", .{ url.host, url.path }) catch return error.OutOfMemory;
+        defer self.allocator.free(uri_str);
+        const uri = std.Uri.parse(uri_str) catch return error.HandshakeFailed;
+
+        const extra = [_]std.http.Header{
+            .{ .name = "Upgrade", .value = "websocket" },
+            .{ .name = "Sec-WebSocket-Key", .value = &key_b64 },
+            .{ .name = "Sec-WebSocket-Version", .value = "13" },
+        };
+
+        var req = h.client.request(.GET, uri, .{
+            .connection = h.connection,
+            .keep_alive = true,
+            .extra_headers = &extra,
+            .headers = .{
+                .host = .{ .override = url.host },
+                .connection = .{ .override = "Upgrade" },
+                .user_agent = .{ .override = "carl/0.1" },
+            },
+        }) catch return error.HandshakeFailed;
+
+        req.sendBodiless() catch return error.HandshakeFailed;
+
+        var redirect_buf: [1024]u8 = undefined;
+        const response = req.receiveHead(&redirect_buf) catch return error.HandshakeFailed;
+        const head = response.head;
+
+        if (head.status != .switching_protocols) {
+            log.warn("ws handshake status {s}", .{@tagName(head.status)});
+            return error.HandshakeFailed;
+        }
+
+        const expected = expectedAccept(&key_b64);
+        var it = head.iterateHeaders();
+        var have_accept = false;
+        while (it.next()) |hdr| {
+            if (hdr.name.len != "Sec-WebSocket-Accept".len) continue;
+            if (!std.ascii.eqlIgnoreCase(hdr.name, "Sec-WebSocket-Accept")) continue;
+            if (!std.mem.eql(u8, hdr.value, &expected)) {
+                log.warn("ws handshake bad Sec-WebSocket-Accept", .{});
+                return error.HandshakeFailed;
+            }
+            have_accept = true;
+            break;
+        }
+        if (!have_accept) {
+            log.warn("ws handshake missing Sec-WebSocket-Accept header", .{});
+            return error.HandshakeFailed;
+        }
+
+        // Detach the connection so `req.deinit` does not return it to the pool
+        // or drain bytes that belong to the first WebSocket frame.
+        h.connection.closing = false;
+        req.reader.state = .ready;
+        req.connection = null;
+        req.deinit();
+    }
+
+    /// `ws://` upgrade over a plain TCP socket.
+    fn performHandshakePlain(self: *Conn, url: Url) Error!void {
+        var key_raw: [16]u8 = undefined;
+        std.crypto.random.bytes(&key_raw);
+        var key_b64: [24]u8 = undefined;
+        _ = std.base64.standard.Encoder.encode(&key_b64, &key_raw);
+
         var req_buf: [1024]u8 = undefined;
         const req = std.fmt.bufPrint(
             &req_buf,
@@ -281,17 +383,12 @@ pub const Conn = struct {
 
         try self.writeAll(req);
 
-        // Read response headers one byte at a time so we never read past the
-        // CRLFCRLF terminator. On the plaintext (ws://) path readSome maps
-        // directly to recv, so any over-read would discard frame bytes the
-        // server might have pipelined behind the upgrade. (The TLS path
-        // buffers internally and doesn't have this issue, but uniform handling
-        // is simpler and the handshake is ~500 bytes — one byte per syscall
-        // is fine.)
         var hdr_buf: [4096]u8 = undefined;
         var hdr_len: usize = 0;
         while (hdr_len < hdr_buf.len) {
-            const n = try self.readSome(hdr_buf[hdr_len..][0..1]);
+            const space = hdr_buf.len - hdr_len;
+            const want = @min(space, 512);
+            const n = try self.readSome(hdr_buf[hdr_len..][0..want]);
             if (n == 0) return error.HandshakeFailed;
             hdr_len += n;
             if (hdr_len >= 4 and std.mem.eql(u8, hdr_buf[hdr_len - 4 .. hdr_len], "\r\n\r\n")) break;
@@ -303,10 +400,6 @@ pub const Conn = struct {
             return error.HandshakeFailed;
         }
 
-        // Verify Sec-WebSocket-Accept = base64(SHA1(key + magic)). Parse the
-        // header line by name rather than substring-matching the whole
-        // response (an unrelated header containing the same 28-char base64
-        // would otherwise spoof acceptance).
         const expected = expectedAccept(&key_b64);
         const accept_value = findHeader(headers, "Sec-WebSocket-Accept") orelse {
             log.warn("ws handshake missing Sec-WebSocket-Accept header", .{});
@@ -413,9 +506,10 @@ pub const Conn = struct {
     }
 
     fn writeAll(self: *Conn, buf: []const u8) Error!void {
-        if (self.tls_state) |t| {
-            t.tls.writer.writeAll(buf) catch return error.SendFailed;
-            t.tls.writer.flush() catch return error.SendFailed;
+        if (self.http) |h| {
+            const w = h.connection.writer();
+            w.writeAll(buf) catch return error.SendFailed;
+            h.connection.flush() catch return error.SendFailed;
         } else {
             var off: usize = 0;
             while (off < buf.len) {
@@ -427,8 +521,9 @@ pub const Conn = struct {
     }
 
     fn readSome(self: *Conn, buf: []u8) Error!usize {
-        if (self.tls_state) |t| {
-            return t.tls.reader.readSliceShort(buf) catch return error.RecvFailed;
+        if (self.http) |h| {
+            const r = h.connection.reader();
+            return r.readSliceShort(buf) catch return error.RecvFailed;
         }
         const n = posix.recv(self.stream.handle, buf, 0) catch |err| switch (err) {
             error.WouldBlock => return error.Timeout,
@@ -447,71 +542,43 @@ pub const Conn = struct {
     }
 };
 
-/// All TLS-related buffers and state, kept on the heap so the std.crypto.tls
-/// Client's internal Reader/Writer struct addresses stay stable.
-const TlsState = struct {
-    stream_reader: std.net.Stream.Reader,
-    stream_writer: std.net.Stream.Writer,
-    tls: std.crypto.tls.Client,
-    ca_bundle: std.crypto.Certificate.Bundle,
+fn setRecvTimeout(stream: std.net.Stream, sec: u32) void {
+    const tv: posix.timeval = .{ .sec = @intCast(sec), .usec = 0 };
+    posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+}
 
-    // Buffers (sized per std.crypto.tls.Client requirements).
-    socket_read_buf: []u8,
-    socket_write_buf: []u8,
-    tls_read_buf: []u8,
-    tls_write_buf: []u8,
+fn httpConnectError(err: std.http.Client.ConnectTcpError) Error {
+    return switch (err) {
+        error.TlsInitializationFailed => error.TlsInitFailed,
+        error.UnknownHostName, error.HostLacksNetworkAddresses => error.DnsResolveFailed,
+        else => error.ConnectFailed,
+    };
+}
 
-    fn init(allocator: Allocator, stream: std.net.Stream, host: []const u8) !*TlsState {
-        const min = std.crypto.tls.Client.min_buffer_len;
-        const self = try allocator.create(TlsState);
-        errdefer allocator.destroy(self);
+/// Open TCP to `host`:`port`, preferring IPv4 and trying every resolved address
+/// before giving up. `std.net.tcpConnectToHost` stops on the first non-refused
+/// error, which breaks when DNS returns AAAA before A and IPv6 is unroutable.
+fn tcpConnect(allocator: Allocator, host: []const u8, port: u16) Error!std.net.Stream {
+    const list = std.net.getAddressList(allocator, host, port) catch return error.DnsResolveFailed;
+    defer list.deinit();
+    if (list.addrs.len == 0) return error.DnsResolveFailed;
 
-        self.socket_read_buf = try allocator.alloc(u8, min);
-        errdefer allocator.free(self.socket_read_buf);
-        self.socket_write_buf = try allocator.alloc(u8, min);
-        errdefer allocator.free(self.socket_write_buf);
-        self.tls_read_buf = try allocator.alloc(u8, min);
-        errdefer allocator.free(self.tls_read_buf);
-        self.tls_write_buf = try allocator.alloc(u8, min);
-        errdefer allocator.free(self.tls_write_buf);
+    var last_err: ?std.net.TcpConnectToAddressError = null;
 
-        self.ca_bundle = .{};
-        errdefer self.ca_bundle.deinit(allocator);
-        try self.ca_bundle.rescan(allocator);
-
-        self.stream_reader = stream.reader(self.socket_read_buf);
-        self.stream_writer = stream.writer(self.socket_write_buf);
-
-        self.tls = try std.crypto.tls.Client.init(
-            self.stream_reader.interface(),
-            &self.stream_writer.interface,
-            .{
-                .host = .{ .explicit = host },
-                .ca = .{ .bundle = self.ca_bundle },
-                .read_buffer = self.tls_read_buf,
-                .write_buffer = self.tls_write_buf,
-                // WebSocket frames are self-delimiting (length-prefixed in
-                // the frame header), so a connection that ends mid-message
-                // is detected by our readExact returning Closed — we don't
-                // need TLS-level truncation detection to catch it. Allowing
-                // truncation here just means a missing close_notify is
-                // forwarded as EOF instead of TlsConnectionTruncated, which
-                // is what we want for relays that hang up bluntly.
-                .allow_truncation_attacks = true,
-            },
-        );
-        return self;
+    inline for (.{ posix.AF.INET, posix.AF.INET6 }) |family| {
+        for (list.addrs) |addr| {
+            if (addr.any.family != family) continue;
+            const stream = std.net.tcpConnectToAddress(addr) catch |err| {
+                last_err = err;
+                continue;
+            };
+            return stream;
+        }
     }
 
-    fn deinit(self: *TlsState, allocator: Allocator) void {
-        self.ca_bundle.deinit(allocator);
-        allocator.free(self.socket_read_buf);
-        allocator.free(self.socket_write_buf);
-        allocator.free(self.tls_read_buf);
-        allocator.free(self.tls_write_buf);
-        allocator.destroy(self);
-    }
-};
+    if (last_err) |_| return error.ConnectFailed;
+    return error.ConnectFailed;
+}
 
 /// Compute the expected Sec-WebSocket-Accept header value for a given
 /// base64-encoded client key. Format: base64(sha1(key + magic)).
