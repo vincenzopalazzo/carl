@@ -14,6 +14,9 @@ pub const secp = @import("secp.zig");
 pub const ws = @import("ws.zig");
 pub const nip19 = @import("nip19.zig");
 pub const nostr = @import("nostr.zig");
+pub const nip35 = @import("nip35.zig");
+pub const peer_announce = @import("peer_announce.zig");
+pub const relay = @import("relay.zig");
 
 test {
     _ = bencode;
@@ -31,5 +34,8 @@ test {
     _ = ws;
     _ = nip19;
     _ = nostr;
+    _ = nip35;
+    _ = peer_announce;
+    _ = relay;
     _ = @import("integration_test.zig");
 }
