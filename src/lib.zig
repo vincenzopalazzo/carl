@@ -12,6 +12,9 @@ pub const extension = @import("extension.zig");
 pub const dht = @import("dht.zig");
 pub const secp = @import("secp.zig");
 pub const proxy = @import("proxy.zig");
+pub const ws = @import("ws.zig");
+pub const nip19 = @import("nip19.zig");
+pub const nostr = @import("nostr.zig");
 
 test {
     _ = bencode;
@@ -27,5 +30,8 @@ test {
     _ = dht;
     _ = secp;
     _ = proxy;
+    _ = ws;
+    _ = nip19;
+    _ = nostr;
     _ = @import("integration_test.zig");
 }
