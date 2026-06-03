@@ -64,14 +64,24 @@ pub fn main() !void {
         try cmdDownload(allocator, source, output_dir, port, parseProxy(args[3..]), want_nostr);
     } else if (std.mem.eql(u8, command, "seed")) {
         if (args.len < 4) {
-            log.err("usage: carl seed <file.torrent> <data-dir> [--port <port>] [--nostr] [--external-ip <ip>]", .{});
+            log.err("usage: carl seed <file.torrent> <data-dir> [--port p] [--nostr] [--external-ip ip] [--tor-seed] [--tor-control addr] [--tor-cookie path] [--tor-onion-port p] [--tor-socks url] [--description \"...\"]", .{});
             std.process.exit(1);
         }
         const port = parsePort(args[4..]);
         const want_nostr = parseFlagPresent(args[4..], "--nostr");
+        const tor_seed = parseFlagPresent(args[4..], "--tor-seed");
         const external_ip = parseFlag(args[4..], "--external-ip");
         const description = parseFlag(args[4..], "--description") orelse "";
-        try cmdSeed(allocator, args[2], args[3], port, parseProxy(args[4..]), want_nostr, external_ip, description);
+        const tor_control = parseFlag(args[4..], "--tor-control") orelse "127.0.0.1:9051";
+        const tor_cookie = parseFlag(args[4..], "--tor-cookie");
+        const tor_onion_port: u16 = parsePortFlag(args[4..], "--tor-onion-port", 80);
+        const tor_socks_url = parseFlag(args[4..], "--tor-socks") orelse "socks5h://127.0.0.1:9050";
+        try cmdSeed(allocator, args[2], args[3], port, parseProxy(args[4..]), want_nostr, tor_seed, external_ip, description, .{
+            .control_addr = tor_control,
+            .cookie_path = tor_cookie,
+            .onion_port = tor_onion_port,
+            .socks_url = tor_socks_url,
+        });
     } else if (std.mem.eql(u8, command, "search")) {
         if (args.len < 3) {
             log.err("usage: carl search <query> [--limit <n>] [--relay <url>]", .{});
@@ -79,7 +89,7 @@ pub fn main() !void {
         }
         const limit = parseUnsignedFlag(args[3..], "--limit", 50);
         const single_relay = parseFlag(args[3..], "--relay");
-        try cmdSearch(allocator, stdout, args[2], limit, single_relay);
+        try cmdSearch(allocator, stdout, args[2], limit, single_relay, parseProxy(args[3..]));
     } else if (std.mem.eql(u8, command, "nostr-keygen")) {
         try cmdNostrKeygen(allocator, stdout);
     } else {
@@ -99,9 +109,12 @@ fn printUsage() void {
         \\  download <source> [--output-dir d] [--port p] [--proxy url] [--nostr]
         \\           source: file.torrent, magnet:?..., or http(s):// URL
         \\           --nostr: also subscribe to nostr peer-announce events
-        \\  seed <file.torrent> <data-dir> [--port p] [--proxy url] [--nostr] [--external-ip <ip>] [--description "..."]
+        \\  seed <file.torrent> <data-dir> [--port p] [--proxy url] [--nostr] [--external-ip <ip>]
+        \\           [--tor-seed] [--tor-control host:port] [--tor-cookie path]
+        \\           [--tor-onion-port p] [--tor-socks url] [--description "..."]
         \\           --nostr: publish NIP-35 torrent event + peer-announce
-        \\           --external-ip: required with --nostr; the IP peers should dial
+        \\           --external-ip: public IPv4 for peer-announce (classic seeding)
+        \\           --tor-seed: hidden service via Tor ControlPort; requires --nostr
         \\  search <query> [--limit n] [--relay <wss://...>]
         \\           search nostr relays for kind-2003 torrent events
         \\  nostr-keygen                                     generate a fresh nostr key
@@ -281,7 +294,7 @@ fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []c
         defer mi.deinit(allocator);
 
         std.fs.cwd().makePath(output_dir) catch {};
-        var session = carl.session.Session.init(allocator, mi, output_dir, .download, port, proxy) catch |err| {
+        var session = carl.session.Session.init(allocator, mi, output_dir, .download, port, proxy, .any, false) catch |err| {
             log.err("failed to initialize session: {}", .{err});
             std.process.exit(1);
         };
@@ -321,7 +334,7 @@ fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []c
 
 fn startDownload(allocator: std.mem.Allocator, mi: carl.metainfo.Metainfo, output_dir: []const u8, port: u16, proxy: ?carl.proxy.Proxy, want_nostr: bool) void {
     std.fs.cwd().makePath(output_dir) catch {};
-    var session = carl.session.Session.init(allocator, mi, output_dir, .download, port, proxy) catch |err| {
+    var session = carl.session.Session.init(allocator, mi, output_dir, .download, port, proxy, .any, false) catch |err| {
         log.err("failed to initialize session: {}", .{err});
         std.process.exit(1);
     };
@@ -372,6 +385,13 @@ fn fetchUrl(allocator: std.mem.Allocator, url: []const u8, proxy: ?carl.proxy.Pr
     return response_body.toOwnedSlice(allocator);
 }
 
+const TorSeedOptions = struct {
+    control_addr: []const u8,
+    cookie_path: ?[]const u8,
+    onion_port: u16,
+    socks_url: []const u8,
+};
+
 fn cmdSeed(
     allocator: std.mem.Allocator,
     torrent_path: []const u8,
@@ -379,39 +399,73 @@ fn cmdSeed(
     port: u16,
     proxy: ?carl.proxy.Proxy,
     want_nostr: bool,
+    tor_seed: bool,
     external_ip: ?[]const u8,
     description: []const u8,
+    tor_opts: TorSeedOptions,
 ) !void {
+    if (tor_seed and proxy != null) {
+        log.err("--tor-seed and --proxy are mutually exclusive on seed", .{});
+        std.process.exit(1);
+    }
+    if (tor_seed and !want_nostr) {
+        log.err("--tor-seed requires --nostr", .{});
+        std.process.exit(1);
+    }
+    if (tor_seed and external_ip != null) {
+        log.err("--tor-seed uses a Tor hidden service; do not pass --external-ip", .{});
+        std.process.exit(1);
+    }
+    if (want_nostr and !tor_seed and external_ip == null) {
+        log.err("--nostr requires --external-ip <ip> or --tor-seed", .{});
+        std.process.exit(1);
+    }
+
     const mi = readTorrent(allocator, torrent_path);
     defer mi.deinit(allocator);
 
+    var hidden: ?carl.tor_control.HiddenService = null;
+    defer if (hidden) |*h| h.deinit();
+
+    const nostr_proxy: ?carl.proxy.Proxy = if (tor_seed)
+        parseTorSocksProxy(tor_opts.socks_url)
+    else
+        null;
+
     if (want_nostr) {
-        if (external_ip == null) {
-            log.err("--nostr requires --external-ip <ip> so peers know how to dial you", .{});
-            std.process.exit(1);
+        if (tor_seed) {
+            hidden = carl.tor_control.addOnion(allocator, .{
+                .control_addr = tor_opts.control_addr,
+                .cookie_path = tor_opts.cookie_path,
+                .local_port = port,
+                .onion_port = tor_opts.onion_port,
+            }) catch |err| {
+                log.err("tor hidden service setup failed: {}", .{err});
+                std.process.exit(1);
+            };
+            publishNostrOnion(allocator, mi, hidden.?.onion_host, hidden.?.onion_port, description, nostr_proxy) catch |err| {
+                log.warn("nostr publish failed: {} (continuing seed)", .{err});
+            };
+        } else {
+            const ip = parseIpv4(external_ip.?) orelse {
+                log.err("invalid --external-ip: {s}", .{external_ip.?});
+                std.process.exit(1);
+            };
+            if (!carl.peer_announce.isRoutable(ip)) {
+                log.err(
+                    "--external-ip {d}.{d}.{d}.{d} is not routable; refusing to publish peer-announce",
+                    .{ ip[0], ip[1], ip[2], ip[3] },
+                );
+                std.process.exit(1);
+            }
+            publishNostrIpv4(allocator, mi, ip, port, description, null) catch |err| {
+                log.warn("nostr publish failed: {} (continuing seed)", .{err});
+            };
         }
-        const ip = parseIpv4(external_ip.?) orelse {
-            log.err("invalid --external-ip: {s}", .{external_ip.?});
-            std.process.exit(1);
-        };
-        // Run the seeder's own IP through the same safety filter we apply to
-        // peers we'd download from. Publishing a peer-announce for 127.0.0.1
-        // or 192.168.x.y is always a mistake — every receiving carl will
-        // reject it in peer_announce.parse, so we may as well catch it here
-        // with a useful error instead of silently emitting a dud event.
-        if (!carl.peer_announce.isRoutable(ip)) {
-            log.err(
-                "--external-ip {d}.{d}.{d}.{d} is not a routable public address; refusing to publish peer-announce",
-                .{ ip[0], ip[1], ip[2], ip[3] },
-            );
-            std.process.exit(1);
-        }
-        publishNostr(allocator, mi, ip, port, description) catch |err| {
-            log.warn("nostr publish failed: {} (continuing seed)", .{err});
-        };
     }
 
-    var session = carl.session.Session.init(allocator, mi, data_dir, .seed, port, proxy) catch |err| {
+    const listen_bind: carl.session.ListenBind = if (tor_seed) .loopback else .any;
+    var session = carl.session.Session.init(allocator, mi, data_dir, .seed, port, null, listen_bind, tor_seed) catch |err| {
         log.err("failed to initialize session: {}", .{err});
         std.process.exit(1);
     };
@@ -419,6 +473,13 @@ fn cmdSeed(
 
     session.run() catch |err| {
         log.err("session failed: {}", .{err});
+        std.process.exit(1);
+    };
+}
+
+fn parseTorSocksProxy(url: []const u8) carl.proxy.Proxy {
+    return carl.proxy.parseUrl(url) catch |err| {
+        log.err("invalid --tor-socks URL '{s}': {}", .{ url, err });
         std.process.exit(1);
     };
 }
@@ -433,6 +494,7 @@ fn cmdSearch(
     query: []const u8,
     limit: u32,
     single_relay: ?[]const u8,
+    proxy: ?carl.proxy.Proxy,
 ) !void {
     var relay_urls: [][]const u8 = undefined;
     var relays_owned = false;
@@ -480,7 +542,7 @@ fn cmdSearch(
     relay_loop: for (relay_urls) |url| {
         if (printed >= limit) break;
 
-        var r = carl.relay.Relay.connect(allocator, url) catch |err| {
+        var r = carl.relay.Relay.connect(allocator, url, proxy) catch |err| {
             log.warn("relay {s}: {}", .{ url, err });
             continue;
         };
@@ -601,22 +663,15 @@ fn cmdNostrKeygen(allocator: std.mem.Allocator, stdout: anytype) !void {
 // Nostr helpers for seed/download
 // -------------------------------------------------------------------------
 
-fn publishNostr(
+fn publishNostrIpv4(
     allocator: std.mem.Allocator,
     mi: carl.metainfo.Metainfo,
     external_ip: [4]u8,
     port: u16,
     description: []const u8,
+    proxy: ?carl.proxy.Proxy,
 ) !void {
-    const sk = carl.nostr_config.readSecretKey(allocator) catch |err| {
-        switch (err) {
-            error.NoKey => {
-                log.err("no nostr key configured. run `carl nostr-keygen` first", .{});
-                return error.NoKey;
-            },
-            else => return err,
-        }
-    };
+    const sk = try readNostrSecretKey(allocator);
     const pk = try carl.secp.publicKeyFromSecret(sk);
     const info_hash = carl.metainfo.infoHash(mi.raw_info);
 
@@ -625,13 +680,54 @@ fn publishNostr(
     var announce_ev = try carl.peer_announce.build(allocator, sk, pk, info_hash, external_ip, port);
     defer announce_ev.deinit(allocator);
 
+    try publishNostrEvents(allocator, torrent_ev, announce_ev, proxy);
+}
+
+fn publishNostrOnion(
+    allocator: std.mem.Allocator,
+    mi: carl.metainfo.Metainfo,
+    onion_host: []const u8,
+    onion_port: u16,
+    description: []const u8,
+    proxy: ?carl.proxy.Proxy,
+) !void {
+    const sk = try readNostrSecretKey(allocator);
+    const pk = try carl.secp.publicKeyFromSecret(sk);
+    const info_hash = carl.metainfo.infoHash(mi.raw_info);
+
+    var torrent_ev = try carl.nip35.buildFromMetainfo(allocator, sk, pk, mi, info_hash, description);
+    defer torrent_ev.deinit(allocator);
+    var announce_ev = try carl.peer_announce.buildOnion(allocator, sk, pk, info_hash, onion_host, onion_port);
+    defer announce_ev.deinit(allocator);
+
+    try publishNostrEvents(allocator, torrent_ev, announce_ev, proxy);
+}
+
+fn readNostrSecretKey(allocator: std.mem.Allocator) !carl.secp.SecretKey {
+    return carl.nostr_config.readSecretKey(allocator) catch |err| {
+        switch (err) {
+            error.NoKey => {
+                log.err("no nostr key configured. run `carl nostr-keygen` first", .{});
+                return error.NoKey;
+            },
+            else => return err,
+        }
+    };
+}
+
+fn publishNostrEvents(
+    allocator: std.mem.Allocator,
+    torrent_ev: carl.nostr.Event,
+    announce_ev: carl.nostr.Event,
+    proxy: ?carl.proxy.Proxy,
+) !void {
     const relay_urls = try carl.nostr_config.readRelays(allocator);
     defer carl.nostr_config.freeRelays(allocator, relay_urls);
 
     var torrent_acks: usize = 0;
     var announce_acks: usize = 0;
     for (relay_urls) |url| {
-        var r = carl.relay.Relay.connect(allocator, url) catch |err| {
+        var r = carl.relay.Relay.connect(allocator, url, proxy) catch |err| {
             log.warn("nostr publish: {s}: {}", .{ url, err });
             continue;
         };
@@ -672,7 +768,7 @@ fn collectNostrPeers(
 
     var added: usize = 0;
     for (relay_urls) |url| {
-        var r = carl.relay.Relay.connect(allocator, url) catch |err| {
+        var r = carl.relay.Relay.connect(allocator, url, session.proxy) catch |err| {
             log.debug("nostr peer-discover: {s}: {}", .{ url, err });
             continue;
         };
@@ -689,10 +785,25 @@ fn collectNostrPeers(
         for (events) |ev| {
             const ann = carl.peer_announce.parse(ev) catch continue;
             if (!std.mem.eql(u8, &ann.info_hash, &info_hash)) continue;
-            if (added >= 50) break; // cap how many nostr peers we proactively dial
-            const addr = std.net.Address.initIp4(ann.ip, ann.port);
-            session.connectDirectPeer(addr) catch continue;
-            added += 1;
+            if (added >= 50) break;
+            switch (ann.endpoint) {
+                .ipv4 => |ep| {
+                    const addr = std.net.Address.initIp4(ep.ip, ep.port);
+                    session.connectDirectPeer(addr) catch continue;
+                    added += 1;
+                },
+                .onion => |ep| {
+                    if (session.proxy == null) {
+                        log.warn(
+                            "nostr peer {s}:{d} is a .onion host; use --proxy socks5h://127.0.0.1:9050 to connect",
+                            .{ ep.host, ep.port },
+                        );
+                        continue;
+                    }
+                    session.connectOnionPeer(ep.host, ep.port) catch continue;
+                    added += 1;
+                },
+            }
         }
     }
     if (added > 0) log.info("added {d} peers from nostr", .{added});
@@ -730,6 +841,11 @@ fn parseFlag(extra_args: []const [:0]u8, flag: []const u8) ?[]const u8 {
 fn parsePort(extra_args: []const [:0]u8) u16 {
     const port_str = parseFlag(extra_args, "--port") orelse return 6881;
     return std.fmt.parseUnsigned(u16, port_str, 10) catch 6881;
+}
+
+fn parsePortFlag(extra_args: []const [:0]u8, flag: []const u8, default: u16) u16 {
+    const port_str = parseFlag(extra_args, flag) orelse return default;
+    return std.fmt.parseUnsigned(u16, port_str, 10) catch default;
 }
 
 /// Parse `--proxy <url>`. Exits with an error if the URL is malformed or the

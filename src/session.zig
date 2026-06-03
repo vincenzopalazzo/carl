@@ -33,6 +33,8 @@ fn sigintHandler(_: i32) callconv(.c) void {
 
 pub const Mode = enum { download, seed };
 
+pub const ListenBind = enum { any, loopback };
+
 pub const Session = struct {
     allocator: Allocator,
     meta: metainfo.Metainfo,
@@ -87,6 +89,11 @@ pub const Session = struct {
     // listener are disabled to avoid leaking the real IP.
     proxy: ?proxy_mod.Proxy,
 
+    /// Where the inbound listener binds when active.
+    listen_bind: ListenBind,
+    /// Tor hidden-service seed: no tracker/DHT (would leak or bypass Tor).
+    tor_hidden: bool,
+
     // Progress tracking
     start_time: i64,
     last_progress_time: i64,
@@ -99,6 +106,8 @@ pub const Session = struct {
         mode: Mode,
         listen_port: u16,
         proxy: ?proxy_mod.Proxy,
+        listen_bind: ListenBind,
+        tor_hidden: bool,
     ) !Session {
         const total_length = piece_mod.totalLength(meta.files);
         const num_pieces = piece_mod.numPieces(total_length, meta.piece_length);
@@ -144,7 +153,11 @@ pub const Session = struct {
         // peers would reveal the real IP to whoever connects.
         var listener: ?std.net.Server = null;
         if (proxy == null and (mode == .seed or our_bitfield.count() > 0)) {
-            const addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, listen_port);
+            const bind_ip: [4]u8 = switch (listen_bind) {
+                .any => .{ 0, 0, 0, 0 },
+                .loopback => .{ 127, 0, 0, 1 },
+            };
+            const addr = std.net.Address.initIp4(bind_ip, listen_port);
             listener = addr.listen(.{ .reuse_address = true }) catch null;
         }
 
@@ -181,6 +194,8 @@ pub const Session = struct {
             .dht_instance = null,
             .dht_failed = false,
             .proxy = proxy,
+            .listen_bind = listen_bind,
+            .tor_hidden = tor_hidden,
             .start_time = now,
             .last_progress_time = now,
             .last_progress_bytes = 0,
@@ -238,14 +253,18 @@ pub const Session = struct {
 
         // Multi-tracker announce (BEP 12) / DHT peer discovery
         const has_trackers = (self.meta.announce.len > 0) or (self.meta.announce_list != null);
-        if (has_trackers) {
-            stderr.print("announcing to tracker...\n", .{}) catch {};
-        }
-        self.doMultiTrackerAnnounce(.started) catch |err| {
+        if (!self.tor_hidden) {
             if (has_trackers) {
-                stderr.print("all trackers failed: {}\n", .{err}) catch {};
+                stderr.print("announcing to tracker...\n", .{}) catch {};
             }
-        };
+            self.doMultiTrackerAnnounce(.started) catch |err| {
+                if (has_trackers) {
+                    stderr.print("all trackers failed: {}\n", .{err}) catch {};
+                }
+            };
+        } else {
+            log.info("tor hidden-service mode: tracker and DHT announces disabled", .{});
+        }
 
         stdout.print("session started: {d} pieces, {d} bytes\n", .{ self.num_pieces, self.total_length }) catch {};
 
@@ -255,7 +274,11 @@ pub const Session = struct {
                 self.doMultiTrackerAnnounce(.completed) catch {};
                 // Don't open an inbound listener when proxied (would leak our IP).
                 if (self.listener == null and self.proxy == null) {
-                    const addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, self.listen_port);
+                    const bind_ip: [4]u8 = switch (self.listen_bind) {
+                        .any => .{ 0, 0, 0, 0 },
+                        .loopback => .{ 127, 0, 0, 1 },
+                    };
+                    const addr = std.net.Address.initIp4(bind_ip, self.listen_port);
                     self.listener = addr.listen(.{ .reuse_address = true }) catch null;
                 }
                 self.mode = .seed;
@@ -290,8 +313,10 @@ pub const Session = struct {
         if (shutdown_requested.load(.acquire)) {
             stderr.print("\nshutting down gracefully...\n", .{}) catch {};
         }
-        self.doMultiTrackerAnnounce(.stopped) catch {};
-        stderr.print("sent stopped announce to tracker\n", .{}) catch {};
+        if (!self.tor_hidden) {
+            self.doMultiTrackerAnnounce(.stopped) catch {};
+            stderr.print("sent stopped announce to tracker\n", .{}) catch {};
+        }
     }
 
     fn buildPollFds(self: *Session, fds: *[max_peers + 1]std.posix.pollfd) usize {
@@ -1003,15 +1028,17 @@ pub const Session = struct {
         // Run choking algorithm
         self.runChokingAlgorithm();
 
-        // Re-announce to trackers at the tracker-provided interval
-        const interval_secs = std.math.cast(i64, self.tracker_interval) orelse 1800;
-        if (now - self.last_announce_time > interval_secs) {
-            self.doMultiTrackerAnnounce(.none) catch {};
-        }
+        if (!self.tor_hidden) {
+            // Re-announce to trackers at the tracker-provided interval
+            const interval_secs = std.math.cast(i64, self.tracker_interval) orelse 1800;
+            if (now - self.last_announce_time > interval_secs) {
+                self.doMultiTrackerAnnounce(.none) catch {};
+            }
 
-        // DHT: retry more aggressively when we have zero peers
-        if (self.peers.items.len == 0 and now - self.last_announce_time > 30) {
-            self.tryDhtPeerDiscovery() catch {};
+            // DHT: retry more aggressively when we have zero peers
+            if (self.peers.items.len == 0 and now - self.last_announce_time > 30) {
+                self.tryDhtPeerDiscovery() catch {};
+            }
         }
     }
 
@@ -1172,6 +1199,23 @@ pub const Session = struct {
         p.* = peer_mod.PeerConnection.init(self.allocator, addr);
         p.proxy = self.proxy;
 
+        try self.finishPeerConnect(p);
+    }
+
+    /// Connect to a Tor hidden service (or other hostname) via the session proxy.
+    pub fn connectOnionPeer(self: *Session, host: []const u8, port: u16) !void {
+        if (self.peers.items.len >= max_peers) return;
+        const px = self.proxy orelse return error.ConnectionFailed;
+
+        const p = self.allocator.create(peer_mod.PeerConnection) catch return error.OutOfMemory;
+        errdefer self.allocator.destroy(p);
+        p.* = try peer_mod.PeerConnection.initOnion(self.allocator, host, port);
+        errdefer p.deinit();
+        p.proxy = px;
+        try self.finishPeerConnect(p);
+    }
+
+    fn finishPeerConnect(self: *Session, p: *peer_mod.PeerConnection) !void {
         p.connect() catch {
             p.deinit();
             self.allocator.destroy(p);

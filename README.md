@@ -148,12 +148,29 @@ carl seed file.torrent /path/to/data --nostr --external-ip 203.0.113.7 \
     --description "My release notes"
 ```
 
+### Seed behind Tor (hidden service)
+
+Requires a running `tor` with ControlPort and cookie auth (default
+`127.0.0.1:9051`, cookie at `~/.tor/control_auth_cookie`):
+
+```sh
+carl seed file.torrent /path/to/data --tor-seed --nostr \
+    --description "Seeded over Tor"
+
+# Leechers must use Tor SOCKS (remote DNS)
+carl download file.torrent --nostr --proxy socks5h://127.0.0.1:9050
+```
+
+Carl creates an ephemeral v3 onion, listens on `127.0.0.1`, publishes the
+`.onion` endpoint in kind 30078 (no public IPv4), and routes Nostr `wss`
+through `--tor-socks` (default `socks5h://127.0.0.1:9050`). Tracker/DHT
+announces are disabled in this mode so your real IP is not leaked to trackers.
+
 ### Download using Nostr peer-discovery
 
 ```sh
-# Subscribes to kind 30078 events filtered by infohash and feeds the IPs
-# back into the session alongside tracker/DHT peers. Routable IPs only —
-# private/loopback/multicast addresses from relays are rejected.
+# Subscribes to kind 30078 events filtered by infohash and dials IPv4 or
+# `.onion` peers (onion requires --proxy socks5h://…). Routable IPv4 only.
 carl download file.torrent --nostr
 ```
 

@@ -184,6 +184,27 @@ still works, carl *must* be tunneling; if it leaked, it would have no
 connectivity at all. This is the gold-standard fail-closed check (`ip netns` +
 a single veth route to the proxy host).
 
+## Tor hidden-service seeding (`--tor-seed`)
+
+For seeding without a public IP, Carl can create an ephemeral v3 onion via Tor
+ControlPort and publish it on Nostr (kind 30078 `host` + `port` tags, no IPv4).
+
+```sh
+# tor must be running with ControlPort (default 9051) and cookie auth
+carl seed file.torrent /data --tor-seed --nostr
+
+# Remote leecher (onion dials require Tor SOCKS)
+carl download file.torrent --nostr --proxy socks5h://127.0.0.1:9050
+```
+
+`--tor-seed` binds the BitTorrent listener to `127.0.0.1` only, disables
+tracker/DHT announces, and tunnels Nostr `wss` via `--tor-socks` (default
+`socks5h://127.0.0.1:9050`). It is mutually exclusive with `--proxy` on seed.
+
+Optional flags: `--tor-control host:port`, `--tor-cookie path`,
+`--tor-onion-port` (virtual port on the onion, default 80),
+`--tor-socks url`.
+
 ## Limitations
 
 - **Web seeds are not tunneled yet** -- they're disabled when proxied (a

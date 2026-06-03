@@ -9,6 +9,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ws = @import("ws.zig");
+const proxy_mod = @import("proxy.zig");
 const nostr = @import("nostr.zig");
 
 const log = std.log.scoped(.relay);
@@ -27,8 +28,8 @@ pub const Relay = struct {
     url: []const u8, // borrowed
     conn: ws.Conn,
 
-    pub fn connect(allocator: Allocator, url: []const u8) Error!Relay {
-        const conn = ws.Conn.connect(allocator, url) catch |err| {
+    pub fn connect(allocator: Allocator, url: []const u8, proxy: ?proxy_mod.Proxy) Error!Relay {
+        const conn = ws.Conn.connect(allocator, url, .{ .proxy = proxy }) catch |err| {
             log.warn("relay connect to {s} failed: {}", .{ url, err });
             return error.ConnectFailed;
         };
