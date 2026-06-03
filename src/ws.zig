@@ -117,7 +117,6 @@ pub const Conn = struct {
             log.warn("tcp connect to {s}:{d} failed: {}", .{ url.host, url.port, err });
             return error.ConnectFailed;
         };
-        errdefer stream.close();
 
         // Apply a recv timeout so reads can fail instead of hanging forever.
         const tv: posix.timeval = .{ .sec = 30, .usec = 0 };
@@ -128,6 +127,9 @@ pub const Conn = struct {
             std.mem.asBytes(&tv),
         ) catch {};
 
+        // Take ownership of the socket via the Conn. From here on, any error
+        // path runs through `conn.deinit()` exactly once — that closes the
+        // stream, releases TLS state if present, and frees fragment_buf.
         var conn: Conn = .{
             .allocator = allocator,
             .stream = stream,
@@ -135,6 +137,7 @@ pub const Conn = struct {
             .fragment_buf = .empty,
             .fragment_opcode = null,
         };
+        errdefer conn.deinit();
 
         if (url.secure) {
             conn.tls_state = TlsState.init(allocator, stream, url.host) catch |err| {
@@ -143,10 +146,7 @@ pub const Conn = struct {
             };
         }
 
-        conn.performHandshake(url) catch |err| {
-            conn.deinit();
-            return err;
-        };
+        try conn.performHandshake(url);
         return conn;
     }
 
@@ -281,14 +281,20 @@ pub const Conn = struct {
 
         try self.writeAll(req);
 
-        // Read response headers until \r\n\r\n.
+        // Read response headers one byte at a time so we never read past the
+        // CRLFCRLF terminator. On the plaintext (ws://) path readSome maps
+        // directly to recv, so any over-read would discard frame bytes the
+        // server might have pipelined behind the upgrade. (The TLS path
+        // buffers internally and doesn't have this issue, but uniform handling
+        // is simpler and the handshake is ~500 bytes — one byte per syscall
+        // is fine.)
         var hdr_buf: [4096]u8 = undefined;
         var hdr_len: usize = 0;
         while (hdr_len < hdr_buf.len) {
-            const n = try self.readSome(hdr_buf[hdr_len..]);
+            const n = try self.readSome(hdr_buf[hdr_len..][0..1]);
             if (n == 0) return error.HandshakeFailed;
             hdr_len += n;
-            if (std.mem.indexOf(u8, hdr_buf[0..hdr_len], "\r\n\r\n") != null) break;
+            if (hdr_len >= 4 and std.mem.eql(u8, hdr_buf[hdr_len - 4 .. hdr_len], "\r\n\r\n")) break;
         }
         const headers = hdr_buf[0..hdr_len];
 
@@ -297,12 +303,38 @@ pub const Conn = struct {
             return error.HandshakeFailed;
         }
 
-        // Verify Sec-WebSocket-Accept = base64(SHA1(key + magic)).
-        const accept = expectedAccept(&key_b64);
-        if (std.mem.indexOf(u8, headers, &accept) == null) {
+        // Verify Sec-WebSocket-Accept = base64(SHA1(key + magic)). Parse the
+        // header line by name rather than substring-matching the whole
+        // response (an unrelated header containing the same 28-char base64
+        // would otherwise spoof acceptance).
+        const expected = expectedAccept(&key_b64);
+        const accept_value = findHeader(headers, "Sec-WebSocket-Accept") orelse {
+            log.warn("ws handshake missing Sec-WebSocket-Accept header", .{});
+            return error.HandshakeFailed;
+        };
+        if (!std.mem.eql(u8, accept_value, &expected)) {
             log.warn("ws handshake bad Sec-WebSocket-Accept", .{});
             return error.HandshakeFailed;
         }
+    }
+
+    /// Find the value of a case-insensitive header name in an HTTP/1.1 header
+    /// block. Returns null if the header is absent.
+    fn findHeader(headers: []const u8, name: []const u8) ?[]const u8 {
+        var line_start: usize = 0;
+        while (line_start < headers.len) {
+            const line_end = std.mem.indexOfScalarPos(u8, headers, line_start, '\n') orelse return null;
+            const line = headers[line_start..line_end];
+            const trimmed = std.mem.trimRight(u8, line, "\r");
+            if (std.mem.indexOfScalar(u8, trimmed, ':')) |colon| {
+                const hdr_name = trimmed[0..colon];
+                if (hdr_name.len == name.len and std.ascii.eqlIgnoreCase(hdr_name, name)) {
+                    return std.mem.trim(u8, trimmed[colon + 1 ..], " \t");
+                }
+            }
+            line_start = line_end + 1;
+        }
+        return null;
     }
 
     const FrameMeta = struct {
@@ -458,6 +490,13 @@ const TlsState = struct {
                 .ca = .{ .bundle = self.ca_bundle },
                 .read_buffer = self.tls_read_buf,
                 .write_buffer = self.tls_write_buf,
+                // WebSocket frames are self-delimiting (length-prefixed in
+                // the frame header), so a connection that ends mid-message
+                // is detected by our readExact returning Closed — we don't
+                // need TLS-level truncation detection to catch it. Allowing
+                // truncation here just means a missing close_notify is
+                // forwarded as EOF instead of TlsConnectionTruncated, which
+                // is what we want for relays that hang up bluntly.
                 .allow_truncation_attacks = true,
             },
         );

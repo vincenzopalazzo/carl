@@ -56,9 +56,14 @@ pub fn encode32(allocator: Allocator, kind: Kind, data: [32]u8) Error![]u8 {
 
 /// Decode a bech32 string. Returns the kind and the 32-byte payload.
 /// Returns BadHrp if the HRP doesn't match a known bare-32 entity.
+/// Uses an internal stack buffer for the temporary 5-to-8 bit conversion —
+/// no heap allocation, no allocator parameter required.
 pub fn decode32(input: []const u8) Error!struct { kind: Kind, data: [32]u8 } {
-    const decoded = try decodeRaw(input);
-    defer std.heap.page_allocator.free(decoded.data);
+    // A 32-byte payload occupies 52 chars in bech32 (+6 checksum). 64 bytes
+    // is more than enough for any bare-32 entity's 5-to-8 expansion.
+    var stack_buf: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&stack_buf);
+    const decoded = try decodeRaw(fba.allocator(), input);
 
     if (decoded.data.len != 32) return error.BadLength;
 
@@ -106,11 +111,11 @@ pub fn encodeRaw(allocator: Allocator, hrp: []const u8, data: []const u8) Error!
 }
 
 const DecodedRaw = struct {
-    hrp: []const u8, // borrowed slice of input
-    data: []u8, // owned (allocated with page_allocator)
+    hrp: []const u8, // borrows from input
+    data: []u8, // owned by the caller-supplied allocator
 };
 
-fn decodeRaw(input: []const u8) Error!DecodedRaw {
+fn decodeRaw(allocator: Allocator, input: []const u8) Error!DecodedRaw {
     if (input.len < 8 or input.len > 1024) return error.InvalidBech32;
     // Determine case (all upper or all lower; mixed is invalid).
     var has_lower = false;
@@ -145,7 +150,7 @@ fn decodeRaw(input: []const u8) Error!DecodedRaw {
     }
 
     const payload = values_buf[0 .. data_part.len - 6];
-    const eight = try convertBits(std.heap.page_allocator, payload, 5, 8, false);
+    const eight = try convertBits(allocator, payload, 5, 8, false);
     return .{ .hrp = hrp_slice, .data = eight };
 }
 
@@ -179,11 +184,8 @@ pub const TlvDecoded = struct {
 
 /// Decode a TLV bech32 entity (nevent/naddr/nprofile).
 pub fn decodeTlv(allocator: Allocator, input: []const u8) Error!TlvDecoded {
-    const decoded = try decodeRaw(input);
-    // We need to re-allocate the bytes into the caller's allocator and free the
-    // page_allocator buffer.
-    const owned = try allocator.dupe(u8, decoded.data);
-    std.heap.page_allocator.free(decoded.data);
+    const decoded = try decodeRaw(allocator, input);
+    const owned = decoded.data;
 
     const kind: TlvKind = if (std.mem.eql(u8, decoded.hrp, "nevent"))
         .nevent
@@ -280,29 +282,39 @@ fn verifyChecksum(hrp: []const u8, data: []const u5) bool {
 }
 
 /// Convert `data` from `from_bits` to `to_bits` bit groups, optionally padding.
+/// Allocates exactly one slice from `allocator` — no intermediate growth, so
+/// callers that use a tight FixedBufferAllocator won't exhaust the stack
+/// buffer through ArrayList's doubling strategy.
 fn convertBits(allocator: Allocator, data: anytype, from_bits: u4, to_bits: u4, pad: bool) ![]u8 {
+    // Upper-bound the output length: ceil(data.len * from_bits / to_bits).
+    const total_in_bits: usize = data.len * @as(usize, from_bits);
+    const max_out_len: usize = (total_in_bits + @as(usize, to_bits) - 1) / @as(usize, to_bits);
+    var out = try allocator.alloc(u8, max_out_len);
+    errdefer allocator.free(out);
+    var w: usize = 0;
+
     var acc: u32 = 0;
     var bits: u4 = 0;
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-
     const max_v: u32 = (@as(u32, 1) << to_bits) - 1;
     for (data) |b| {
         acc = (acc << from_bits) | @as(u32, b);
         bits += from_bits;
         while (bits >= to_bits) {
             bits -= to_bits;
-            try out.append(allocator, @intCast((acc >> bits) & max_v));
+            out[w] = @intCast((acc >> bits) & max_v);
+            w += 1;
         }
     }
     if (pad) {
         if (bits > 0) {
-            try out.append(allocator, @intCast((acc << (to_bits - bits)) & max_v));
+            out[w] = @intCast((acc << (to_bits - bits)) & max_v);
+            w += 1;
         }
     } else if (bits >= from_bits or (acc << (to_bits - bits)) & max_v != 0) {
+        allocator.free(out);
         return error.InvalidBech32;
     }
-    return out.toOwnedSlice(allocator);
+    return allocator.realloc(out, w) catch out[0..w];
 }
 
 // Special-case overload: we need to call convertBits on a slice of u5 too.
