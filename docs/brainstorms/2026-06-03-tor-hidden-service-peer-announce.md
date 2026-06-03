@@ -1,5 +1,9 @@
 # Tor hidden-service seeding + onion peer announce
 
+> **Canonical documentation:** [tor-hidden-service.md](../tor-hidden-service.md)
+> (setup, proxy split, security, E2E test, limitations). This file is the
+> original design brainstorm.
+
 Brainstorm for Carl: seed behind a Tor v3 hidden service, publish the endpoint on Nostr (kind 30078), and let remote leechers discover and connect only via Tor.
 
 **Context:** Today `carl seed --nostr` requires `--external-ip` (IPv4). Kind 30078 uses `ip` + `port` tags. With `--proxy`, the inbound listener is disabled (fail-closed anonymity), so classic seeding over Tor outbound-only does not work. Remote confirmation (Hetzner `65.108.246.14`) showed Nostr discovery works but `45.80.136.155:6881` is unreachable from the internet (firewall/NAT).

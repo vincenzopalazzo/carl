@@ -163,9 +163,11 @@ carl download file.torrent --nostr --proxy socks5h://127.0.0.1:9050
 
 Carl creates an ephemeral v3 onion, listens on `127.0.0.1`, and publishes the
 `.onion` endpoint in kind 30078 (no public IPv4). Leechers dial the onion via
-`--proxy socks5h://127.0.0.1:9050`. Nostr relay `wss` uses clearnet today
-(proxied `wss` is not implemented); tracker/DHT announces are disabled in
-tor-seed mode so your real IP is not leaked to trackers.
+`--proxy socks5h://127.0.0.1:9050`. Tracker/DHT announces are disabled so your
+real IP is not leaked to trackers.
+
+Full details (proxy split, security, E2E test, troubleshooting):
+[docs/tor-hidden-service.md](docs/tor-hidden-service.md).
 
 ### Download using Nostr peer-discovery
 
@@ -209,6 +211,7 @@ src/
   nip19.zig        Bech32 codec for npub/nsec/note + TLV decoder
   nip35.zig        Kind 2003 torrent index event builder/parser
   peer_announce.zig  Kind 30078 peer-announce builder/parser + IP safety filter
+  tor_control.zig  Tor ControlPort ADD_ONION / DEL_ONION for v3 hidden services
   relay.zig        Connect to a relay, subscribe-collect-until-EOSE, publish-and-wait
   nostr_config.zig  ~/.config/carl/{nsec,relays} read/write
 ```
