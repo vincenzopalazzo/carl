@@ -20,6 +20,7 @@ pub const peer_announce = @import("peer_announce.zig");
 pub const tor_control = @import("tor_control.zig");
 pub const relay = @import("relay.zig");
 pub const nostr_config = @import("nostr_config.zig");
+pub const mse = @import("mse.zig");
 
 test {
     _ = bencode;
@@ -43,5 +44,6 @@ test {
     _ = tor_control;
     _ = relay;
     _ = nostr_config;
+    _ = mse;
     _ = @import("integration_test.zig");
 }

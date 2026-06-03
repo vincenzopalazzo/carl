@@ -12,6 +12,7 @@ A BitTorrent client written in pure Zig. The BitTorrent core has zero Zig packag
 - **Multi-file torrents** -- single and multi-file torrent support with proper file mapping
 - **Seeding** -- upload mode with incoming connection support
 - **Proxy / anonymous mode** -- route peers and trackers through a SOCKS5/SOCKS5h or HTTP proxy, hiding your real IP from the swarm ([docs](docs/proxy.md))
+- **MSE/PE (in progress)** -- Vuze message-stream encryption module landed in [#27](https://github.com/vincenzopalazzo/carl/pull/27); not wired to the CLI yet ([docs](docs/mse-pe.md), issue [#12](https://github.com/vincenzopalazzo/carl/issues/12))
 - **Nostr discovery** -- publish torrents you seed as NIP-35 events and find others' torrents via `carl search`; per-seeder peer-announces over a custom kind 30078 feed peers into download sessions
 
 ## Protocol Support
@@ -203,6 +204,7 @@ src/
   dht.zig          Kademlia DHT (BEP 5)
   extension.zig    Extension protocol / metadata exchange (BEP 9/10)
   proxy.zig        SOCKS5/SOCKS5h + HTTP CONNECT proxy tunneling
+  mse.zig          Vuze MSE/PE handshake + RC4 stream (library only until peer wiring)
 
   # Nostr (optional discovery layer)
   secp.zig         BIP-340 Schnorr wrapper over vendored libsecp256k1
