@@ -463,14 +463,23 @@ pub const Session = struct {
                 }
             },
             .bitfield => |data| {
+                // Keep the raw bytes: a bitfield received during the magnet
+                // metadata-only phase can't be parsed yet (piece count unknown),
+                // and the peer won't resend it. onMetadataComplete re-parses it.
+                if (p.raw_bitfield) |old| self.allocator.free(old);
+                p.raw_bitfield = self.allocator.dupe(u8, data) catch null;
+
                 if (p.peer_bitfield) |*bf| {
                     // Remove old availability counts
                     self.removeAvailability(bf);
                     bf.deinit(self.allocator);
+                    p.peer_bitfield = null;
                 }
-                p.peer_bitfield = piece_mod.Bitfield.fromRaw(self.allocator, data, self.num_pieces) catch null;
-                if (p.peer_bitfield) |*bf| {
-                    self.addAvailability(bf);
+                if (self.num_pieces > 0) {
+                    p.peer_bitfield = piece_mod.Bitfield.fromRaw(self.allocator, data, self.num_pieces) catch null;
+                    if (p.peer_bitfield) |*bf| {
+                        self.addAvailability(bf);
+                    }
                 }
 
                 if (self.mode == .download and !p.am_interested) {
@@ -588,13 +597,15 @@ pub const Session = struct {
     }
 
     fn handleMetadataMessage(self: *Session, p: *peer_mod.PeerConnection, ext_data: []const u8) !void {
-        var md = &(self.metadata_download orelse return);
-
         var msg = extension.parseMetadataMessage(self.allocator, ext_data) catch return;
         defer msg.deinit(self.allocator);
 
         switch (msg.msg_type) {
             .data => {
+                // Only meaningful while we're fetching metadata. A seeder that
+                // already has the info dict has no metadata_download and just
+                // ignores stray data messages.
+                var md = &(self.metadata_download orelse return);
                 if (msg.data) |data| {
                     if (msg.total_size) |ts| {
                         md.setSize(ts) catch return;
@@ -654,10 +665,26 @@ pub const Session = struct {
     }
 
     fn serveMetadataPiece(self: *Session, p: *peer_mod.PeerConnection, piece_idx: u32) !void {
-        // Serving metadata to peers -- simplified for now
-        _ = self;
-        _ = p;
-        _ = piece_idx;
+        const peer_id = p.peer_ut_metadata_id orelse return;
+        if (self.meta.raw_info.len == 0) return;
+
+        const mps = extension.metadata_piece_size;
+        const start: usize = @as(usize, piece_idx) * mps;
+        if (start >= self.meta.raw_info.len) return;
+
+        const end = @min(start + mps, self.meta.raw_info.len);
+        const piece_data = self.meta.raw_info[start..end];
+        const total_size: u32 = std.math.cast(u32, self.meta.raw_info.len) orelse return;
+
+        const payload = extension.buildMetadataData(
+            self.allocator,
+            peer_id,
+            piece_idx,
+            total_size,
+            piece_data,
+        ) catch return;
+        defer self.allocator.free(payload);
+        p.enqueueMessage(.{ .extended = payload }) catch {};
     }
 
     fn onMetadataComplete(self: *Session, raw_info: []const u8) !void {
@@ -746,6 +773,26 @@ pub const Session = struct {
         self.metadata_only = false;
         if (self.metadata_download) |*md| md.deinit();
         self.metadata_download = null;
+
+        // Re-parse any bitfields that arrived before we knew the piece count, so
+        // peers connected during the metadata phase are usable for downloading
+        // immediately (otherwise we'd think they have no pieces and stall).
+        for (self.peers.items) |p| {
+            if (p.state != .active) continue;
+            if (p.raw_bitfield) |raw| {
+                if (p.peer_bitfield) |*bf| {
+                    self.removeAvailability(bf);
+                    bf.deinit(self.allocator);
+                    p.peer_bitfield = null;
+                }
+                p.peer_bitfield = piece_mod.Bitfield.fromRaw(self.allocator, raw, self.num_pieces) catch null;
+                if (p.peer_bitfield) |*bf| self.addAvailability(bf);
+            }
+            if (!p.am_interested and self.peerHasNeededPieces(p)) {
+                p.am_interested = true;
+                p.enqueueMessage(.interested) catch {};
+            }
+        }
 
         log.info("metadata complete: '{s}', {d} pieces, {d} bytes", .{ name, self.num_pieces, self.total_length });
     }
@@ -1409,7 +1456,14 @@ pub const Session = struct {
     }
 
     fn printProgress(self: *Session) !void {
-        const stdout = std.fs.File.stdout().deprecatedWriter();
+        // Only render the \r progress bar to an interactive terminal. When
+        // stdout is piped to a log file or another process, the carriage-return
+        // redraws are noise -- and a reader that doesn't promptly drain stdout
+        // could fill the pipe and block our single-threaded event loop.
+        const stdout_file = std.fs.File.stdout();
+        if (!std.posix.isatty(stdout_file.handle)) return;
+
+        const stdout = stdout_file.deprecatedWriter();
         const now = std.time.timestamp();
         const have = self.our_bitfield.count();
         const pct = if (self.num_pieces > 0) (have * 100) / self.num_pieces else 0;

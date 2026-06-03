@@ -145,6 +145,17 @@ pub const Conn = struct {
     pub fn connect(allocator: Allocator, url_input: []const u8, options: ConnectOptions) Error!Conn {
         const url = try parseUrl(url_input);
 
+        // For direct connections, probe reachability with a bounded timeout
+        // first so a relay with a hanging TCP connect can't stall us for the
+        // OS default (~75 s) inside std's timeout-free connect. Proxied
+        // connections dial the proxy, not the relay, so skip the probe there.
+        if (options.proxy == null and
+            !preflightReachable(allocator, url.host, url.port, preflight_connect_ms))
+        {
+            log.warn("relay {s}:{d} unreachable within {d}ms, skipping", .{ url.host, url.port, preflight_connect_ms });
+            return error.ConnectFailed;
+        }
+
         if (url.secure) {
             if (options.proxy != null) {
                 log.warn("wss over proxy is not supported; use relay.connect or clearnet", .{});
@@ -595,6 +606,59 @@ fn httpConnectError(err: std.http.Client.ConnectTcpError) Error {
         error.UnknownHostName, error.HostLacksNetworkAddresses => error.DnsResolveFailed,
         else => error.ConnectFailed,
     };
+}
+
+/// Connect-probe budget (ms) for the preflight reachability check. The blocking
+/// connect inside `std.http.Client` (used for the `wss://` TLS path) has no
+/// timeout, so a relay whose TCP connect hangs -- e.g. an unroutable address or
+/// a silently-dropped SYN, as public relays like relay.nostr.band sometimes do
+/// -- would otherwise stall the caller for the OS default (~75 s). We probe
+/// first with a bounded non-blocking connect and skip the relay fast on failure.
+const preflight_connect_ms: i32 = 4000;
+
+/// Best-effort fast reachability probe: resolve `host` and try a non-blocking
+/// TCP connect (IPv4 first) bounded by `timeout_ms`. Returns true as soon as any
+/// address accepts. A false return lets the caller skip a dead/slow relay
+/// quickly instead of blocking in std's timeout-free connect.
+fn preflightReachable(allocator: Allocator, host: []const u8, port: u16, timeout_ms: i32) bool {
+    const list = std.net.getAddressList(allocator, host, port) catch return false;
+    defer list.deinit();
+
+    inline for (.{ posix.AF.INET, posix.AF.INET6 }) |family| {
+        for (list.addrs) |addr| {
+            if (addr.any.family != family) continue;
+            if (probeConnect(addr, timeout_ms)) return true;
+        }
+    }
+    return false;
+}
+
+/// Non-blocking connect to a single address, bounded by `timeout_ms`. The probe
+/// socket is always closed; we only care whether the connect would succeed.
+fn probeConnect(addr: std.net.Address, timeout_ms: i32) bool {
+    const sock = posix.socket(
+        addr.any.family,
+        posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
+        posix.IPPROTO.TCP,
+    ) catch return false;
+    defer posix.close(sock);
+
+    const flags = posix.fcntl(sock, posix.F.GETFL, 0) catch return false;
+    var o: posix.O = @bitCast(@as(u32, @truncate(flags)));
+    o.NONBLOCK = true;
+    _ = posix.fcntl(sock, posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
+
+    posix.connect(sock, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
+        error.WouldBlock => {
+            var pfd = [_]posix.pollfd{.{ .fd = sock, .events = posix.POLL.OUT, .revents = 0 }};
+            const ready = posix.poll(&pfd, timeout_ms) catch return false;
+            if (ready == 0) return false;
+            posix.getsockoptError(sock) catch return false;
+            return true;
+        },
+        else => return false,
+    };
+    return true; // connected synchronously
 }
 
 /// Open TCP to `host`:`port`, preferring IPv4 and trying every resolved address

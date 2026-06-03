@@ -36,6 +36,11 @@ pub const PeerConnection = struct {
     peer_interested: bool,
 
     peer_bitfield: ?piece_mod.Bitfield,
+    /// Raw bitfield bytes as received, kept so a bitfield that arrives during
+    /// the magnet metadata-only phase (when piece count is still unknown) can
+    /// be re-parsed once `onMetadataComplete` learns the real piece count.
+    /// Owned by the connection. Defaulted so struct literals can omit it.
+    raw_bitfield: ?[]u8 = null,
     peer_id: ?[20]u8,
 
     // BEP 10 extension state
@@ -121,6 +126,7 @@ pub const PeerConnection = struct {
         if (self.stream) |s| s.close();
         if (self.connect_host) |h| self.allocator.free(h);
         if (self.peer_bitfield) |*bf| bf.deinit(self.allocator);
+        if (self.raw_bitfield) |rb| self.allocator.free(rb);
         self.recv_buf.deinit(self.allocator);
         self.send_buf.deinit(self.allocator);
         self.pending_requests.deinit(self.allocator);
@@ -161,16 +167,54 @@ pub const PeerConnection = struct {
         };
         errdefer std.posix.close(sock);
 
-        // Set send timeout to limit blocking connect duration
-        const timeout = std.posix.timeval{ .sec = connect_timeout_secs, .usec = 0 };
-        std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
-
-        // Blocking connect with timeout
-        std.posix.connect(sock, &self.address.any, @sizeOf(std.posix.sockaddr.in)) catch {
-            // errdefer above handles closing the socket
+        // Connect with a hard timeout. SO_SNDTIMEO does NOT bound connect() on
+        // macOS, so a dead or filtered peer (e.g. a stale nostr peer-announce)
+        // could block the whole session in connect() for the OS default ~75 s.
+        // Use a non-blocking connect + poll(POLLOUT) so connect_timeout_secs is
+        // a real upper bound on every platform, then restore blocking mode for
+        // the session's normal poll-driven I/O.
+        const flags = std.posix.fcntl(sock, std.posix.F.GETFL, 0) catch {
             self.state = .disconnected;
             return error.ConnectionFailed;
         };
+        var o: std.posix.O = @bitCast(@as(u32, @truncate(flags)));
+        o.NONBLOCK = true;
+        _ = std.posix.fcntl(sock, std.posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
+
+        std.posix.connect(sock, &self.address.any, @sizeOf(std.posix.sockaddr.in)) catch |err| switch (err) {
+            // EINPROGRESS: the connect is underway; wait for the socket to
+            // become writable (success) or error out, bounded by our timeout.
+            error.WouldBlock => {
+                var pfd = [_]std.posix.pollfd{.{
+                    .fd = sock,
+                    .events = std.posix.POLL.OUT,
+                    .revents = 0,
+                }};
+                const ready = std.posix.poll(&pfd, connect_timeout_secs * 1000) catch {
+                    self.state = .disconnected;
+                    return error.ConnectionFailed;
+                };
+                if (ready == 0) {
+                    self.state = .disconnected;
+                    return error.ConnectionTimedOut;
+                }
+                // Connect finished -- surface any asynchronous error (refused,
+                // unreachable, …) via SO_ERROR rather than treating it as ok.
+                std.posix.getsockoptError(sock) catch {
+                    self.state = .disconnected;
+                    return error.ConnectionFailed;
+                };
+            },
+            else => {
+                self.state = .disconnected;
+                return error.ConnectionFailed;
+            },
+        };
+
+        // Back to blocking: the session multiplexes peers with poll() and then
+        // does blocking reads/writes on ready sockets.
+        o.NONBLOCK = false;
+        _ = std.posix.fcntl(sock, std.posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
 
         self.stream = .{ .handle = sock };
         self.state = .handshaking;
