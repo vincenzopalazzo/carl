@@ -140,10 +140,11 @@ pub fn sign(out_event: *Event, sk: secp.SecretKey, allocator: Allocator) Error!v
 
     out_event.id = computeId(preimage);
 
-    // BIP-340 sign over the id. We pass null aux_rand so libsecp256k1 uses
-    // the all-zero auxiliary, which is spec-compliant and deterministic for
-    // a given (sk, msg). For better side-channel resistance, callers can
-    // supply fresh randomness via signWithAux below.
+    // BIP-340 sign over the id. Passing null asks `secp.sign` to draw fresh
+    // 32-byte auxiliary randomness from std.crypto.random, which mitigates
+    // fault and side-channel attacks on the nonce derivation. Callers wanting
+    // deterministic signatures (test vectors, reproducibility) call
+    // `secp.sign` directly with an explicit aux value.
     out_event.sig = secp.sign(sk, out_event.id, null) catch return error.BadSignature;
 }
 
