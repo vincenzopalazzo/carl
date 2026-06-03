@@ -11,6 +11,7 @@ A BitTorrent client written in pure Zig with zero external dependencies. Carl im
 - **Resume support** -- verifies existing pieces on startup and continues where you left off
 - **Multi-file torrents** -- single and multi-file torrent support with proper file mapping
 - **Seeding** -- upload mode with incoming connection support
+- **Proxy / anonymous mode** -- route peers and trackers through a SOCKS5/SOCKS5h or HTTP proxy, hiding your real IP from the swarm ([docs](docs/proxy.md))
 
 ## Protocol Support
 
@@ -93,6 +94,27 @@ carl announce file.torrent
 carl seed file.torrent /path/to/data --port 6881
 ```
 
+### Anonymous mode (proxy)
+
+Route peers and trackers through a SOCKS5/SOCKS5h or HTTP proxy with `--proxy`:
+
+```sh
+# SOCKS5 with remote DNS (recommended -- no DNS leak)
+carl download file.torrent --proxy socks5h://127.0.0.1:1080
+
+# With authentication
+carl download file.torrent --proxy socks5h://user:pass@127.0.0.1:1080
+
+# HTTP CONNECT proxy
+carl announce file.torrent --proxy http://127.0.0.1:3128
+```
+
+When a proxy is set, carl fails closed: DHT, UDP trackers, web seeds, and the
+incoming listener are disabled so nothing bypasses the proxy. `http://` and
+`https://` trackers are tunneled (HTTPS runs cert-verified TLS over the proxied
+stream); UDP trackers are not. See [docs/proxy.md](docs/proxy.md) for proxy
+setup on Linux/macOS and how to verify there are no leaks.
+
 ## Architecture
 
 ```
@@ -111,6 +133,7 @@ src/
   udp_tracker.zig  UDP tracker client (BEP 15)
   dht.zig          Kademlia DHT (BEP 5)
   extension.zig    Extension protocol / metadata exchange (BEP 9/10)
+  proxy.zig        SOCKS5/SOCKS5h + HTTP CONNECT proxy tunneling
 ```
 
 ### Session internals

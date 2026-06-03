@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 const wire = @import("wire.zig");
 const piece_mod = @import("piece.zig");
 const extension = @import("extension.zig");
+const proxy_mod = @import("proxy.zig");
 
 pub const PeerState = enum {
     connecting,
@@ -20,6 +21,10 @@ pub const PeerConnection = struct {
     address: std.net.Address,
     stream: ?std.net.Stream,
     state: PeerState,
+
+    /// Outbound proxy to tunnel this connection through. When null, connect
+    /// directly. Set by the session after `init` from its own proxy config.
+    proxy: ?proxy_mod.Proxy,
 
     // Protocol state
     am_choking: bool,
@@ -57,6 +62,7 @@ pub const PeerConnection = struct {
             .address = address,
             .stream = null,
             .state = .connecting,
+            .proxy = null,
             .am_choking = true,
             .am_interested = false,
             .peer_choking = true,
@@ -90,6 +96,17 @@ pub const PeerConnection = struct {
 
     /// Initiate TCP connection with a timeout.
     pub fn connect(self: *PeerConnection) !void {
+        // When a proxy is configured, tunnel through it. The handshake is
+        // synchronous, so on success the stream is ready for the BT handshake.
+        if (self.proxy) |px| {
+            self.stream = proxy_mod.connectThroughProxyAddr(self.allocator, px, self.address) catch {
+                self.state = .disconnected;
+                return error.ConnectionFailed;
+            };
+            self.state = .handshaking;
+            return;
+        }
+
         // Create socket
         const sock = std.posix.socket(
             std.posix.AF.INET,

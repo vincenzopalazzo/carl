@@ -14,6 +14,7 @@ const peer_mod = @import("peer.zig");
 const extension = @import("extension.zig");
 const bencode = @import("bencode.zig");
 const dht_mod = @import("dht.zig");
+const proxy_mod = @import("proxy.zig");
 
 const log = std.log.scoped(.session);
 
@@ -81,6 +82,11 @@ pub const Session = struct {
     dht_instance: ?dht_mod.Dht,
     dht_failed: bool,
 
+    // Outbound proxy (SOCKS5/SOCKS5h/HTTP CONNECT). When set, peers and HTTP
+    // trackers are tunneled; DHT, UDP trackers, web seeds, and the inbound
+    // listener are disabled to avoid leaking the real IP.
+    proxy: ?proxy_mod.Proxy,
+
     // Progress tracking
     start_time: i64,
     last_progress_time: i64,
@@ -92,6 +98,7 @@ pub const Session = struct {
         output_dir: []const u8,
         mode: Mode,
         listen_port: u16,
+        proxy: ?proxy_mod.Proxy,
     ) !Session {
         const total_length = piece_mod.totalLength(meta.files);
         const num_pieces = piece_mod.numPieces(total_length, meta.piece_length);
@@ -133,8 +140,10 @@ pub const Session = struct {
             }
         }
 
+        // Skip the inbound listener entirely when proxied: accepting incoming
+        // peers would reveal the real IP to whoever connects.
         var listener: ?std.net.Server = null;
-        if (mode == .seed or our_bitfield.count() > 0) {
+        if (proxy == null and (mode == .seed or our_bitfield.count() > 0)) {
             const addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, listen_port);
             listener = addr.listen(.{ .reuse_address = true }) catch null;
         }
@@ -171,6 +180,7 @@ pub const Session = struct {
             .metadata_only = false,
             .dht_instance = null,
             .dht_failed = false,
+            .proxy = proxy,
             .start_time = now,
             .last_progress_time = now,
             .last_progress_bytes = 0,
@@ -210,6 +220,22 @@ pub const Session = struct {
         };
         std.posix.sigaction(std.posix.SIG.INT, &act, null);
 
+        if (self.proxy) |px| {
+            log.info(
+                "proxy enabled ({s} {s}:{d}); DHT, UDP trackers, web seeds, and incoming peers disabled for anonymity",
+                .{ @tagName(px.scheme), px.host, px.port },
+            );
+            // With DHT and UDP trackers off, an HTTP/HTTPS tracker is the only
+            // peer source left. Warn loudly if the torrent has none, otherwise
+            // the session polls forever with nothing to discover.
+            if (!self.hasProxyUsableTracker()) {
+                log.warn(
+                    "no proxy-usable peer source: DHT and UDP trackers are disabled and this torrent has no http(s):// tracker. No peers can be found -- add an http(s):// tracker or run without --proxy.",
+                    .{},
+                );
+            }
+        }
+
         // Multi-tracker announce (BEP 12) / DHT peer discovery
         const has_trackers = (self.meta.announce.len > 0) or (self.meta.announce_list != null);
         if (has_trackers) {
@@ -227,12 +253,17 @@ pub const Session = struct {
             if (self.mode == .download and !self.metadata_only and self.num_pieces > 0 and self.our_bitfield.isComplete()) {
                 stdout.print("\ndownload complete!\n", .{}) catch {};
                 self.doMultiTrackerAnnounce(.completed) catch {};
-                if (self.listener == null) {
+                // Don't open an inbound listener when proxied (would leak our IP).
+                if (self.listener == null and self.proxy == null) {
                     const addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, self.listen_port);
                     self.listener = addr.listen(.{ .reuse_address = true }) catch null;
                 }
                 self.mode = .seed;
-                stdout.print("now seeding on port {d}...\n", .{self.listen_port}) catch {};
+                if (self.proxy == null) {
+                    stdout.print("now seeding on port {d}...\n", .{self.listen_port}) catch {};
+                } else {
+                    stdout.print("download complete; seeding to outbound peers only (proxied)\n", .{}) catch {};
+                }
             }
 
             var fds: [max_peers + 1]std.posix.pollfd = undefined;
@@ -1025,14 +1056,36 @@ pub const Session = struct {
         return error.TrackerFailed;
     }
 
+    /// Whether any announce URL can be used while proxied. HTTP and HTTPS
+    /// trackers are tunneled; UDP trackers are disabled. A torrent with only
+    /// UDP trackers (or none) has no peer source under --proxy.
+    fn hasProxyUsableTracker(self: *Session) bool {
+        if (isHttpTracker(self.meta.announce)) return true;
+        if (self.meta.announce_list) |tiers| {
+            for (tiers) |tier| {
+                for (tier) |url| {
+                    if (isHttpTracker(url)) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    fn isHttpTracker(url: []const u8) bool {
+        return std.mem.startsWith(u8, url, "http://") or std.mem.startsWith(u8, url, "https://");
+    }
+
     fn tryAnnounceUrl(self: *Session, url: []const u8, req: tracker_mod.AnnounceRequest) ?tracker_mod.AnnounceResponse {
         if (std.mem.startsWith(u8, url, "udp://")) {
+            // UDP cannot be carried over an HTTP/SOCKS CONNECT tunnel; disable
+            // when proxied so we never leak the real IP via a raw datagram.
+            if (self.proxy != null) return null;
             return udp_tracker.announce(self.allocator, url, req) catch |err| {
                 log.warn("UDP tracker {s} failed: {}", .{ url, err });
                 return null;
             };
         } else if (url.len > 0) {
-            return tracker_mod.announce(self.allocator, url, req) catch |err| {
+            return tracker_mod.announce(self.allocator, url, req, self.proxy) catch |err| {
                 log.warn("HTTP tracker {s} failed: {}", .{ url, err });
                 return null;
             };
@@ -1088,6 +1141,7 @@ pub const Session = struct {
 
             const p = self.allocator.create(peer_mod.PeerConnection) catch continue;
             p.* = peer_mod.PeerConnection.init(self.allocator, addr);
+            p.proxy = self.proxy;
 
             p.connect() catch {
                 p.deinit();
@@ -1116,6 +1170,7 @@ pub const Session = struct {
 
         const p = self.allocator.create(peer_mod.PeerConnection) catch return error.OutOfMemory;
         p.* = peer_mod.PeerConnection.init(self.allocator, addr);
+        p.proxy = self.proxy;
 
         p.connect() catch {
             p.deinit();
@@ -1168,6 +1223,10 @@ pub const Session = struct {
     // --- BEP 5: DHT peer discovery ---
 
     fn tryDhtPeerDiscovery(self: *Session) !void {
+        // DHT runs over UDP, which cannot be tunneled through an HTTP/SOCKS
+        // CONNECT proxy. Disable it when proxied to avoid leaking the real IP.
+        if (self.proxy != null) return;
+
         // Don't retry if DHT previously failed to start (e.g. port busy)
         if (self.dht_failed) return;
 
@@ -1196,6 +1255,10 @@ pub const Session = struct {
     // --- BEP 19: Web seed downloads ---
 
     fn tryWebSeedDownload(self: *Session) !void {
+        // Web seeds use std.http.Client directly; disable when proxied (a
+        // proxied + Range-aware path is a follow-up).
+        if (self.proxy != null) return;
+
         const urls = self.meta.url_list orelse return;
         if (urls.len == 0) return;
         if (self.num_pieces == 0) return;

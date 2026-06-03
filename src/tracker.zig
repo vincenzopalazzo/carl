@@ -1,6 +1,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const bencode = @import("bencode.zig");
+const proxy_mod = @import("proxy.zig");
+
+const log = std.log.scoped(.tracker);
 
 /// A peer returned by the tracker.
 pub const Peer = struct {
@@ -187,14 +190,18 @@ pub fn parseAnnounceResponse(
     };
 }
 
-/// Perform an HTTP tracker announce. Returns the parsed response.
+/// Perform an HTTP tracker announce. Returns the parsed response. When `proxy`
+/// is set, the announce is tunneled through it (fail-closed: no direct request).
 pub fn announce(
     allocator: Allocator,
     announce_url: []const u8,
     req: AnnounceRequest,
+    proxy: ?proxy_mod.Proxy,
 ) TrackerError!AnnounceResponse {
     const url = buildAnnounceUrl(allocator, announce_url, req) catch return error.OutOfMemory;
     defer allocator.free(url);
+
+    if (proxy) |px| return announceThroughProxy(allocator, px, url);
 
     var client: std.http.Client = .{ .allocator = allocator };
     defer client.deinit();
@@ -214,6 +221,18 @@ pub fn announce(
     if (result.status != .ok) return error.HttpError;
 
     return parseAnnounceResponse(allocator, response_body.items);
+}
+
+/// Announce by tunneling the GET through the proxy. `http://` goes in plaintext,
+/// `https://` runs TLS over the proxied stream -- both via `proxy.httpGet`, so
+/// nothing is ever sent directly.
+fn announceThroughProxy(allocator: Allocator, proxy: proxy_mod.Proxy, url: []const u8) TrackerError!AnnounceResponse {
+    const body = proxy_mod.httpGet(allocator, proxy, url, null) catch |err| {
+        log.warn("proxied tracker announce failed: {}", .{err});
+        return error.HttpError;
+    };
+    defer allocator.free(body);
+    return parseAnnounceResponse(allocator, body);
 }
 
 // --- Internal helpers ---

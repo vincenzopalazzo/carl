@@ -11,6 +11,7 @@ pub const magnet = @import("magnet.zig");
 pub const extension = @import("extension.zig");
 pub const dht = @import("dht.zig");
 pub const secp = @import("secp.zig");
+pub const proxy = @import("proxy.zig");
 
 test {
     _ = bencode;
@@ -25,5 +26,6 @@ test {
     _ = extension;
     _ = dht;
     _ = secp;
+    _ = proxy;
     _ = @import("integration_test.zig");
 }
