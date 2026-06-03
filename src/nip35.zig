@@ -110,7 +110,10 @@ pub fn buildFromMetainfo(
         .content = content_dup,
         .sig = undefined,
     };
-    nostr.sign(&ev, sk, allocator) catch return error.OutOfMemory;
+    // Propagate `nostr.sign`'s real error rather than collapsing every cause
+    // into OutOfMemory — BadSignature, InvalidJson, etc. are meaningful for
+    // the caller and they were getting hidden by the catch.
+    try nostr.sign(&ev, sk, allocator);
     return ev;
 }
 
