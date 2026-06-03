@@ -21,7 +21,8 @@ const log = std.log.scoped(.secp);
 pub const Error = error{
     InvalidSecretKey,
     InvalidPublicKey,
-    InvalidSignature,
+    InvalidHex,
+    KeyGenerationFailed,
     SigningFailed,
     OutOfMemory,
 };
@@ -77,7 +78,10 @@ pub fn generateSecretKey() Error!SecretKey {
         std.crypto.random.bytes(&sk);
         if (c.secp256k1_ec_seckey_verify(ctx_ptr, &sk) == 1) return sk;
     }
-    return error.SigningFailed;
+    // Statistically unreachable (~256 * 2^-256), but if the RNG is broken or
+    // the curve order has shifted under our feet, return a name that matches
+    // the action.
+    return error.KeyGenerationFailed;
 }
 
 /// Derive the x-only public key from a secret key. Returns InvalidSecretKey if
@@ -101,18 +105,26 @@ pub fn publicKeyFromSecret(sk: SecretKey) Error!PublicKey {
 // Sign and verify
 // ---------------------------------------------------------------------------
 
-/// Sign a 32-byte message hash with BIP-340 Schnorr. `aux_rand` should be
-/// 32 fresh random bytes for nonce derivation; pass null to use no auxiliary
-/// randomness (the spec recommends fresh randomness for side-channel safety).
+/// Sign a 32-byte message hash with BIP-340 Schnorr. When `aux_rand` is null
+/// we draw 32 fresh bytes from `std.crypto.random` — per BIP-340 §3.3,
+/// auxiliary randomness mitigates fault and side-channel attacks on the nonce
+/// derivation, so the safe default is the easy default. Callers needing
+/// deterministic signatures (test vectors, reproducibility) pass an explicit
+/// 32-byte value.
 pub fn sign(sk: SecretKey, msg32: [32]u8, aux_rand: ?[32]u8) Error!Signature {
     const ctx_ptr = try getCtx();
     var keypair: c.secp256k1_keypair = undefined;
     if (c.secp256k1_keypair_create(ctx_ptr, &keypair, &sk) != 1) {
         return error.InvalidSecretKey;
     }
+    var aux: [32]u8 = undefined;
+    if (aux_rand) |a| {
+        aux = a;
+    } else {
+        std.crypto.random.bytes(&aux);
+    }
     var sig: Signature = undefined;
-    const aux_ptr: [*c]const u8 = if (aux_rand) |*a| @ptrCast(a) else null;
-    if (c.secp256k1_schnorrsig_sign32(ctx_ptr, &sig, &msg32, &keypair, aux_ptr) != 1) {
+    if (c.secp256k1_schnorrsig_sign32(ctx_ptr, &sig, &msg32, &keypair, &aux) != 1) {
         return error.SigningFailed;
     }
     return sig;
@@ -135,8 +147,11 @@ pub fn verify(sig: Signature, msg: []const u8, pk: PublicKey) bool {
 const hex_table = "0123456789abcdef";
 
 /// Encode `bytes` as lowercase hex into `out`. `out.len` must equal 2*bytes.len.
+/// Mismatched sizes are a programmer error and panic explicitly in all build
+/// modes (a `std.debug.assert` would compile out and silently overrun the
+/// buffer in ReleaseFast/ReleaseSmall).
 pub fn toHex(bytes: []const u8, out: []u8) void {
-    std.debug.assert(out.len == bytes.len * 2);
+    if (out.len != bytes.len * 2) @panic("secp.toHex: out buffer must be 2 * bytes.len");
     for (bytes, 0..) |b, i| {
         out[i * 2] = hex_table[b >> 4];
         out[i * 2 + 1] = hex_table[b & 0x0f];
@@ -145,11 +160,11 @@ pub fn toHex(bytes: []const u8, out: []u8) void {
 
 /// Decode lowercase or uppercase hex into `out`. `out.len` must equal hex.len/2.
 pub fn fromHex(hex: []const u8, out: []u8) Error!void {
-    if (hex.len != out.len * 2) return error.InvalidPublicKey;
+    if (hex.len != out.len * 2) return error.InvalidHex;
     var i: usize = 0;
     while (i < out.len) : (i += 1) {
-        const hi = nibble(hex[i * 2]) orelse return error.InvalidPublicKey;
-        const lo = nibble(hex[i * 2 + 1]) orelse return error.InvalidPublicKey;
+        const hi = nibble(hex[i * 2]) orelse return error.InvalidHex;
+        const lo = nibble(hex[i * 2 + 1]) orelse return error.InvalidHex;
         out[i] = (hi << 4) | lo;
     }
 }
@@ -296,6 +311,6 @@ test "hex round trip" {
 
 test "fromHex rejects bad input" {
     var out: [4]u8 = undefined;
-    try std.testing.expectError(error.InvalidPublicKey, fromHex("xx", &out)); // wrong length
-    try std.testing.expectError(error.InvalidPublicKey, fromHex("ZZZZZZZZ", &out)); // bad chars
+    try std.testing.expectError(error.InvalidHex, fromHex("xx", &out)); // wrong length
+    try std.testing.expectError(error.InvalidHex, fromHex("ZZZZZZZZ", &out)); // bad chars
 }

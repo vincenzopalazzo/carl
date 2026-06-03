@@ -42,8 +42,10 @@ pub fn build(b: *std.Build) void {
         .{ "ENABLE_MODULE_SCHNORRSIG", "1" },
         .{ "ENABLE_MODULE_EXTRAKEYS", "1" },
         .{ "ECMULT_WINDOW_SIZE", "15" },
-        // ECMULT_GEN_KB=22 keeps the table at ~22 KiB (vs 86 KiB default) —
-        // we don't need fastest-possible signing.
+        // The (COMB_BLOCKS, COMB_TEETH) = (11, 6) pair is libsecp256k1's
+        // encoding for what its CMake exposes as ECMULT_GEN_KB=22 — a ~22 KiB
+        // precomputed signing table (vs 86 KiB default). We don't need
+        // fastest-possible signing.
         .{ "COMB_BLOCKS", "11" },
         .{ "COMB_TEETH", "6" },
     };
