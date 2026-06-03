@@ -186,7 +186,7 @@ src/
 
   # Nostr (optional discovery layer)
   secp.zig         BIP-340 Schnorr wrapper over vendored libsecp256k1
-  ws.zig           Minimal RFC 6455 WebSocket client (TLS via std.crypto.tls)
+  ws.zig           Minimal RFC 6455 WebSocket client (wss via std.http.Client)
   nostr.zig        NIP-01 events, canonical id hashing, sign/verify, filters
   nip19.zig        Bech32 codec for npub/nsec/note + TLV decoder
   nip35.zig        Kind 2003 torrent index event builder/parser
