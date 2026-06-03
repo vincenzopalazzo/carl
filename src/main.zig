@@ -229,19 +229,63 @@ fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []c
         log.info("magnet link parsed", .{});
         if (ml.name) |n| log.info("name: {s}", .{n});
 
-        const announce = if (ml.trackers.len > 0)
-            allocator.dupe(u8, ml.trackers[0]) catch {
+        var merged_trackers: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (merged_trackers.items) |t| allocator.free(t);
+            merged_trackers.deinit(allocator);
+        }
+        for (ml.trackers) |t| {
+            merged_trackers.append(allocator, try allocator.dupe(u8, t)) catch std.process.exit(1);
+        }
+
+        // One NIP-35 lookup feeds BOTH tracker enrichment and the display name,
+        // so a bare magnet costs a single relay round-trip here instead of two.
+        var nip35_entry: ?carl.nip35.TorrentEntry = null;
+        defer if (nip35_entry) |e| e.deinit(allocator);
+        if (want_nostr) {
+            nip35_entry = fetchNip35Entry(allocator, ml.info_hash, proxy);
+        }
+
+        if (nip35_entry) |entry| {
+            var added: usize = 0;
+            for (entry.trackers) |t| {
+                var dup = false;
+                for (merged_trackers.items) |existing| {
+                    if (std.mem.eql(u8, existing, t)) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) {
+                    merged_trackers.append(allocator, try allocator.dupe(u8, t)) catch std.process.exit(1);
+                    added += 1;
+                }
+            }
+            if (added > 0 and ml.trackers.len == 0) {
+                log.info("enriched magnet with {d} tracker(s) from nostr", .{added});
+            }
+        }
+
+        const announce = if (merged_trackers.items.len > 0)
+            allocator.dupe(u8, merged_trackers.items[0]) catch {
                 std.process.exit(1);
             }
         else blk: {
-            // Trackerless magnet -- will use DHT for peer discovery
-            log.info("no trackers in magnet link, will use DHT", .{});
+            log.info("no trackers in magnet link, will use DHT and nostr peers", .{});
             break :blk allocator.dupe(u8, "") catch {
                 std.process.exit(1);
             };
         };
 
-        const name = if (ml.name) |n|
+        // Borrow the title from the still-live nip35_entry; `name` dupes it.
+        var display_name: ?[]const u8 = ml.name;
+        if (display_name == null) {
+            if (nip35_entry) |entry| {
+                if (entry.title.len > 0) display_name = entry.title;
+            }
+        }
+
+        const name = if (display_name) |n|
             allocator.dupe(u8, n) catch {
                 std.process.exit(1);
             }
@@ -251,11 +295,11 @@ fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []c
             };
 
         var announce_list: ?[]const []const []const u8 = null;
-        if (ml.trackers.len > 1) {
-            const tier = allocator.alloc([]const u8, ml.trackers.len) catch {
+        if (merged_trackers.items.len > 1) {
+            const tier = allocator.alloc([]const u8, merged_trackers.items.len) catch {
                 std.process.exit(1);
             };
-            for (ml.trackers, 0..) |t, i| {
+            for (merged_trackers.items, 0..) |t, i| {
                 tier[i] = allocator.dupe(u8, t) catch {
                     std.process.exit(1);
                 };
@@ -745,6 +789,61 @@ fn publishNostrEvents(
         "nostr publish: kind-2003 {d}/{d} relays, kind-30078 {d}/{d} relays",
         .{ torrent_acks, relay_urls.len, announce_acks, relay_urls.len },
     );
+}
+
+/// Fetch the most recent kind-2003 (NIP-35) torrent event for `info_hash`,
+/// returning its parsed entry (title, trackers, files). Caller owns the result
+/// and must `deinit` it. Returns null if no matching event is found.
+fn fetchNip35Entry(
+    allocator: std.mem.Allocator,
+    info_hash: [20]u8,
+    proxy: ?carl.proxy.Proxy,
+) ?carl.nip35.TorrentEntry {
+    var ih_hex: [40]u8 = undefined;
+    carl.secp.toHex(&info_hash, &ih_hex);
+
+    var values_arr = [_][]const u8{&ih_hex};
+    var tag_filters = [_]carl.nostr.Filter.TagFilter{.{ .letter = 'x', .values = &values_arr }};
+    const filter: carl.nostr.Filter = .{
+        .kinds = &[_]u32{carl.nip35.kind_torrent},
+        .tags = &tag_filters,
+        .limit = 20,
+    };
+
+    const relay_urls = carl.nostr_config.readRelays(allocator) catch return null;
+    defer carl.nostr_config.freeRelays(allocator, relay_urls);
+
+    var best: ?carl.nip35.TorrentEntry = null;
+    var best_created: i64 = std.math.minInt(i64);
+
+    for (relay_urls) |url| {
+        var r = carl.relay.Relay.connect(allocator, url, proxy) catch continue;
+        defer r.deinit();
+        const events = carl.relay.subscribeAndCollect(allocator, &r, filter, .{
+            .timeout_ms = 10_000,
+            .max_events = 20,
+            .verify_signatures = true,
+        }) catch continue;
+        defer {
+            for (events) |e| e.deinit(allocator);
+            allocator.free(events);
+        }
+        for (events) |ev| {
+            const entry = carl.nip35.parseEvent(allocator, ev) catch continue;
+            if (!std.mem.eql(u8, &entry.info_hash, &info_hash)) {
+                entry.deinit(allocator);
+                continue;
+            }
+            if (entry.created_at > best_created) {
+                if (best) |b| b.deinit(allocator);
+                best_created = entry.created_at;
+                best = entry;
+            } else {
+                entry.deinit(allocator);
+            }
+        }
+    }
+    return best;
 }
 
 fn collectNostrPeers(

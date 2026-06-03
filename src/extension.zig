@@ -188,6 +188,36 @@ pub fn buildMetadataRequest(
     return msg;
 }
 
+/// Build a ut_metadata data message (BEP 9).
+/// Returns: [peer_ut_metadata_id][bencoded_dict][raw_piece_bytes].
+pub fn buildMetadataData(
+    allocator: Allocator,
+    peer_ut_metadata_id: u8,
+    piece_index: u32,
+    total_size: u32,
+    piece_data: []const u8,
+) error{OutOfMemory}![]u8 {
+    var entries: [3]bencode.Value.DictEntry = undefined;
+    entries[0] = .{ .key = "msg_type", .value = .{ .integer = @intFromEnum(MetadataMsgType.data) } };
+    entries[1] = .{ .key = "piece", .value = .{ .integer = piece_index } };
+    entries[2] = .{ .key = "total_size", .value = .{ .integer = total_size } };
+
+    const dict = bencode.Value{ .dict = &entries };
+    const encoded = bencode.encode(allocator, dict) catch return error.OutOfMemory;
+    errdefer allocator.free(encoded);
+
+    const msg = allocator.alloc(u8, 1 + encoded.len + piece_data.len) catch {
+        allocator.free(encoded);
+        return error.OutOfMemory;
+    };
+    msg[0] = peer_ut_metadata_id;
+    @memcpy(msg[1 .. 1 + encoded.len], encoded);
+    @memcpy(msg[1 + encoded.len ..], piece_data);
+    allocator.free(encoded);
+
+    return msg;
+}
+
 /// Parse a ut_metadata message from the payload after msg ID 20.
 /// The payload format is: [ext_id][bencoded_dict][optional_raw_data].
 pub fn parseMetadataMessage(
@@ -398,6 +428,22 @@ test "extension bit set and check" {
     setExtensionBit(&reserved);
     try std.testing.expect(supportsExtensions(reserved));
     try std.testing.expectEqual(@as(u8, 0x10), reserved[5]);
+}
+
+test "build and parse metadata data" {
+    const allocator = std.testing.allocator;
+    const piece: [10]u8 = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+
+    const payload = try buildMetadataData(allocator, 3, 0, 100, &piece);
+    defer allocator.free(payload);
+
+    try std.testing.expectEqual(@as(u8, 3), payload[0]);
+    var msg = try parseMetadataMessage(allocator, payload);
+    defer msg.deinit(allocator);
+    try std.testing.expectEqual(MetadataMsgType.data, msg.msg_type);
+    try std.testing.expectEqual(@as(u32, 0), msg.piece);
+    try std.testing.expectEqual(@as(u32, 100), msg.total_size.?);
+    try std.testing.expectEqualStrings(&piece, msg.data.?);
 }
 
 test "build and parse extension handshake" {

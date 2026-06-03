@@ -9,6 +9,7 @@ const wire = @import("wire.zig");
 const piece_mod = @import("piece.zig");
 const storage_mod = @import("storage.zig");
 const session_mod = @import("session.zig");
+const extension = @import("extension.zig");
 
 /// Generate deterministic test data of a given size.
 fn generateTestData(allocator: std.mem.Allocator, size: usize) ![]u8 {
@@ -365,6 +366,133 @@ test "full session seed and download over loopback" {
         const downloaded = dl_sess.store.readPiece(allocator, idx, plen) catch continue;
         defer allocator.free(downloaded);
 
+        try std.testing.expectEqualSlices(u8, test_data[start .. start + plen], downloaded);
+    }
+}
+
+// Test 3: Magnet-style metadata exchange (BEP 9) then piece download over
+// loopback. Mirrors `carl download <magnet> --nostr`: the downloader starts in
+// metadata-only mode knowing only the info-hash, pulls the info dict from the
+// seeder via ut_metadata, then downloads the data.
+//
+// Unlike Test 2 this is CI-safe and runs under `zig build test`: it is
+// single-threaded (both sessions are driven in lock-step with tick(), so there
+// are no timing races), binds the seeder to an ephemeral port (0 -> OS-assigned,
+// so parallel runs never collide), and is bounded by a hard iteration cap (so a
+// regression can never hang the runner). It guards the metadata path the magnet
+// CLI depends on -- the exact path that previously stalled forever.
+test "magnet metadata exchange then download over loopback" {
+    const allocator = std.testing.allocator;
+
+    const test_data = try generateTestData(allocator, 65536);
+    defer allocator.free(test_data);
+
+    const piece_length: u64 = 16384;
+    var tm = try buildTestMetainfo(allocator, test_data, piece_length, "meta_test.bin");
+    defer tm.deinit();
+
+    const info_hash = metainfo.infoHash(tm.meta.raw_info);
+
+    var seeder_dir = std.testing.tmpDir(.{});
+    defer seeder_dir.cleanup();
+    var downloader_dir = std.testing.tmpDir(.{});
+    defer downloader_dir.cleanup();
+
+    const seeder_path = try seeder_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(seeder_path);
+    const downloader_path = try downloader_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(downloader_path);
+
+    {
+        var store = storage_mod.Storage.init(allocator, tm.meta, seeder_path, true) catch return;
+        defer store.deinit();
+        const num_pieces = piece_mod.numPieces(test_data.len, piece_length);
+        for (0..num_pieces) |i| {
+            const idx: u32 = @intCast(i);
+            const plen = piece_mod.pieceLength(idx, piece_length, test_data.len);
+            const start = @as(usize, idx) * @as(usize, @intCast(piece_length));
+            store.writePiece(idx, test_data[start .. start + plen]) catch return;
+        }
+    }
+
+    // Seeder session bound to an ephemeral port (0 -> OS picks a free one).
+    var seeder = session_mod.Session.init(
+        allocator,
+        tm.meta,
+        seeder_path,
+        .seed,
+        0,
+        null,
+        .loopback,
+        false,
+    ) catch return;
+    defer seeder.deinit();
+    // init opens the inbound listener for seed mode; read back the real port.
+    const seeder_port = (seeder.listener orelse return error.SeederNotListening)
+        .listen_address.getPort();
+
+    // Downloader in metadata-only mode. Arena-backed so the metadata-only ->
+    // full-metadata handoff (which reassigns Session.meta) doesn't trip the
+    // testing allocator's leak detector; we are exercising protocol behavior.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const da = arena.allocator();
+
+    const empty_path = try da.alloc([]const u8, 1);
+    empty_path[0] = try da.dupe(u8, "unknown");
+    const empty_files = try da.alloc(metainfo.FileInfo, 1);
+    empty_files[0] = .{ .length = 0, .path = empty_path };
+    const empty_meta = metainfo.Metainfo{
+        .announce = try da.dupe(u8, ""),
+        .announce_list = null,
+        .name = try da.dupe(u8, "unknown"),
+        .piece_length = 0,
+        .pieces = &.{},
+        .files = empty_files,
+        .comment = null,
+        .creation_date = null,
+        .created_by = null,
+        .raw_info = &.{},
+        .url_list = null,
+    };
+
+    var dl = session_mod.Session.init(
+        da,
+        empty_meta,
+        downloader_path,
+        .download,
+        0,
+        null,
+        .loopback,
+        false,
+    ) catch return;
+    defer dl.deinit();
+    dl.info_hash = info_hash;
+    dl.metadata_download = extension.MetadataDownload.init(da, info_hash);
+    dl.metadata_only = true;
+
+    try dl.connectDirectPeer(std.net.Address.initIp4(.{ 127, 0, 0, 1 }, seeder_port));
+
+    // Drive both sessions in lock-step until the downloader has fetched the
+    // metadata AND all pieces. Hard cap keeps a regression from hanging CI; the
+    // happy path converges in a couple hundred iterations.
+    var i: usize = 0;
+    while (i < 4000 and (dl.metadata_only or !dl.our_bitfield.isComplete())) : (i += 1) {
+        seeder.tick() catch {};
+        dl.tick() catch {};
+    }
+
+    // Metadata exchange must have completed (switched out of metadata-only)...
+    try std.testing.expect(!dl.metadata_only);
+    // ...and then the actual data must have downloaded and verified.
+    try std.testing.expect(dl.our_bitfield.isComplete());
+
+    const num_pieces = piece_mod.numPieces(test_data.len, piece_length);
+    for (0..num_pieces) |i_piece| {
+        const idx: u32 = @intCast(i_piece);
+        const plen = piece_mod.pieceLength(idx, piece_length, test_data.len);
+        const start = @as(usize, idx) * @as(usize, @intCast(piece_length));
+        const downloaded = dl.store.readPiece(da, idx, plen) catch continue;
         try std.testing.expectEqualSlices(u8, test_data[start .. start + plen], downloaded);
     }
 }
