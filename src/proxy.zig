@@ -184,6 +184,9 @@ pub fn httpGet(allocator: Allocator, proxy: Proxy, url: []const u8, extra_header
     var req: std.ArrayList(u8) = .empty;
     defer req.deinit(allocator);
     try append(allocator, &req, "GET ");
+    // Request target must be origin-form ("/..."). parseHttpUrl may hand back
+    // "", "/path[?query]", or "?query"; synthesize the leading slash as needed.
+    if (u.path.len == 0 or u.path[0] != '/') try append(allocator, &req, "/");
     try append(allocator, &req, u.path);
     try append(allocator, &req, " HTTP/1.1\r\nHost: ");
     try append(allocator, &req, u.host);
@@ -282,7 +285,10 @@ fn socks5Handshake(stream: std.net.Stream, proxy: Proxy) ProxyError!void {
     try readN(stream, &sel);
     if (sel[0] != 0x05) return error.InvalidResponse;
     switch (sel[1]) {
-        0x00 => {}, // no auth required
+        // No-auth accepted. We allow this even when credentials were supplied:
+        // the proxy doesn't require them, and withholding creds from a proxy
+        // that didn't ask avoids leaking them to a misconfigured endpoint.
+        0x00 => {},
         0x02 => try socks5UserPassAuth(stream, proxy),
         else => return error.AuthenticationFailed, // includes 0xFF (no acceptable method)
     }
@@ -485,9 +491,17 @@ fn parseHttpUrl(url: []const u8) ?HttpUrl {
         rest = url[8..];
     } else return null;
 
-    const path_start = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
-    const authority = rest[0..path_start];
-    const path = if (path_start < rest.len) rest[path_start..] else "/";
+    // Authority ends at the first '/' or '?'. A query-only URL (no path),
+    // e.g. http://tracker/?-less host + "?passkey=...", must keep its query in
+    // the request target rather than folding it into the host.
+    const slash = std.mem.indexOfScalar(u8, rest, '/');
+    const quest = std.mem.indexOfScalar(u8, rest, '?');
+    const auth_end = if (slash != null and quest != null)
+        @min(slash.?, quest.?)
+    else
+        slash orelse quest orelse rest.len;
+    const authority = rest[0..auth_end];
+    const path = rest[auth_end..]; // "", "/path[?query]", or "?query"
 
     var host = authority;
     var port: u16 = if (is_https) 443 else 80;
@@ -637,6 +651,21 @@ test "parseHttpUrl https flagged" {
     const u = parseHttpUrl("https://secure.tracker/announce").?;
     try std.testing.expect(u.is_https);
     try std.testing.expectEqual(@as(u16, 443), u.port);
+}
+
+test "parseHttpUrl query-only authority keeps query out of host" {
+    // No '/' before the query (bare-host announce URL + appended params).
+    const u = parseHttpUrl("http://tracker.example.com?passkey=abc&info_hash=x").?;
+    try std.testing.expectEqualStrings("tracker.example.com", u.host);
+    try std.testing.expectEqual(@as(u16, 80), u.port);
+    try std.testing.expectEqualStrings("?passkey=abc&info_hash=x", u.path);
+}
+
+test "parseHttpUrl bare host has empty path" {
+    const u = parseHttpUrl("http://tracker.example.com:6969").?;
+    try std.testing.expectEqualStrings("tracker.example.com", u.host);
+    try std.testing.expectEqual(@as(u16, 6969), u.port);
+    try std.testing.expectEqualStrings("", u.path);
 }
 
 test "parseHttpResponse plain body" {
