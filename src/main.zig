@@ -394,6 +394,18 @@ fn cmdSeed(
             log.err("invalid --external-ip: {s}", .{external_ip.?});
             std.process.exit(1);
         };
+        // Run the seeder's own IP through the same safety filter we apply to
+        // peers we'd download from. Publishing a peer-announce for 127.0.0.1
+        // or 192.168.x.y is always a mistake — every receiving carl will
+        // reject it in peer_announce.parse, so we may as well catch it here
+        // with a useful error instead of silently emitting a dud event.
+        if (!carl.peer_announce.isRoutable(ip)) {
+            log.err(
+                "--external-ip {d}.{d}.{d}.{d} is not a routable public address; refusing to publish peer-announce",
+                .{ ip[0], ip[1], ip[2], ip[3] },
+            );
+            std.process.exit(1);
+        }
         publishNostr(allocator, mi, ip, port, description) catch |err| {
             log.warn("nostr publish failed: {} (continuing seed)", .{err});
         };
@@ -610,7 +622,8 @@ fn publishNostr(
     const relay_urls = try carl.nostr_config.readRelays(allocator);
     defer carl.nostr_config.freeRelays(allocator, relay_urls);
 
-    var published: usize = 0;
+    var torrent_acks: usize = 0;
+    var announce_acks: usize = 0;
     for (relay_urls) |url| {
         var r = carl.relay.Relay.connect(allocator, url) catch |err| {
             log.warn("nostr publish: {s}: {}", .{ url, err });
@@ -619,13 +632,17 @@ fn publishNostr(
         defer r.deinit();
         if (carl.relay.publishAndWait(allocator, &r, torrent_ev, 5_000)) {
             log.info("published kind-2003 to {s}", .{url});
-            published += 1;
+            torrent_acks += 1;
         }
         if (carl.relay.publishAndWait(allocator, &r, announce_ev, 5_000)) {
             log.info("published kind-30078 peer-announce to {s}", .{url});
+            announce_acks += 1;
         }
     }
-    log.info("published torrent event to {d}/{d} relays", .{ published, relay_urls.len });
+    log.info(
+        "nostr publish: kind-2003 {d}/{d} relays, kind-30078 {d}/{d} relays",
+        .{ torrent_acks, relay_urls.len, announce_acks, relay_urls.len },
+    );
 }
 
 fn collectNostrPeers(

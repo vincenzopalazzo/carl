@@ -13,16 +13,15 @@ const nip19 = @import("nip19.zig");
 
 const log = std.log.scoped(.config);
 
-pub const Error = error{
-    NoConfigDir,
-    NoKey,
-    BadKeyFile,
-    OutOfMemory,
-} || std.fs.File.OpenError || std.fs.Dir.MakeError || std.posix.WriteError;
+// Module errors are inferred: every public function below returns its real
+// error set, including the named variants (`NoKey`, `BadKeyFile`,
+// `NoConfigDir`) plus whatever the underlying std.fs / std.process calls
+// surface. `main.zig` switches on the specific tags it cares about and lets
+// the rest propagate.
 
 /// Resolve the config directory: $XDG_CONFIG_HOME/carl or $HOME/.config/carl.
 /// Caller owns the returned slice.
-pub fn configDir(allocator: Allocator) Error![]u8 {
+pub fn configDir(allocator: Allocator) ![]u8 {
     if (std.process.getEnvVarOwned(allocator, "XDG_CONFIG_HOME")) |xdg| {
         defer allocator.free(xdg);
         return try std.fmt.allocPrint(allocator, "{s}/carl", .{xdg});
@@ -34,7 +33,7 @@ pub fn configDir(allocator: Allocator) Error![]u8 {
 }
 
 /// Ensure the config directory exists; mode 0700.
-pub fn ensureConfigDir(allocator: Allocator) Error![]u8 {
+pub fn ensureConfigDir(allocator: Allocator) ![]u8 {
     const dir = try configDir(allocator);
     errdefer allocator.free(dir);
     std.fs.cwd().makePath(dir) catch |err| switch (err) {
@@ -63,8 +62,22 @@ pub fn writeSecretKey(allocator: Allocator, sk: secp.SecretKey) ![]u8 {
     return nsec;
 }
 
+/// Parse the contents of an nsec file (one bech32 entity, optional trailing
+/// whitespace) into a 32-byte secret key. Returns `BadKeyFile` if the payload
+/// is malformed or the HRP isn't `nsec`. Extracted from readSecretKey so the
+/// test suite can hit it without touching the filesystem layer.
+pub fn parseNsecFile(content: []const u8) !secp.SecretKey {
+    var trimmed: []const u8 = content;
+    while (trimmed.len > 0 and (trimmed[trimmed.len - 1] == '\n' or trimmed[trimmed.len - 1] == '\r' or trimmed[trimmed.len - 1] == ' ' or trimmed[trimmed.len - 1] == '\t')) {
+        trimmed = trimmed[0 .. trimmed.len - 1];
+    }
+    const decoded = nip19.decode32(trimmed) catch return error.BadKeyFile;
+    if (decoded.kind != .nsec) return error.BadKeyFile;
+    return decoded.data;
+}
+
 /// Read the secret key from `<config>/nsec`. Returns NoKey if absent.
-pub fn readSecretKey(allocator: Allocator) Error!secp.SecretKey {
+pub fn readSecretKey(allocator: Allocator) !secp.SecretKey {
     const dir = try configDir(allocator);
     defer allocator.free(dir);
 
@@ -79,14 +92,7 @@ pub fn readSecretKey(allocator: Allocator) Error!secp.SecretKey {
 
     var buf: [128]u8 = undefined;
     const n = file.readAll(&buf) catch return error.BadKeyFile;
-    var trimmed: []const u8 = buf[0..n];
-    while (trimmed.len > 0 and (trimmed[trimmed.len - 1] == '\n' or trimmed[trimmed.len - 1] == '\r' or trimmed[trimmed.len - 1] == ' ')) {
-        trimmed = trimmed[0 .. trimmed.len - 1];
-    }
-
-    const decoded = nip19.decode32(trimmed) catch return error.BadKeyFile;
-    if (decoded.kind != .nsec) return error.BadKeyFile;
-    return decoded.data;
+    return parseNsecFile(buf[0..n]);
 }
 
 /// Read the relay list from `<config>/relays` (one per line). If absent or
@@ -139,14 +145,8 @@ pub fn freeRelays(allocator: Allocator, relays: [][]const u8) void {
 // Tests
 // ===========================================================================
 
-// Round-trip secret-key file in a temporary directory. We exercise the bech32
-// codec used by the writer/reader without poking the real $HOME/$XDG_CONFIG_HOME
-// (that path requires setenv plumbing that std doesn't expose cleanly).
-test "writeFileAndReadBack roundtrips an nsec file at an arbitrary path" {
+test "parseNsecFile: round trips a written nsec via the production path" {
     const allocator = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
 
     var sk: secp.SecretKey = undefined;
     try secp.fromHex("0000000000000000000000000000000000000000000000000000000000000003", &sk);
@@ -154,20 +154,46 @@ test "writeFileAndReadBack roundtrips an nsec file at an arbitrary path" {
     const nsec = try nip19.encode32(allocator, .nsec, sk);
     defer allocator.free(nsec);
 
-    var file = try tmp.dir.createFile("nsec", .{ .truncate = true, .mode = 0o600 });
-    try file.writeAll(nsec);
-    try file.writeAll("\n");
-    file.close();
+    // What writeSecretKey actually puts on disk: bech32 entity + "\n".
+    var on_disk: [128]u8 = undefined;
+    @memcpy(on_disk[0..nsec.len], nsec);
+    on_disk[nsec.len] = '\n';
 
-    // Read back via the same logic readSecretKey uses internally.
-    var f2 = try tmp.dir.openFile("nsec", .{});
-    defer f2.close();
+    const back = try parseNsecFile(on_disk[0 .. nsec.len + 1]);
+    try std.testing.expectEqualSlices(u8, &sk, &back);
+}
+
+test "parseNsecFile: tolerates trailing \\r\\n and spaces" {
+    const allocator = std.testing.allocator;
+
+    var sk: secp.SecretKey = undefined;
+    try secp.fromHex("0000000000000000000000000000000000000000000000000000000000000003", &sk);
+
+    const nsec = try nip19.encode32(allocator, .nsec, sk);
+    defer allocator.free(nsec);
+
     var buf: [128]u8 = undefined;
-    const n = try f2.readAll(&buf);
-    var trimmed: []const u8 = buf[0..n];
-    while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '\n') trimmed = trimmed[0 .. trimmed.len - 1];
+    @memcpy(buf[0..nsec.len], nsec);
+    buf[nsec.len] = '\r';
+    buf[nsec.len + 1] = '\n';
+    buf[nsec.len + 2] = ' ';
 
-    const decoded = try nip19.decode32(trimmed);
-    try std.testing.expectEqual(nip19.Kind.nsec, decoded.kind);
-    try std.testing.expectEqualSlices(u8, &sk, &decoded.data);
+    const back = try parseNsecFile(buf[0 .. nsec.len + 3]);
+    try std.testing.expectEqualSlices(u8, &sk, &back);
+}
+
+test "parseNsecFile: rejects a non-nsec bech32 entity" {
+    const allocator = std.testing.allocator;
+
+    var pk: secp.PublicKey = undefined;
+    @memset(&pk, 0x55);
+    const npub = try nip19.encode32(allocator, .npub, pk);
+    defer allocator.free(npub);
+
+    try std.testing.expectError(error.BadKeyFile, parseNsecFile(npub));
+}
+
+test "parseNsecFile: rejects garbage" {
+    try std.testing.expectError(error.BadKeyFile, parseNsecFile("not bech32"));
+    try std.testing.expectError(error.BadKeyFile, parseNsecFile(""));
 }
