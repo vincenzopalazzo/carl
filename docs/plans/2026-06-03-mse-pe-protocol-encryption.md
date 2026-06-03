@@ -15,7 +15,7 @@ Vuze MSE/PE on peer TCP: DH + RC4 full stream (`0x02`), then existing BEP 3. Pre
 | 3 | `feat/mse-session-inbound` | `session.zig`: accept detect + responder |
 | 4 | `feat/mse-cli` | `main.zig` flags `--mse`, `--prefer-encryption` |
 | 5 | `feat/mse-tracker` | `tracker.zig`: supportcrypto / crypto_flags |
-| 6 | `feat/mse-docs` | `docs/mse-pe.md` + integration test |
+| 6 | `feat/mse-docs` | Expand `docs/mse-pe.md` + integration test (impact doc started in PR 1) |
 
 ## PR 1 acceptance
 
