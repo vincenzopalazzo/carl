@@ -515,7 +515,11 @@ const TlsState = struct {
 
 /// Compute the expected Sec-WebSocket-Accept header value for a given
 /// base64-encoded client key. Format: base64(sha1(key + magic)).
-fn expectedAccept(key_b64: []const u8) [28]u8 {
+/// Compute the `Sec-WebSocket-Accept` value the server must send back for a
+/// given client `Sec-WebSocket-Key` (per RFC 6455 §1.3). Exposed so the
+/// in-process mock relay in `mock_relay.zig` can reuse the same logic and
+/// stay in lockstep with the client.
+pub fn expectedAccept(key_b64: []const u8) [28]u8 {
     const magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     var hasher = std.crypto.hash.Sha1.init(.{});
     hasher.update(key_b64);

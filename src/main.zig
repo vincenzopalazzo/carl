@@ -385,6 +385,11 @@ fn cmdSeed(
     const mi = readTorrent(allocator, torrent_path);
     defer mi.deinit(allocator);
 
+    var announce_loop_state: ?*PeerAnnounceLoop = null;
+    var announce_loop_thread: ?std.Thread = null;
+    defer if (announce_loop_thread) |t| t.join();
+    defer if (announce_loop_state) |s| s.deinit();
+
     if (want_nostr) {
         if (external_ip == null) {
             log.err("--nostr requires --external-ip <ip> so peers know how to dial you", .{});
@@ -409,6 +414,32 @@ fn cmdSeed(
         publishNostr(allocator, mi, ip, port, description) catch |err| {
             log.warn("nostr publish failed: {} (continuing seed)", .{err});
         };
+
+        // Kick off the periodic peer-announce refresher. NIP-33 replaceable
+        // events stay on relays in principle, but in practice relays GC and
+        // some clients filter on freshness — a long seed needs to re-publish
+        // every few minutes to stay visible. 5 min is conservative; it can
+        // become a CLI flag later.
+        const info_hash = carl.metainfo.infoHash(mi.raw_info);
+        announce_loop_state = PeerAnnounceLoop.start(
+            allocator,
+            info_hash,
+            ip,
+            port,
+            5 * 60 * 1000,
+            &carl.session.shutdown_requested,
+        ) catch |err| blk: {
+            log.warn("could not start peer-announce loop: {} (one-shot publish only)", .{err});
+            break :blk null;
+        };
+        if (announce_loop_state) |state| {
+            announce_loop_thread = std.Thread.spawn(.{}, PeerAnnounceLoop.run, .{state}) catch |err| blk: {
+                log.warn("could not spawn peer-announce loop thread: {}", .{err});
+                state.deinit();
+                announce_loop_state = null;
+                break :blk null;
+            };
+        }
     }
 
     var session = carl.session.Session.init(allocator, mi, data_dir, .seed, port, proxy) catch |err| {
@@ -421,6 +452,9 @@ fn cmdSeed(
         log.err("session failed: {}", .{err});
         std.process.exit(1);
     };
+    // session.run() returns when shutdown_requested flips, which the
+    // PeerAnnounceLoop also polls — the deferred join above will return
+    // within ~1s of session exit.
 }
 
 // -------------------------------------------------------------------------
@@ -765,6 +799,110 @@ fn parseUnsignedFlag(extra_args: []const [:0]u8, flag: []const u8, default: u32)
     const s = parseFlag(extra_args, flag) orelse return default;
     return std.fmt.parseUnsigned(u32, s, 10) catch default;
 }
+
+// -------------------------------------------------------------------------
+// Periodic peer-announce loop
+// -------------------------------------------------------------------------
+
+/// Background loop that re-publishes a kind-30078 peer-announce every
+/// `interval_ms` milliseconds for the lifetime of a `carl seed --nostr`
+/// session. Holds only immutable copies of the inputs (sk, pk, info_hash, ip,
+/// port, relay URLs) so there's no shared mutable state with the session
+/// thread. Exits within ~1s of `shutdown_requested` flipping to true.
+const PeerAnnounceLoop = struct {
+    allocator: std.mem.Allocator,
+    sk: carl.secp.SecretKey,
+    pk: carl.secp.PublicKey,
+    info_hash: [20]u8,
+    ip: [4]u8,
+    port: u16,
+    interval_ms: u64,
+    /// Deep-copied list of relay URLs we own; freed in deinit.
+    relay_urls: [][]const u8,
+    /// Borrowed: lives in carl.session module scope.
+    shutdown: *std.atomic.Value(bool),
+
+    fn start(
+        allocator: std.mem.Allocator,
+        info_hash: [20]u8,
+        ip: [4]u8,
+        port: u16,
+        interval_ms: u64,
+        shutdown: *std.atomic.Value(bool),
+    ) !*PeerAnnounceLoop {
+        const sk = try carl.nostr_config.readSecretKey(allocator);
+        const pk = try carl.secp.publicKeyFromSecret(sk);
+
+        // Deep-copy the relay list so the thread doesn't share strings with
+        // any caller-owned data structure that might be freed mid-loop.
+        const fresh_relays = try carl.nostr_config.readRelays(allocator);
+        defer carl.nostr_config.freeRelays(allocator, fresh_relays);
+        const owned = try allocator.alloc([]const u8, fresh_relays.len);
+        errdefer allocator.free(owned);
+        var copied: usize = 0;
+        errdefer for (owned[0..copied]) |s| allocator.free(s);
+        for (fresh_relays, 0..) |r, i| {
+            owned[i] = try allocator.dupe(u8, r);
+            copied = i + 1;
+        }
+
+        const self = try allocator.create(PeerAnnounceLoop);
+        self.* = .{
+            .allocator = allocator,
+            .sk = sk,
+            .pk = pk,
+            .info_hash = info_hash,
+            .ip = ip,
+            .port = port,
+            .interval_ms = interval_ms,
+            .relay_urls = owned,
+            .shutdown = shutdown,
+        };
+        return self;
+    }
+
+    fn deinit(self: *PeerAnnounceLoop) void {
+        for (self.relay_urls) |r| self.allocator.free(r);
+        self.allocator.free(self.relay_urls);
+        // Zero the secret key on free. libsecp256k1 doesn't zero internally.
+        @memset(&self.sk, 0);
+        self.allocator.destroy(self);
+    }
+
+    fn run(self: *PeerAnnounceLoop) void {
+        log.info("nostr peer-announce loop started (interval {d}ms, {d} relays)", .{ self.interval_ms, self.relay_urls.len });
+        while (!self.shutdown.load(.acquire)) {
+            // Sleep in 1s chunks polling the shutdown flag so SIGINT propagates
+            // within ~1s instead of waiting for the full interval.
+            const chunks: u64 = (self.interval_ms + 999) / 1000;
+            var i: u64 = 0;
+            while (i < chunks) : (i += 1) {
+                if (self.shutdown.load(.acquire)) return;
+                std.Thread.sleep(1 * std.time.ns_per_s);
+            }
+            if (self.shutdown.load(.acquire)) return;
+
+            self.publishOnce() catch |err| {
+                log.warn("nostr peer-announce cycle failed: {}", .{err});
+            };
+        }
+    }
+
+    fn publishOnce(self: *PeerAnnounceLoop) !void {
+        var ev = try carl.peer_announce.build(self.allocator, self.sk, self.pk, self.info_hash, self.ip, self.port);
+        defer ev.deinit(self.allocator);
+
+        var acks: usize = 0;
+        for (self.relay_urls) |url| {
+            var r = carl.relay.Relay.connect(self.allocator, url) catch continue;
+            defer r.deinit();
+            if (carl.relay.publishAndWait(self.allocator, &r, ev, 5_000)) {
+                acks += 1;
+            }
+        }
+        log.info("nostr peer-announce refresh: {d}/{d} relays acked", .{ acks, self.relay_urls.len });
+    }
+};
 
 test {
     _ = @import("carl");
