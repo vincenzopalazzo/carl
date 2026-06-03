@@ -61,14 +61,16 @@ pub fn main() !void {
         const output_dir = parseFlag(args[3..], "--output-dir") orelse ".";
         const port = parsePort(args[3..]);
         const want_nostr = parseFlagPresent(args[3..], "--nostr");
-        try cmdDownload(allocator, source, output_dir, port, parseProxy(args[3..]), want_nostr);
+        const want_pubky = parseFlagPresent(args[3..], "--pubky");
+        try cmdDownload(allocator, source, output_dir, port, parseProxy(args[3..]), want_nostr, want_pubky);
     } else if (std.mem.eql(u8, command, "seed")) {
         if (args.len < 4) {
-            log.err("usage: carl seed <file.torrent> <data-dir> [--port p] [--nostr] [--external-ip ip] [--tor-seed] [--tor-control addr] [--tor-cookie path] [--tor-onion-port p] [--tor-socks url] [--description \"...\"]", .{});
+            log.err("usage: carl seed <file.torrent> <data-dir> [--port p] [--nostr] [--pubky] [--external-ip ip] [--tor-seed] [--tor-control addr] [--tor-cookie path] [--tor-onion-port p] [--tor-socks url] [--description \"...\"]", .{});
             std.process.exit(1);
         }
         const port = parsePort(args[4..]);
         const want_nostr = parseFlagPresent(args[4..], "--nostr");
+        const want_pubky = parseFlagPresent(args[4..], "--pubky");
         const tor_seed = parseFlagPresent(args[4..], "--tor-seed");
         const external_ip = parseFlag(args[4..], "--external-ip");
         const description = parseFlag(args[4..], "--description") orelse "";
@@ -76,7 +78,7 @@ pub fn main() !void {
         const tor_cookie = parseFlag(args[4..], "--tor-cookie");
         const tor_onion_port: u16 = parsePortFlag(args[4..], "--tor-onion-port", 80);
         const tor_socks_url = parseFlag(args[4..], "--tor-socks") orelse "socks5h://127.0.0.1:9050";
-        try cmdSeed(allocator, args[2], args[3], port, parseProxy(args[4..]), want_nostr, tor_seed, external_ip, description, .{
+        try cmdSeed(allocator, args[2], args[3], port, parseProxy(args[4..]), want_nostr, want_pubky, tor_seed, external_ip, description, .{
             .control_addr = tor_control,
             .cookie_path = tor_cookie,
             .onion_port = tor_onion_port,
@@ -84,14 +86,18 @@ pub fn main() !void {
         });
     } else if (std.mem.eql(u8, command, "search")) {
         if (args.len < 3) {
-            log.err("usage: carl search <query> [--limit <n>] [--relay <url>]", .{});
+            log.err("usage: carl search <query> [--limit <n>] [--nostr] [--pubky] [--relay <url>]", .{});
             std.process.exit(1);
         }
         const limit = parseUnsignedFlag(args[3..], "--limit", 50);
+        const want_nostr = parseFlagPresent(args[3..], "--nostr");
+        const want_pubky = parseFlagPresent(args[3..], "--pubky");
         const single_relay = parseFlag(args[3..], "--relay");
-        try cmdSearch(allocator, stdout, args[2], limit, single_relay, parseProxy(args[3..]));
+        try cmdSearch(allocator, stdout, args[2], limit, want_nostr, want_pubky, single_relay, parseProxy(args[3..]));
     } else if (std.mem.eql(u8, command, "nostr-keygen")) {
         try cmdNostrKeygen(allocator, stdout);
+    } else if (std.mem.eql(u8, command, "pubky-keygen")) {
+        try cmdPubkyKeygen(allocator, stdout);
     } else {
         log.err("unknown command: {s}", .{command});
         std.process.exit(1);
@@ -106,18 +112,20 @@ fn printUsage() void {
         \\commands:
         \\  info <file.torrent>                              show torrent metadata
         \\  announce <file.torrent> [--proxy url]            query tracker for peers
-        \\  download <source> [--output-dir d] [--port p] [--proxy url] [--nostr]
+        \\  download <source> [--output-dir d] [--port p] [--proxy url] [--nostr] [--pubky]
         \\           source: file.torrent, magnet:?..., or http(s):// URL
-        \\           --nostr: also subscribe to nostr peer-announce events
-        \\  seed <file.torrent> <data-dir> [--port p] [--proxy url] [--nostr] [--external-ip <ip>]
+        \\           --nostr / --pubky: also collect peer announces from that layer
+        \\  seed <file.torrent> <data-dir> [--port p] [--proxy url] [--nostr] [--pubky] [--external-ip <ip>]
         \\           [--tor-seed] [--tor-control host:port] [--tor-cookie path]
         \\           [--tor-onion-port p] [--tor-socks url] [--description "..."]
         \\           --nostr: publish NIP-35 torrent event + peer-announce
+        \\           --pubky: publish carl.app torrent + announce JSON on homeserver
         \\           --external-ip: public IPv4 for peer-announce (classic seeding)
-        \\           --tor-seed: hidden service via Tor ControlPort; requires --nostr
-        \\  search <query> [--limit n] [--relay <wss://...>]
-        \\           search nostr relays for kind-2003 torrent events
+        \\           --tor-seed: hidden service via Tor ControlPort; requires --nostr or --pubky
+        \\  search <query> [--limit n] [--nostr] [--pubky] [--relay <wss://...>]
+        \\           default: --nostr if no discovery flag; use --pubky for Nexus/homeserver
         \\  nostr-keygen                                     generate a fresh nostr key
+        \\  pubky-keygen                                     generate a fresh pubky key (Ed25519)
         \\
         \\  --proxy url   route peers and HTTP trackers through a proxy. Forms:
         \\                socks5h://[user:pass@]host:port  (remote DNS, no leak)
@@ -217,7 +225,7 @@ fn cmdAnnounce(allocator: std.mem.Allocator, stdout: anytype, path: []const u8, 
     }
 }
 
-fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []const u8, port: u16, proxy: ?carl.proxy.Proxy, want_nostr: bool) !void {
+fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []const u8, port: u16, proxy: ?carl.proxy.Proxy, want_nostr: bool, want_pubky: bool) !void {
     if (std.mem.startsWith(u8, source, "magnet:")) {
         // Magnet link
         const ml = carl.magnet.parse(allocator, source) catch |err| {
@@ -302,9 +310,8 @@ fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []c
         session.info_hash = ml.info_hash; // Use magnet's hash, not SHA1("")
         session.metadata_download = carl.extension.MetadataDownload.init(allocator, ml.info_hash);
         session.metadata_only = true;
-        if (want_nostr) {
-            collectNostrPeers(allocator, ml.info_hash, &session);
-        }
+        if (want_nostr) collectNostrPeers(allocator, ml.info_hash, &session);
+        if (want_pubky) collectPubkyPeers(allocator, ml.info_hash, &session);
         session.run() catch |err| {
             log.err("session failed: {}", .{err});
             std.process.exit(1);
@@ -323,26 +330,25 @@ fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []c
             std.process.exit(1);
         };
         defer mi.deinit(allocator);
-        startDownload(allocator, mi, output_dir, port, proxy, want_nostr);
+        startDownload(allocator, mi, output_dir, port, proxy, want_nostr, want_pubky);
     } else {
         // File path
         const mi = readTorrent(allocator, source);
         defer mi.deinit(allocator);
-        startDownload(allocator, mi, output_dir, port, proxy, want_nostr);
+        startDownload(allocator, mi, output_dir, port, proxy, want_nostr, want_pubky);
     }
 }
 
-fn startDownload(allocator: std.mem.Allocator, mi: carl.metainfo.Metainfo, output_dir: []const u8, port: u16, proxy: ?carl.proxy.Proxy, want_nostr: bool) void {
+fn startDownload(allocator: std.mem.Allocator, mi: carl.metainfo.Metainfo, output_dir: []const u8, port: u16, proxy: ?carl.proxy.Proxy, want_nostr: bool, want_pubky: bool) void {
     std.fs.cwd().makePath(output_dir) catch {};
     var session = carl.session.Session.init(allocator, mi, output_dir, .download, port, proxy, .any, false) catch |err| {
         log.err("failed to initialize session: {}", .{err});
         std.process.exit(1);
     };
     defer session.deinit();
-    if (want_nostr) {
-        const info_hash = carl.metainfo.infoHash(mi.raw_info);
-        collectNostrPeers(allocator, info_hash, &session);
-    }
+    const info_hash = carl.metainfo.infoHash(mi.raw_info);
+    if (want_nostr) collectNostrPeers(allocator, info_hash, &session);
+    if (want_pubky) collectPubkyPeers(allocator, info_hash, &session);
     session.run() catch |err| {
         log.err("session failed: {}", .{err});
         std.process.exit(1);
@@ -399,6 +405,7 @@ fn cmdSeed(
     port: u16,
     proxy: ?carl.proxy.Proxy,
     want_nostr: bool,
+    want_pubky: bool,
     tor_seed: bool,
     external_ip: ?[]const u8,
     description: []const u8,
@@ -408,16 +415,16 @@ fn cmdSeed(
         log.err("--tor-seed and --proxy are mutually exclusive on seed", .{});
         std.process.exit(1);
     }
-    if (tor_seed and !want_nostr) {
-        log.err("--tor-seed requires --nostr", .{});
+    if (tor_seed and !want_nostr and !want_pubky) {
+        log.err("--tor-seed requires --nostr or --pubky", .{});
         std.process.exit(1);
     }
     if (tor_seed and external_ip != null) {
         log.err("--tor-seed uses a Tor hidden service; do not pass --external-ip", .{});
         std.process.exit(1);
     }
-    if (want_nostr and !tor_seed and external_ip == null) {
-        log.err("--nostr requires --external-ip <ip> or --tor-seed", .{});
+    if ((want_nostr or want_pubky) and !tor_seed and external_ip == null) {
+        log.err("--nostr/--pubky requires --external-ip <ip> or --tor-seed", .{});
         std.process.exit(1);
     }
 
@@ -431,6 +438,8 @@ fn cmdSeed(
         parseTorSocksProxy(tor_opts.socks_url)
     else
         null;
+
+    const info_hash = carl.metainfo.infoHash(mi.raw_info);
 
     if (want_nostr) {
         if (tor_seed) {
@@ -464,6 +473,40 @@ fn cmdSeed(
         }
     }
 
+    if (want_pubky) {
+        if (tor_seed) {
+            if (hidden == null) {
+                hidden = carl.tor_control.addOnion(allocator, .{
+                    .control_addr = tor_opts.control_addr,
+                    .cookie_path = tor_opts.cookie_path,
+                    .local_port = port,
+                    .onion_port = tor_opts.onion_port,
+                }) catch |err| {
+                    log.err("tor hidden service setup failed: {}", .{err});
+                    std.process.exit(1);
+                };
+            }
+            carl.pubky_client.publishSeedOnion(allocator, mi, info_hash, description, hidden.?.onion_host, hidden.?.onion_port) catch |err| {
+                log.warn("pubky publish failed: {} (continuing seed)", .{err});
+            };
+        } else {
+            const ip = parseIpv4(external_ip.?) orelse {
+                log.err("invalid --external-ip: {s}", .{external_ip.?});
+                std.process.exit(1);
+            };
+            if (!carl.peer_announce.isRoutable(ip)) {
+                log.err(
+                    "--external-ip {d}.{d}.{d}.{d} is not routable; refusing to publish peer-announce",
+                    .{ ip[0], ip[1], ip[2], ip[3] },
+                );
+                std.process.exit(1);
+            }
+            carl.pubky_client.publishSeedIpv4(allocator, mi, info_hash, description, ip, port) catch |err| {
+                log.warn("pubky publish failed: {} (continuing seed)", .{err});
+            };
+        }
+    }
+
     const listen_bind: carl.session.ListenBind = if (tor_seed) .loopback else .any;
     var session = carl.session.Session.init(allocator, mi, data_dir, .seed, port, null, listen_bind, tor_seed) catch |err| {
         log.err("failed to initialize session: {}", .{err});
@@ -493,9 +536,47 @@ fn cmdSearch(
     stdout: anytype,
     query: []const u8,
     limit: u32,
+    want_nostr: bool,
+    want_pubky: bool,
     single_relay: ?[]const u8,
     proxy: ?carl.proxy.Proxy,
 ) !void {
+    const do_nostr = want_nostr or (!want_nostr and !want_pubky);
+    const do_pubky = want_pubky;
+
+    var found_any = false;
+
+    if (do_pubky) {
+        const nexus_base = carl.pubky_config.readNexusBase(allocator) catch |err| {
+            log.err("could not read pubky nexus config: {}", .{err});
+            std.process.exit(1);
+        };
+        defer allocator.free(nexus_base);
+
+        log.info("searching pubky nexus for '{s}' (limit {d})", .{ query, limit });
+        var hits: []carl.nexus.Hit = &.{};
+        hits = carl.nexus.searchTorrents(allocator, nexus_base, query, limit) catch |err| blk: {
+            log.warn("pubky search failed: {}", .{err});
+            break :blk &[_]carl.nexus.Hit{};
+        };
+        defer {
+            for (hits) |h| h.deinit(allocator);
+            if (hits.len > 0) allocator.free(hits);
+        }
+        var printed: u32 = 0;
+        for (hits) |hit| {
+            if (printed >= limit) break;
+            try printPubkySearchResult(stdout, hit.entry);
+            printed += 1;
+            found_any = true;
+        }
+    }
+
+    if (!do_nostr) {
+        if (!found_any) try stdout.print("no results\n", .{});
+        return;
+    }
+
     var relay_urls: [][]const u8 = undefined;
     var relays_owned = false;
     if (single_relay) |r| {
@@ -538,7 +619,6 @@ fn cmdSearch(
     // a per-relay multiplier. With 3 default relays this prevents `--limit 10`
     // from printing up to 30 unique results.
     var printed: u32 = 0;
-    var found_any = false;
     relay_loop: for (relay_urls) |url| {
         if (printed >= limit) break;
 
@@ -613,6 +693,26 @@ fn textMatches(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
+fn printPubkySearchResult(stdout: anytype, entry: carl.pubky_torrent.TorrentEntry) !void {
+    var ih_hex: [40]u8 = undefined;
+    carl.secp.toHex(&entry.info_hash, &ih_hex);
+
+    var total: u64 = 0;
+    for (entry.files) |f| total += f.size;
+
+    try stdout.print("─" ** 60 ++ "\n", .{});
+    try stdout.print("source:    pubky\n", .{});
+    try stdout.print("title:     {s}\n", .{entry.title});
+    try stdout.print("infohash:  {s}\n", .{ih_hex});
+    try stdout.print("pubky:     {s}\n", .{entry.pubky_z32});
+    try stdout.print("files:     {d}, total {d} bytes\n", .{ entry.files.len, total });
+    try stdout.print("trackers:  {d}\n", .{entry.trackers.len});
+    if (entry.description.len > 0) {
+        try stdout.print("desc:      {s}\n", .{entry.description});
+    }
+    try stdout.print("magnet:    magnet:?xt=urn:btih:{s}\n", .{ih_hex});
+}
+
 fn printSearchResult(stdout: anytype, entry: carl.nip35.TorrentEntry) !void {
     var ih_hex: [40]u8 = undefined;
     carl.secp.toHex(&entry.info_hash, &ih_hex);
@@ -634,6 +734,36 @@ fn printSearchResult(stdout: anytype, entry: carl.nip35.TorrentEntry) !void {
 // -------------------------------------------------------------------------
 // `carl nostr-keygen`
 // -------------------------------------------------------------------------
+
+fn cmdPubkyKeygen(allocator: std.mem.Allocator, stdout: anytype) !void {
+    const keys = carl.pubky_ffi.generateSecretKey(allocator) catch {
+        log.err("failed to generate pubky key", .{});
+        std.process.exit(1);
+    };
+    defer allocator.free(keys.secret_key);
+    defer allocator.free(keys.public_key);
+    defer allocator.free(keys.uri);
+
+    carl.pubky_config.writeSecretKey(allocator, keys.secret_key) catch |err| {
+        log.err("failed to save pubky secret: {}", .{err});
+        std.process.exit(1);
+    };
+    const hs = carl.pubky_config.readHomeserver(allocator) catch |err| {
+        log.err("failed to read homeserver config: {}", .{err});
+        std.process.exit(1);
+    };
+    defer allocator.free(hs);
+
+    carl.pubky_ffi.signup(allocator, keys.secret_key, hs, null) catch |err| {
+        log.warn("pubky signup: {} (you may already be registered — try seed --pubky)", .{err});
+    };
+
+    try stdout.print("wrote pubky_secret to your config dir\n", .{});
+    try stdout.print("pubky: {s}\n", .{keys.public_key});
+    try stdout.print("uri:   {s}\n", .{keys.uri});
+    try stdout.print("homeserver: {s}\n", .{hs});
+    try stdout.print("\nkeep your pubky_secret private.\n", .{});
+}
 
 fn cmdNostrKeygen(allocator: std.mem.Allocator, stdout: anytype) !void {
     const sk = carl.secp.generateSecretKey() catch {
@@ -807,6 +937,50 @@ fn collectNostrPeers(
         }
     }
     if (added > 0) log.info("added {d} peers from nostr", .{added});
+}
+
+fn collectPubkyPeers(
+    allocator: std.mem.Allocator,
+    info_hash: [20]u8,
+    session: *carl.session.Session,
+) void {
+    const nexus_base = carl.pubky_config.readNexusBase(allocator) catch return;
+    defer allocator.free(nexus_base);
+
+    const urls = carl.nexus.searchAnnouncesForInfohash(allocator, nexus_base, info_hash, 50) catch return;
+    defer {
+        for (urls) |u| allocator.free(u);
+        allocator.free(urls);
+    }
+
+    var added: usize = 0;
+    for (urls) |url| {
+        if (added >= 50) break;
+        const body = carl.pubky_ffi.get(allocator, url) catch continue;
+        defer allocator.free(body);
+        const ann = carl.pubky_peer_announce.parseJson(allocator, body, "") catch continue;
+        defer allocator.free(ann.pubky_z32);
+        if (!std.mem.eql(u8, &ann.info_hash, &info_hash)) continue;
+        switch (ann.endpoint) {
+            .ipv4 => |ep| {
+                const addr = std.net.Address.initIp4(ep.ip, ep.port);
+                session.connectDirectPeer(addr) catch continue;
+                added += 1;
+            },
+            .onion => |ep| {
+                if (session.proxy == null) {
+                    log.warn(
+                        "pubky peer {s}:{d} is a .onion host; use --proxy socks5h://127.0.0.1:9050 to connect",
+                        .{ ep.host, ep.port },
+                    );
+                    continue;
+                }
+                session.connectOnionPeer(ep.host, ep.port) catch continue;
+                added += 1;
+            },
+        }
+    }
+    if (added > 0) log.info("added {d} peers from pubky", .{added});
 }
 
 fn parseIpv4(s: []const u8) ?[4]u8 {

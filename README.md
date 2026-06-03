@@ -13,6 +13,7 @@ A BitTorrent client written in pure Zig. The BitTorrent core has zero Zig packag
 - **Seeding** -- upload mode with incoming connection support
 - **Proxy / anonymous mode** -- route peers and trackers through a SOCKS5/SOCKS5h or HTTP proxy, hiding your real IP from the swarm ([docs](docs/proxy.md))
 - **Nostr discovery** -- publish torrents you seed as NIP-35 events and find others' torrents via `carl search`; per-seeder peer-announces over a custom kind 30078 feed peers into download sessions
+- **Pubky discovery** -- optional parallel layer: homeserver JSON under `/pub/carl.app/`, Nexus search, `--pubky` on seed/download (see [docs/pubky.md](docs/pubky.md))
 
 ## Protocol Support
 
@@ -184,6 +185,17 @@ comments); if absent, carl falls back to three well-known public relays.
 the infohashes you seed. If that bothers you, generate a fresh key per
 seeding session and don't share it.
 
+### Discover torrents on Pubky
+
+```sh
+carl pubky-keygen
+carl search "ubuntu" --pubky --limit 20
+carl seed file.torrent /path/to/data --pubky --external-ip 203.0.113.7
+carl download file.torrent --pubky
+```
+
+Requires Rust/cargo for the Pubky FFI bridge (`zig build` runs `cargo` automatically). Details: [docs/pubky.md](docs/pubky.md).
+
 ## Architecture
 
 ```
@@ -214,6 +226,14 @@ src/
   tor_control.zig  Tor ControlPort ADD_ONION / DEL_ONION for v3 hidden services
   relay.zig        Connect to a relay, subscribe-collect-until-EOSE, publish-and-wait
   nostr_config.zig  ~/.config/carl/{nsec,relays} read/write
+
+  # Pubky (optional discovery layer, Rust FFI)
+  pubky_ffi.zig       C bindings to native/carl_pubky_bridge
+  pubky_config.zig    ~/.config/carl/{pubky_secret,pubky_homeserver,pubky_nexus}
+  pubky_torrent.zig   /pub/carl.app/torrents/{infohash}.json
+  pubky_peer_announce.zig  /pub/carl.app/announces/{infohash}.json
+  pubky_client.zig    publish helpers for seed
+  nexus.zig           Nexus REST search
 ```
 
 ### Session internals

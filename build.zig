@@ -3,6 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const enable_pubky = b.option(bool, "pubky", "Enable Pubky discovery (requires cargo)") orelse true;
 
     // ----------------------------------------------------------------
     // libsecp256k1 — vendored via build.zig.zon, built as a static C lib.
@@ -66,6 +67,11 @@ pub fn build(b: *std.Build) void {
     lib_mod.linkLibrary(secp);
     lib_mod.addIncludePath(secp_dep.path("include"));
 
+    var pubky_cargo_step: ?*std.Build.Step = null;
+    if (enable_pubky) {
+        pubky_cargo_step = addPubkyBridge(b, lib_mod, target);
+    }
+
     // ----------------------------------------------------------------
     // CLI executable
     // ----------------------------------------------------------------
@@ -83,6 +89,10 @@ pub fn build(b: *std.Build) void {
     });
     exe.linkLibrary(secp);
     exe.root_module.addIncludePath(secp_dep.path("include"));
+    if (enable_pubky) {
+        linkPubkyBridge(b, exe.root_module, target);
+        if (pubky_cargo_step) |cargo| exe.step.dependOn(cargo);
+    }
 
     b.installArtifact(exe);
 
@@ -100,14 +110,44 @@ pub fn build(b: *std.Build) void {
     const lib_tests = b.addTest(.{
         .root_module = lib_mod,
     });
+    if (enable_pubky) {
+        linkPubkyBridge(b, lib_tests.root_module, target);
+        if (pubky_cargo_step) |cargo| lib_tests.step.dependOn(cargo);
+    }
     const run_lib_tests = b.addRunArtifact(lib_tests);
 
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
     });
+    if (enable_pubky) {
+        if (pubky_cargo_step) |cargo| exe_tests.step.dependOn(cargo);
+    }
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+}
+
+fn addPubkyBridge(b: *std.Build, lib_mod: *std.Build.Module, target: std.Build.ResolvedTarget) *std.Build.Step {
+    const manifest = b.pathFromRoot("native/carl_pubky_bridge/Cargo.toml");
+    const cargo = b.addSystemCommand(&.{
+        "cargo", "build", "--release", "--manifest-path", manifest,
+    });
+    linkPubkyBridge(b, lib_mod, target);
+    return &cargo.step;
+}
+
+fn linkPubkyBridge(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {
+    const lib_path = b.path("native/carl_pubky_bridge/target/release/libcarl_pubky_bridge.a");
+    mod.addObjectFile(lib_path);
+    mod.linkSystemLibrary("c++", .{});
+    mod.linkSystemLibrary("pthread", .{});
+    mod.linkSystemLibrary("m", .{});
+    mod.linkSystemLibrary("dl", .{});
+    if (target.result.os.tag == .macos) {
+        mod.linkFramework("Security", .{});
+        mod.linkFramework("SystemConfiguration", .{});
+        mod.linkFramework("CoreFoundation", .{});
+    }
 }

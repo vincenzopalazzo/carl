@@ -20,6 +20,12 @@ pub const peer_announce = @import("peer_announce.zig");
 pub const tor_control = @import("tor_control.zig");
 pub const relay = @import("relay.zig");
 pub const nostr_config = @import("nostr_config.zig");
+pub const pubky_ffi = @import("pubky_ffi.zig");
+pub const pubky_config = @import("pubky_config.zig");
+pub const pubky_torrent = @import("pubky_torrent.zig");
+pub const pubky_peer_announce = @import("pubky_peer_announce.zig");
+pub const pubky_client = @import("pubky_client.zig");
+pub const nexus = @import("nexus.zig");
 
 test {
     _ = bencode;
@@ -43,5 +49,11 @@ test {
     _ = tor_control;
     _ = relay;
     _ = nostr_config;
+    _ = pubky_ffi;
+    _ = pubky_config;
+    _ = pubky_torrent;
+    _ = pubky_peer_announce;
+    _ = pubky_client;
+    _ = nexus;
     _ = @import("integration_test.zig");
 }
