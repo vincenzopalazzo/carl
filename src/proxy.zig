@@ -19,6 +19,7 @@
 /// target and is ready for the BitTorrent handshake.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const tls = std.crypto.tls;
 
 const log = std.log.scoped(.proxy);
 
@@ -26,7 +27,7 @@ pub const ProxyError = error{
     InvalidProxyUrl,
     UnsupportedScheme,
     UnsupportedAddress,
-    UnsupportedHttps,
+    TlsFailed,
     InvalidUrl,
     DnsResolveFailed,
     SocketFailed,
@@ -164,17 +165,16 @@ pub fn connectThroughProxyHost(allocator: Allocator, proxy: Proxy, host: []const
     return stream;
 }
 
-/// Perform an HTTP GET through the proxy and return the response body (owned by
-/// the caller). Only plaintext `http://` URLs are supported; `https://` returns
-/// `error.UnsupportedHttps` so callers fail closed rather than leak via a direct
-/// TLS handshake.
+/// Perform an HTTP(S) GET through the proxy and return the response body (owned
+/// by the caller). `http://` is tunneled in plaintext; `https://` runs TLS over
+/// the proxied stream with certificate verification, so it never leaks via a
+/// direct connection.
 ///
 /// We build the request by hand rather than using `std.http.Client`: its proxy
 /// support (0.15.2) covers HTTP/HTTPS proxies only, not SOCKS, so routing GETs
 /// over our own tunnel keeps a single code path for every proxy scheme.
 pub fn httpGet(allocator: Allocator, proxy: Proxy, url: []const u8, extra_headers: ?[]const Header) ProxyError![]u8 {
     const u = parseHttpUrl(url) orelse return error.InvalidUrl;
-    if (u.is_https) return error.UnsupportedHttps;
 
     var stream = try connectThroughProxyHost(allocator, proxy, u.host, u.port);
     defer stream.close();
@@ -190,7 +190,8 @@ pub fn httpGet(allocator: Allocator, proxy: Proxy, url: []const u8, extra_header
     try append(allocator, &req, u.path);
     try append(allocator, &req, " HTTP/1.1\r\nHost: ");
     try append(allocator, &req, u.host);
-    if (u.port != 80) {
+    const default_port: u16 = if (u.is_https) 443 else 80;
+    if (u.port != default_port) {
         try append(allocator, &req, ":");
         try appendDecimal(allocator, &req, u.port);
     }
@@ -203,10 +204,16 @@ pub fn httpGet(allocator: Allocator, proxy: Proxy, url: []const u8, extra_header
     };
     try append(allocator, &req, "\r\n");
 
-    try writeAll(stream, req.items);
+    if (u.is_https) return httpsExchange(allocator, stream, u.host, req.items);
 
-    // Read the whole response. We sent `Connection: close`, so the server
-    // closes at EOF; a stalled server is bounded by SO_RCVTIMEO.
+    try writeAll(stream, req.items);
+    return readPlainResponse(allocator, stream);
+}
+
+/// Read a plaintext HTTP response to completion and parse it. We sent
+/// `Connection: close`, so the server closes at EOF; `responseComplete` lets us
+/// stop early once a Content-Length body is fully received.
+fn readPlainResponse(allocator: Allocator, stream: std.net.Stream) ProxyError![]u8 {
     var resp: std.ArrayList(u8) = .empty;
     defer resp.deinit(allocator);
     var chunk: [8192]u8 = undefined;
@@ -215,9 +222,78 @@ pub fn httpGet(allocator: Allocator, proxy: Proxy, url: []const u8, extra_header
         if (n == 0) break;
         resp.appendSlice(allocator, chunk[0..n]) catch return error.OutOfMemory;
         if (resp.items.len > max_response_bytes) break;
+        if (responseComplete(resp.items)) break;
     }
-
     return parseHttpResponse(allocator, resp.items);
+}
+
+/// Run an HTTPS exchange over the already-proxied stream: TLS handshake with
+/// certificate verification against the system CA bundle, send `request`, then
+/// read and parse the response. The proxy only ever sees encrypted bytes.
+fn httpsExchange(allocator: Allocator, stream: std.net.Stream, host: []const u8, request: []const u8) ProxyError![]u8 {
+    var ca_bundle: std.crypto.Certificate.Bundle = .{};
+    ca_bundle.rescan(allocator) catch return error.TlsFailed;
+    defer ca_bundle.deinit(allocator);
+
+    var sock_read_buf: [tls.max_ciphertext_record_len]u8 = undefined;
+    var sock_write_buf: [tls.max_ciphertext_record_len]u8 = undefined;
+    var sr = stream.reader(&sock_read_buf);
+    var sw = stream.writer(&sock_write_buf);
+
+    var tls_read_buf: [tls.max_ciphertext_record_len]u8 = undefined;
+    var tls_write_buf: [tls.max_ciphertext_record_len]u8 = undefined;
+
+    var client = tls.Client.init(sr.interface(), &sw.interface, .{
+        .host = .{ .explicit = host },
+        .ca = .{ .bundle = ca_bundle },
+        .write_buffer = &tls_write_buf,
+        .read_buffer = &tls_read_buf,
+    }) catch return error.TlsFailed;
+
+    // Both layers must flush: the TLS writer stages a record, the socket writer
+    // pushes it onto the wire.
+    client.writer.writeAll(request) catch return error.TlsFailed;
+    client.writer.flush() catch return error.TlsFailed;
+    sw.interface.flush() catch return error.TlsFailed;
+
+    var resp: std.ArrayList(u8) = .empty;
+    defer resp.deinit(allocator);
+    var chunk: [8192]u8 = undefined;
+    while (true) {
+        const n = client.reader.readSliceShort(&chunk) catch break;
+        if (n == 0) break;
+        resp.appendSlice(allocator, chunk[0..n]) catch return error.OutOfMemory;
+        if (resp.items.len > max_response_bytes) break;
+        if (responseComplete(resp.items)) break;
+    }
+    return parseHttpResponse(allocator, resp.items);
+}
+
+/// True if `buf` already holds a complete HTTP response, so the read loop can
+/// stop instead of waiting for the connection to close. Only the Content-Length
+/// case is treated as complete -- chunked / unframed responses read to EOF
+/// (safe, since we send `Connection: close`).
+fn responseComplete(buf: []const u8) bool {
+    const sep = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return false;
+    const head = buf[0..sep];
+    const body = buf[sep + 4 ..];
+    if (headerHasToken(head, "transfer-encoding", "chunked")) return false;
+    if (contentLength(head)) |len| return body.len >= len;
+    return false;
+}
+
+/// Parse the `Content-Length` header value, if present.
+fn contentLength(head: []const u8) ?usize {
+    var lines = std.mem.tokenizeSequence(u8, head, "\r\n");
+    _ = lines.next(); // status line
+    while (lines.next()) |line| {
+        const c = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..c], " \t");
+        if (std.ascii.eqlIgnoreCase(name, "content-length")) {
+            return std.fmt.parseUnsigned(usize, std.mem.trim(u8, line[c + 1 ..], " \t"), 10) catch null;
+        }
+    }
+    return null;
 }
 
 // --- Proxy socket setup ---
@@ -692,4 +768,17 @@ test "headerHasToken case-insensitive" {
     const head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: Chunked\r\nContent-Type: text/plain";
     try std.testing.expect(headerHasToken(head, "transfer-encoding", "chunked"));
     try std.testing.expect(!headerHasToken(head, "content-length", "5"));
+}
+
+test "contentLength parses header" {
+    try std.testing.expectEqual(@as(?usize, 42), contentLength("HTTP/1.1 200 OK\r\nContent-Length: 42\r\nX: y"));
+    try std.testing.expectEqual(@as(?usize, null), contentLength("HTTP/1.1 200 OK\r\nX: y"));
+}
+
+test "responseComplete stops on full Content-Length body" {
+    try std.testing.expect(responseComplete("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"));
+    try std.testing.expect(!responseComplete("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhel")); // body short
+    try std.testing.expect(!responseComplete("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n")); // no header terminator
+    // chunked is read to EOF, not treated as complete by this check
+    try std.testing.expect(!responseComplete("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"));
 }

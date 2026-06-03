@@ -223,14 +223,10 @@ pub fn announce(
     return parseAnnounceResponse(allocator, response_body.items);
 }
 
-/// Announce by tunneling a plain HTTP GET through the proxy. HTTPS trackers are
-/// not yet supported over a proxy (TLS-over-tunnel is a follow-up); they are
-/// skipped rather than sent directly, to avoid leaking the real IP.
+/// Announce by tunneling the GET through the proxy. `http://` goes in plaintext,
+/// `https://` runs TLS over the proxied stream -- both via `proxy.httpGet`, so
+/// nothing is ever sent directly.
 fn announceThroughProxy(allocator: Allocator, proxy: proxy_mod.Proxy, url: []const u8) TrackerError!AnnounceResponse {
-    if (std.mem.startsWith(u8, url, "https://")) {
-        log.warn("HTTPS tracker skipped: not supported over a proxy yet", .{});
-        return error.HttpError;
-    }
     const body = proxy_mod.httpGet(allocator, proxy, url, null) catch |err| {
         log.warn("proxied tracker announce failed: {}", .{err});
         return error.HttpError;

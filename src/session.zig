@@ -225,12 +225,12 @@ pub const Session = struct {
                 "proxy enabled ({s} {s}:{d}); DHT, UDP trackers, web seeds, and incoming peers disabled for anonymity",
                 .{ @tagName(px.scheme), px.host, px.port },
             );
-            // With DHT and UDP trackers off, an http:// tracker is the only peer
-            // source left. Warn loudly if the torrent has none, otherwise the
-            // session polls forever with nothing to discover.
+            // With DHT and UDP trackers off, an HTTP/HTTPS tracker is the only
+            // peer source left. Warn loudly if the torrent has none, otherwise
+            // the session polls forever with nothing to discover.
             if (!self.hasProxyUsableTracker()) {
                 log.warn(
-                    "no proxy-usable peer source: DHT and UDP trackers are disabled and this torrent has no http:// tracker. No peers can be found -- add an http:// tracker or run without --proxy.",
+                    "no proxy-usable peer source: DHT and UDP trackers are disabled and this torrent has no http(s):// tracker. No peers can be found -- add an http(s):// tracker or run without --proxy.",
                     .{},
                 );
             }
@@ -1056,19 +1056,23 @@ pub const Session = struct {
         return error.TrackerFailed;
     }
 
-    /// Whether any announce URL can be used while proxied. Only plaintext
-    /// http:// trackers are tunneled today (https is skipped, udp is disabled),
-    /// so a torrent with no http:// tracker has no peer source under --proxy.
+    /// Whether any announce URL can be used while proxied. HTTP and HTTPS
+    /// trackers are tunneled; UDP trackers are disabled. A torrent with only
+    /// UDP trackers (or none) has no peer source under --proxy.
     fn hasProxyUsableTracker(self: *Session) bool {
-        if (std.mem.startsWith(u8, self.meta.announce, "http://")) return true;
+        if (isHttpTracker(self.meta.announce)) return true;
         if (self.meta.announce_list) |tiers| {
             for (tiers) |tier| {
                 for (tier) |url| {
-                    if (std.mem.startsWith(u8, url, "http://")) return true;
+                    if (isHttpTracker(url)) return true;
                 }
             }
         }
         return false;
+    }
+
+    fn isHttpTracker(url: []const u8) bool {
+        return std.mem.startsWith(u8, url, "http://") or std.mem.startsWith(u8, url, "https://");
     }
 
     fn tryAnnounceUrl(self: *Session, url: []const u8, req: tracker_mod.AnnounceRequest) ?tracker_mod.AnnounceResponse {
