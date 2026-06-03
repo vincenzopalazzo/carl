@@ -36,7 +36,7 @@ pub fn main() !void {
             log.err("usage: carl announce <file.torrent>", .{});
             std.process.exit(1);
         }
-        try cmdAnnounce(allocator, stdout, args[2]);
+        try cmdAnnounce(allocator, stdout, args[2], parseProxy(args[3..]));
     } else if (std.mem.eql(u8, command, "download")) {
         if (args.len < 3) {
             log.err("usage: carl download <source> [--output-dir <dir>] [--port <port>]", .{});
@@ -60,14 +60,14 @@ pub fn main() !void {
         };
         const output_dir = parseFlag(args[3..], "--output-dir") orelse ".";
         const port = parsePort(args[3..]);
-        try cmdDownload(allocator, source, output_dir, port);
+        try cmdDownload(allocator, source, output_dir, port, parseProxy(args[3..]));
     } else if (std.mem.eql(u8, command, "seed")) {
         if (args.len < 4) {
             log.err("usage: carl seed <file.torrent> <data-dir> [--port <port>]", .{});
             std.process.exit(1);
         }
         const port = parsePort(args[4..]);
-        try cmdSeed(allocator, args[2], args[3], port);
+        try cmdSeed(allocator, args[2], args[3], port, parseProxy(args[4..]));
     } else {
         log.err("unknown command: {s}", .{command});
         std.process.exit(1);
@@ -81,10 +81,17 @@ fn printUsage() void {
         \\
         \\commands:
         \\  info <file.torrent>                      show torrent metadata
-        \\  announce <file.torrent>                  query tracker for peers
-        \\  download <source> [--output-dir d] [--port p]     download torrent
+        \\  announce <file.torrent> [--proxy url]    query tracker for peers
+        \\  download <source> [--output-dir d] [--port p] [--proxy url]  download torrent
         \\           source: file.torrent, magnet:?..., or http(s):// URL
-        \\  seed <file.torrent> <data-dir> [--port p]          seed existing data
+        \\  seed <file.torrent> <data-dir> [--port p] [--proxy url]      seed existing data
+        \\
+        \\  --proxy url   route peers and HTTP trackers through a proxy. Forms:
+        \\                socks5h://[user:pass@]host:port  (remote DNS, no leak)
+        \\                socks5://[user:pass@]host:port   (local DNS)
+        \\                http://[user:pass@]host:port     (HTTP CONNECT)
+        \\                When set, DHT, UDP trackers, web seeds, and incoming
+        \\                peers are disabled for anonymity.
         \\
     , .{}) catch {};
 }
@@ -133,7 +140,7 @@ fn cmdInfo(allocator: std.mem.Allocator, stdout: anytype, path: []const u8) !voi
     }
 }
 
-fn cmdAnnounce(allocator: std.mem.Allocator, stdout: anytype, path: []const u8) !void {
+fn cmdAnnounce(allocator: std.mem.Allocator, stdout: anytype, path: []const u8, proxy: ?carl.proxy.Proxy) !void {
     const mi = readTorrent(allocator, path);
     defer mi.deinit(allocator);
 
@@ -154,7 +161,7 @@ fn cmdAnnounce(allocator: std.mem.Allocator, stdout: anytype, path: []const u8) 
         .left = 0,
         .compact = true,
         .event = .started,
-    }) catch |err| {
+    }, proxy) catch |err| {
         log.err("tracker announce failed: {}", .{err});
         std.process.exit(1);
     };
@@ -177,7 +184,7 @@ fn cmdAnnounce(allocator: std.mem.Allocator, stdout: anytype, path: []const u8) 
     }
 }
 
-fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []const u8, port: u16) !void {
+fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []const u8, port: u16, proxy: ?carl.proxy.Proxy) !void {
     if (std.mem.startsWith(u8, source, "magnet:")) {
         // Magnet link
         const ml = carl.magnet.parse(allocator, source) catch |err| {
@@ -254,7 +261,7 @@ fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []c
         defer mi.deinit(allocator);
 
         std.fs.cwd().makePath(output_dir) catch {};
-        var session = carl.session.Session.init(allocator, mi, output_dir, .download, port) catch |err| {
+        var session = carl.session.Session.init(allocator, mi, output_dir, .download, port, proxy) catch |err| {
             log.err("failed to initialize session: {}", .{err});
             std.process.exit(1);
         };
@@ -269,7 +276,7 @@ fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []c
     } else if (std.mem.startsWith(u8, source, "http://") or std.mem.startsWith(u8, source, "https://")) {
         // HTTP URL
         log.info("downloading torrent from {s}...", .{source});
-        const torrent_data = fetchUrl(allocator, source) catch |err| {
+        const torrent_data = fetchUrl(allocator, source, proxy) catch |err| {
             log.err("failed to download torrent: {}", .{err});
             std.process.exit(1);
         };
@@ -280,18 +287,18 @@ fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []c
             std.process.exit(1);
         };
         defer mi.deinit(allocator);
-        startDownload(allocator, mi, output_dir, port);
+        startDownload(allocator, mi, output_dir, port, proxy);
     } else {
         // File path
         const mi = readTorrent(allocator, source);
         defer mi.deinit(allocator);
-        startDownload(allocator, mi, output_dir, port);
+        startDownload(allocator, mi, output_dir, port, proxy);
     }
 }
 
-fn startDownload(allocator: std.mem.Allocator, mi: carl.metainfo.Metainfo, output_dir: []const u8, port: u16) void {
+fn startDownload(allocator: std.mem.Allocator, mi: carl.metainfo.Metainfo, output_dir: []const u8, port: u16, proxy: ?carl.proxy.Proxy) void {
     std.fs.cwd().makePath(output_dir) catch {};
-    var session = carl.session.Session.init(allocator, mi, output_dir, .download, port) catch |err| {
+    var session = carl.session.Session.init(allocator, mi, output_dir, .download, port, proxy) catch |err| {
         log.err("failed to initialize session: {}", .{err});
         std.process.exit(1);
     };
@@ -302,7 +309,16 @@ fn startDownload(allocator: std.mem.Allocator, mi: carl.metainfo.Metainfo, outpu
     };
 }
 
-fn fetchUrl(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
+fn fetchUrl(allocator: std.mem.Allocator, url: []const u8, proxy: ?carl.proxy.Proxy) ![]u8 {
+    // Route the initial .torrent fetch through the proxy too, so it doesn't
+    // leak the real IP. HTTPS torrent URLs are not yet supported over a proxy.
+    if (proxy) |px| {
+        return carl.proxy.httpGet(allocator, px, url, null) catch |err| {
+            log.err("HTTP fetch via proxy error: {}", .{err});
+            return error.HttpFailed;
+        };
+    }
+
     var client: std.http.Client = .{ .allocator = allocator };
     defer client.deinit();
     var response_body: std.ArrayList(u8) = .empty;
@@ -329,11 +345,11 @@ fn fetchUrl(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
     return response_body.toOwnedSlice(allocator);
 }
 
-fn cmdSeed(allocator: std.mem.Allocator, torrent_path: []const u8, data_dir: []const u8, port: u16) !void {
+fn cmdSeed(allocator: std.mem.Allocator, torrent_path: []const u8, data_dir: []const u8, port: u16, proxy: ?carl.proxy.Proxy) !void {
     const mi = readTorrent(allocator, torrent_path);
     defer mi.deinit(allocator);
 
-    var session = carl.session.Session.init(allocator, mi, data_dir, .seed, port) catch |err| {
+    var session = carl.session.Session.init(allocator, mi, data_dir, .seed, port, proxy) catch |err| {
         log.err("failed to initialize session: {}", .{err});
         std.process.exit(1);
     };
@@ -358,6 +374,16 @@ fn parseFlag(extra_args: []const [:0]u8, flag: []const u8) ?[]const u8 {
 fn parsePort(extra_args: []const [:0]u8) u16 {
     const port_str = parseFlag(extra_args, "--port") orelse return 6881;
     return std.fmt.parseUnsigned(u16, port_str, 10) catch 6881;
+}
+
+/// Parse `--proxy <url>`. Exits with an error if the URL is malformed, so a
+/// typo never silently falls back to a direct (de-anonymized) connection.
+fn parseProxy(extra_args: []const [:0]u8) ?carl.proxy.Proxy {
+    const url = parseFlag(extra_args, "--proxy") orelse return null;
+    return carl.proxy.parseUrl(url) catch |err| {
+        log.err("invalid --proxy URL '{s}': {}", .{ url, err });
+        std.process.exit(1);
+    };
 }
 
 test {
