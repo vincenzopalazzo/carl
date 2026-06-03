@@ -16,8 +16,15 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
+const tls = std.crypto.tls;
+const proxy_mod = @import("proxy.zig");
 
 const log = std.log.scoped(.ws);
+
+pub const ConnectOptions = struct {
+    /// When set, `wss://` connects through SOCKS5/HTTP (e.g. Tor at 127.0.0.1:9050).
+    proxy: ?proxy_mod.Proxy = null,
+};
 
 pub const Error = error{
     InvalidUrl,
@@ -102,6 +109,8 @@ pub const Conn = struct {
     stream: std.net.Stream,
     /// Non-null for `wss://`; owns the TLS session used for reads/writes.
     http: ?HttpIo = null,
+    /// Non-null for `wss://` over a proxy tunnel (TLS on top of SOCKS).
+    tls_proxy: ?*TlsProxyIo = null,
 
     /// Buffer used to accumulate the payload of an in-progress message when
     /// the relay fragments. Owned by the Conn.
@@ -113,10 +122,34 @@ pub const Conn = struct {
         connection: *std.http.Client.Connection,
     };
 
-    pub fn connect(allocator: Allocator, url_input: []const u8) Error!Conn {
+    const tls_io_buf_len = tls.max_ciphertext_record_len;
+
+    const TlsProxyIo = struct {
+        stream: std.net.Stream,
+        socket_reader: std.net.Stream.Reader,
+        socket_writer: std.net.Stream.Writer,
+        tls: tls.Client,
+        ca_bundle: std.crypto.Certificate.Bundle,
+        socket_read_buf: [tls_io_buf_len]u8,
+        socket_write_buf: [tls_io_buf_len]u8,
+        tls_read_buf: [tls_io_buf_len]u8,
+        tls_write_buf: [tls_io_buf_len]u8,
+
+        fn deinit(self: *TlsProxyIo, allocator: Allocator) void {
+            self.ca_bundle.deinit(allocator);
+            self.stream.close();
+            allocator.destroy(self);
+        }
+    };
+
+    pub fn connect(allocator: Allocator, url_input: []const u8, options: ConnectOptions) Error!Conn {
         const url = try parseUrl(url_input);
 
         if (url.secure) {
+            if (options.proxy != null) {
+                log.warn("wss over proxy is not supported; use relay.connect or clearnet", .{});
+                return error.ConnectFailed;
+            }
             const client = try allocator.create(std.http.Client);
             client.* = .{ .allocator = allocator };
 
@@ -181,6 +214,8 @@ pub const Conn = struct {
             h.client.connection_pool.release(h.connection);
             h.client.deinit();
             self.allocator.destroy(h.client);
+        } else if (self.tls_proxy) |t| {
+            t.deinit(self.allocator);
         } else {
             self.stream.close();
         }
@@ -510,6 +545,10 @@ pub const Conn = struct {
             const w = h.connection.writer();
             w.writeAll(buf) catch return error.SendFailed;
             h.connection.flush() catch return error.SendFailed;
+        } else if (self.tls_proxy) |t| {
+            t.tls.writer.writeAll(buf) catch return error.SendFailed;
+            t.tls.writer.flush() catch return error.SendFailed;
+            t.socket_writer.interface.flush() catch return error.SendFailed;
         } else {
             var off: usize = 0;
             while (off < buf.len) {
@@ -524,6 +563,9 @@ pub const Conn = struct {
         if (self.http) |h| {
             const r = h.connection.reader();
             return r.readSliceShort(buf) catch return error.RecvFailed;
+        }
+        if (self.tls_proxy) |t| {
+            return t.tls.reader.readSliceShort(buf) catch return error.RecvFailed;
         }
         const n = posix.recv(self.stream.handle, buf, 0) catch |err| switch (err) {
             error.WouldBlock => return error.Timeout,

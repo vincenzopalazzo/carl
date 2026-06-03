@@ -40,6 +40,8 @@ with an error instead of silently running unproxied.
 | Path | Without `--proxy` | With `--proxy` |
 |------|-------------------|----------------|
 | Peer connections | direct TCP | **tunneled** through the proxy |
+| `.onion` peer connections | not used | **tunneled** (requires `socks5h://`; see [tor-hidden-service.md](tor-hidden-service.md)) |
+| Nostr relay `wss://` | direct (TLS) | **clearnet** (proxy not applied; see [tor-hidden-service.md](tor-hidden-service.md)) |
 | `http://` trackers | direct | **tunneled** through the proxy |
 | `https://` trackers | direct (TLS) | **tunneled** -- TLS runs over the proxied stream, with certificate verification |
 | UDP trackers (BEP 15) | direct UDP | **disabled** (UDP can't traverse a CONNECT tunnel) |
@@ -184,8 +186,38 @@ still works, carl *must* be tunneling; if it leaked, it would have no
 connectivity at all. This is the gold-standard fail-closed check (`ip netns` +
 a single veth route to the proxy host).
 
+## Tor hidden-service seeding (`--tor-seed`)
+
+For seeding without a public IP, Carl can create an ephemeral v3 onion via Tor
+ControlPort and publish it on Nostr (kind 30078 `host` + `port` tags, no IPv4).
+
+```sh
+# tor must be running with ControlPort (default 9051) and cookie auth
+carl seed file.torrent /data --tor-seed --nostr
+
+# Remote leecher (onion dials require Tor SOCKS)
+carl download file.torrent --nostr --proxy socks5h://127.0.0.1:9050
+```
+
+`--tor-seed` binds the BitTorrent listener to `127.0.0.1` only and disables
+tracker/DHT announces. It is mutually exclusive with `--proxy` on seed.
+
+**Proxy split:** when a leecher passes `--proxy`, BitTorrent peer TCP (including
+`.onion` hosts) uses the proxy, but Nostr relay `wss://` connections use
+**clearnet** today (proxied WebSocket+TLS is not implemented). See
+[tor-hidden-service.md](tor-hidden-service.md) for setup, security, E2E test
+results, and limitations.
+
+Optional flags: `--tor-control host:port`, `--tor-cookie path`,
+`--tor-onion-port` (virtual port on the onion, default 80),
+`--tor-socks url` (reserved for future proxied Nostr; peer traffic uses
+`--proxy` on download).
+
 ## Limitations
 
+- **Nostr `wss` over `--proxy` is not tunneled** -- relay subscribe/publish uses
+  clearnet `wss` while peer TCP (including `.onion`) uses the proxy. See
+  [tor-hidden-service.md](tor-hidden-service.md).
 - **Web seeds are not tunneled yet** -- they're disabled when proxied (a
   proxied + Range-aware path is a planned follow-up).
 - **No UDP** -- DHT and UDP trackers are disabled; SOCKS5 UDP `ASSOCIATE` is not

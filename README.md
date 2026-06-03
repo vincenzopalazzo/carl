@@ -148,12 +148,32 @@ carl seed file.torrent /path/to/data --nostr --external-ip 203.0.113.7 \
     --description "My release notes"
 ```
 
+### Seed behind Tor (hidden service)
+
+Requires a running `tor` with ControlPort and cookie auth (default
+`127.0.0.1:9051`, cookie at `~/.tor/control_auth_cookie`):
+
+```sh
+carl seed file.torrent /path/to/data --tor-seed --nostr \
+    --description "Seeded over Tor"
+
+# Leechers must use Tor SOCKS (remote DNS)
+carl download file.torrent --nostr --proxy socks5h://127.0.0.1:9050
+```
+
+Carl creates an ephemeral v3 onion, listens on `127.0.0.1`, and publishes the
+`.onion` endpoint in kind 30078 (no public IPv4). Leechers dial the onion via
+`--proxy socks5h://127.0.0.1:9050`. Tracker/DHT announces are disabled so your
+real IP is not leaked to trackers.
+
+Full details (proxy split, security, E2E test, troubleshooting):
+[docs/tor-hidden-service.md](docs/tor-hidden-service.md).
+
 ### Download using Nostr peer-discovery
 
 ```sh
-# Subscribes to kind 30078 events filtered by infohash and feeds the IPs
-# back into the session alongside tracker/DHT peers. Routable IPs only —
-# private/loopback/multicast addresses from relays are rejected.
+# Subscribes to kind 30078 events filtered by infohash and dials IPv4 or
+# `.onion` peers (onion requires --proxy socks5h://…). Routable IPv4 only.
 carl download file.torrent --nostr
 ```
 
@@ -191,6 +211,7 @@ src/
   nip19.zig        Bech32 codec for npub/nsec/note + TLV decoder
   nip35.zig        Kind 2003 torrent index event builder/parser
   peer_announce.zig  Kind 30078 peer-announce builder/parser + IP safety filter
+  tor_control.zig  Tor ControlPort ADD_ONION / DEL_ONION for v3 hidden services
   relay.zig        Connect to a relay, subscribe-collect-until-EOSE, publish-and-wait
   nostr_config.zig  ~/.config/carl/{nsec,relays} read/write
 ```

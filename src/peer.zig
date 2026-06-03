@@ -26,6 +26,9 @@ pub const PeerConnection = struct {
     /// directly. Set by the session after `init` from its own proxy config.
     proxy: ?proxy_mod.Proxy,
 
+    /// When set with `proxy`, connect via SOCKS to this hostname (e.g. `.onion`).
+    connect_host: ?[]const u8 = null,
+
     // Protocol state
     am_choking: bool,
     am_interested: bool,
@@ -63,6 +66,37 @@ pub const PeerConnection = struct {
             .stream = null,
             .state = .connecting,
             .proxy = null,
+            .connect_host = null,
+            .am_choking = true,
+            .am_interested = false,
+            .peer_choking = true,
+            .peer_interested = false,
+            .peer_bitfield = null,
+            .peer_id = null,
+            .supports_extensions = false,
+            .peer_ut_metadata_id = null,
+            .peer_metadata_size = null,
+            .recv_buf = .empty,
+            .send_buf = .empty,
+            .send_pos = 0,
+            .pending_requests = .empty,
+            .bytes_downloaded = 0,
+            .bytes_uploaded = 0,
+            .last_recv_time = std.time.timestamp(),
+            .last_send_time = std.time.timestamp(),
+        };
+    }
+
+    /// Outbound connection to a Tor hidden service or other proxied hostname.
+    pub fn initOnion(allocator: Allocator, host: []const u8, port: u16) !PeerConnection {
+        const host_owned = try allocator.dupe(u8, host);
+        return .{
+            .allocator = allocator,
+            .address = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, port),
+            .stream = null,
+            .state = .connecting,
+            .proxy = null,
+            .connect_host = host_owned,
             .am_choking = true,
             .am_interested = false,
             .peer_choking = true,
@@ -85,6 +119,7 @@ pub const PeerConnection = struct {
 
     pub fn deinit(self: *PeerConnection) void {
         if (self.stream) |s| s.close();
+        if (self.connect_host) |h| self.allocator.free(h);
         if (self.peer_bitfield) |*bf| bf.deinit(self.allocator);
         self.recv_buf.deinit(self.allocator);
         self.send_buf.deinit(self.allocator);
@@ -99,10 +134,18 @@ pub const PeerConnection = struct {
         // When a proxy is configured, tunnel through it. The handshake is
         // synchronous, so on success the stream is ready for the BT handshake.
         if (self.proxy) |px| {
-            self.stream = proxy_mod.connectThroughProxyAddr(self.allocator, px, self.address) catch {
-                self.state = .disconnected;
-                return error.ConnectionFailed;
-            };
+            if (self.connect_host) |host| {
+                const port = self.address.getPort();
+                self.stream = proxy_mod.connectThroughProxyHost(self.allocator, px, host, port) catch {
+                    self.state = .disconnected;
+                    return error.ConnectionFailed;
+                };
+            } else {
+                self.stream = proxy_mod.connectThroughProxyAddr(self.allocator, px, self.address) catch {
+                    self.state = .disconnected;
+                    return error.ConnectionFailed;
+                };
+            }
             self.state = .handshaking;
             return;
         }

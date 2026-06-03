@@ -248,6 +248,8 @@ fn seederThread(args: SeederArgs) void {
         .seed,
         args.port,
         null,
+        .any,
+        false,
     ) catch return;
     defer sess.deinit();
 
@@ -323,6 +325,8 @@ test "full session seed and download over loopback" {
         .download,
         test_port + 1,
         null,
+        .any,
+        false,
     ) catch {
         session_mod.shutdown_requested.store(true, .release);
         seeder_handle.join();

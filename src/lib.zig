@@ -17,6 +17,7 @@ pub const nip19 = @import("nip19.zig");
 pub const nostr = @import("nostr.zig");
 pub const nip35 = @import("nip35.zig");
 pub const peer_announce = @import("peer_announce.zig");
+pub const tor_control = @import("tor_control.zig");
 pub const relay = @import("relay.zig");
 pub const nostr_config = @import("nostr_config.zig");
 
@@ -39,6 +40,7 @@ test {
     _ = nostr;
     _ = nip35;
     _ = peer_announce;
+    _ = tor_control;
     _ = relay;
     _ = nostr_config;
     _ = @import("integration_test.zig");
