@@ -24,6 +24,7 @@ interface CarlContextValue {
     downloadDir?: string;
     relays?: string[];
   }) => Promise<void>;
+  createSeed: (file: File, route: Route, nostr: boolean) => Promise<void>;
   refresh: () => Promise<void>;
 }
 
@@ -133,6 +134,16 @@ export function CarlProvider({ children }: { children: React.ReactNode }) {
     [updateSettings],
   );
 
+  const createSeed = useCallback(
+    async (file: File, route: Route, nostr: boolean) => {
+      const c = clientRef.current;
+      if (!c) throw new Error("daemon not connected");
+      await c.createSeed(file, route, nostr);
+      await refresh();
+    },
+    [refresh],
+  );
+
   const value: CarlContextValue = {
     state,
     connected,
@@ -142,6 +153,7 @@ export function CarlProvider({ children }: { children: React.ReactNode }) {
     search,
     setRoute,
     updateSettings,
+    createSeed,
     refresh,
   };
   return <CarlContext.Provider value={value}>{children}</CarlContext.Provider>;

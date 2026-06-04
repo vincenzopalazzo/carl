@@ -23,7 +23,8 @@ export function AddModal({ onClose }: { onClose: () => void }) {
   const [tab, setTab] = useState<Tab>("magnet");
   const [val, setVal] = useState("");
   const [nostr, setNostr] = useState(true);
-  const [route, setRoute] = useState<Route>("tor");
+  // Downloads are Tor-only — privacy by default; the IP is never exposed.
+  const route: Route = "tor";
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -89,37 +90,15 @@ export function AddModal({ onClose }: { onClose: () => void }) {
             <div className="field">
               <label className="field-label">Route</label>
               <div className="route-select route-select-lg">
-                {(
-                  [
-                    ["direct", "Direct"],
-                    ["proxy", "Proxy"],
-                    ["tor", "Tor"],
-                  ] as const
-                ).map(([id, l]) => (
-                  <button
-                    key={id}
-                    className={
-                      "rsl-btn" + (route === id ? " active rt-" + id : "")
-                    }
-                    onClick={() => setRoute(id)}
-                  >
-                    {id === "tor" ? (
-                      <OnionIcon size={12} />
-                    ) : id === "proxy" ? (
-                      <Icon name="shield" size={12} />
-                    ) : (
-                      <Icon name="globe" size={12} />
-                    )}
-                    {l}
-                  </button>
-                ))}
+                <button className="rsl-btn active rt-tor" disabled>
+                  <OnionIcon size={12} />
+                  Tor
+                </button>
               </div>
               <span className="field-hint">
-                {route === "direct"
-                  ? "Peers see your IP."
-                  : route === "proxy"
-                    ? "Tunneled via SOCKS5 · trackers & DHT off."
-                    : "Anonymous · trackers & DHT off · Nostr only."}
+                Downloads are routed over Tor only — your IP is never exposed.
+                Trackers &amp; DHT off · peers via Nostr. Requires a running Tor
+                SOCKS proxy (127.0.0.1:9050).
               </span>
             </div>
 

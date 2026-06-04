@@ -109,6 +109,31 @@ export class DaemonClient {
   }
 
   /**
+   * Upload a local file and start seeding it. The daemon hashes it into a
+   * torrent in-process. The file bytes are the request body; metadata rides in
+   * headers. Works from a browser drag-drop or the Tauri shell.
+   */
+  async createSeed(
+    file: File,
+    route: Route,
+    nostr: boolean,
+  ): Promise<{ id: string }> {
+    const bytes = await file.arrayBuffer();
+    const res = await fetch(`${this.cfg.base}/api/seeds`, {
+      method: "POST",
+      headers: {
+        "X-Carl-Token": this.cfg.token,
+        "X-Carl-Filename": file.name,
+        "X-Carl-Route": route,
+        "X-Carl-Nostr": String(nostr),
+        "Content-Type": "application/octet-stream",
+      },
+      body: bytes,
+    });
+    return this.json<{ id: string }>(res);
+  }
+
+  /**
    * Open the live state WebSocket. `onState` fires on each pushed snapshot.
    * Returns the socket so the caller can close it. The token rides in the query
    * string because browsers can't set headers on a WebSocket handshake.
