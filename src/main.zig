@@ -99,6 +99,8 @@ pub fn main() !void {
         try cmdSearch(allocator, stdout, args[2], limit, single_relay, parseProxy(args[3..]));
     } else if (std.mem.eql(u8, command, "nostr-keygen")) {
         try cmdNostrKeygen(allocator, stdout);
+    } else if (std.mem.eql(u8, command, "daemon")) {
+        try cmdDaemon(allocator, stdout, args[2..]);
     } else {
         log.err("unknown command: {s}", .{command});
         std.process.exit(1);
@@ -127,6 +129,11 @@ fn printUsage() void {
         \\  search <query> [--limit n] [--relay <wss://...>]
         \\           search nostr relays for kind-2003 torrent events
         \\  nostr-keygen                                     generate a fresh nostr key
+        \\  daemon [--port p] [--bt-port p] [--route direct|proxy|tor] [--socks url]
+        \\         [--download-dir d] [--token tok]
+        \\           run a localhost HTTP+WebSocket API for the desktop GUI.
+        \\           binds 127.0.0.1 only; every request needs the printed token
+        \\           (X-Carl-Token header, or ?token= for the /ws upgrade).
         \\
         \\  --proxy url   route peers and HTTP trackers through a proxy. Forms:
         \\                socks5h://[user:pass@]host:port  (remote DNS, no leak)
@@ -712,6 +719,81 @@ fn cmdNostrKeygen(allocator: std.mem.Allocator, stdout: anytype) !void {
     try stdout.print("wrote nsec (secret key) to your config dir\n", .{});
     try stdout.print("npub: {s}\n", .{npub});
     try stdout.print("\nkeep your nsec private. anyone with it can publish as you.\n", .{});
+}
+
+// -------------------------------------------------------------------------
+// `carl daemon` — localhost HTTP+WebSocket API for the desktop GUI
+// -------------------------------------------------------------------------
+
+/// SIGINT handler for the daemon. Reuses the session shutdown flag so any
+/// running transfer threads stop too; the blocking accept() returns EINTR and
+/// the serve loop then exits.
+fn daemonSigintHandler(_: i32) callconv(.c) void {
+    carl.session.shutdown_requested.store(true, .release);
+}
+
+fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u8) !void {
+    const port = parsePortFlag(extra, "--port", 8088);
+    const bt_port = parsePortFlag(extra, "--bt-port", 6881);
+    const route_str = parseFlag(extra, "--route") orelse "direct";
+    const route = carl.api.Route.parse(route_str) orelse {
+        log.err("invalid --route '{s}' (expected direct|proxy|tor)", .{route_str});
+        std.process.exit(1);
+    };
+    const socks = parseFlag(extra, "--socks") orelse "";
+    const download_dir = parseFlag(extra, "--download-dir") orelse "";
+
+    // Token: use --token if given, else generate a random 32-hex secret. The
+    // Tauri sidecar reads it off stdout and presents it on every request.
+    var token_buf: [32]u8 = undefined;
+    const token: []const u8 = if (parseFlag(extra, "--token")) |t| t else blk: {
+        var raw: [16]u8 = undefined;
+        std.crypto.random.bytes(&raw);
+        const hex = "0123456789abcdef";
+        for (raw, 0..) |b, i| {
+            token_buf[i * 2] = hex[b >> 4];
+            token_buf[i * 2 + 1] = hex[b & 0x0f];
+        }
+        break :blk token_buf[0..];
+    };
+
+    var mgr = carl.manager.Manager.init(allocator, .{
+        .route = route,
+        .socks = socks,
+        .download_dir = download_dir,
+        .listen_port = bt_port,
+    }) catch |err| {
+        log.err("failed to init manager: {}", .{err});
+        std.process.exit(1);
+    };
+    defer mgr.deinit();
+
+    var daemon = carl.daemon.Daemon{ .allocator = allocator, .manager = &mgr, .token = token };
+
+    const act = std.posix.Sigaction{
+        .handler = .{ .handler = daemonSigintHandler },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+
+    // The token line is machine-readable (the GUI parses it); keep the format
+    // stable: "token: <hex>".
+    try stdout.print("carl daemon\n", .{});
+    try stdout.print("listen: http://127.0.0.1:{d}\n", .{port});
+    try stdout.print("token: {s}\n", .{token});
+    try stdout.print("route: {s}\n", .{route_str});
+
+    daemon.serve(port) catch |err| {
+        log.err("daemon error: {}", .{err});
+        std.process.exit(1);
+    };
+
+    // Connection/WebSocket threads are detached; give them a brief window to
+    // observe the shutdown flag and finish touching the allocator before
+    // `mgr.deinit()` and the GPA teardown run. (A full join of connection
+    // threads is a follow-up; see docs/daemon-api.md.)
+    std.Thread.sleep(300 * std.time.ns_per_ms);
 }
 
 // -------------------------------------------------------------------------

@@ -68,6 +68,12 @@ pub const Session = struct {
     // Control
     running: bool,
 
+    // Guards the fields read by `progressSnapshot` against the metadata-complete
+    // transition (which reallocates `our_bitfield`). Lets the daemon read live
+    // progress from another thread without a use-after-free. Defaulted so the
+    // init struct literal need not set it.
+    snapshot_mutex: std.Thread.Mutex = .{},
+
     // Choking state
     last_unchoke_time: i64,
     last_optimistic_time: i64,
@@ -237,6 +243,36 @@ pub const Session = struct {
         // The magnet path replaces `meta` with a session-owned copy; free it.
         // The original caller-owned `meta` is freed by the caller.
         if (self.meta_owned) self.meta.deinit(self.allocator);
+    }
+
+    /// A consistent, race-safe view of the session's live progress, for other
+    /// threads (the daemon). Reads are taken under `snapshot_mutex` so the
+    /// magnet metadata-complete transition (which reallocates `our_bitfield`)
+    /// can't be observed half-applied.
+    pub const Progress = struct {
+        have: u32,
+        num_pieces: u32,
+        downloaded: u64,
+        uploaded: u64,
+        total_length: u64,
+        peers: u32,
+        mode: Mode,
+        metadata_only: bool,
+    };
+
+    pub fn progressSnapshot(self: *Session) Progress {
+        self.snapshot_mutex.lock();
+        defer self.snapshot_mutex.unlock();
+        return .{
+            .have = self.our_bitfield.count(),
+            .num_pieces = self.num_pieces,
+            .downloaded = self.downloaded,
+            .uploaded = self.uploaded,
+            .total_length = self.total_length,
+            .peers = @intCast(self.peers.items.len),
+            .mode = self.mode,
+            .metadata_only = self.metadata_only,
+        };
     }
 
     pub fn run(self: *Session) !void {
@@ -830,17 +866,24 @@ pub const Session = struct {
         };
         self.meta_owned = true;
 
-        // Now initialize storage and piece tracking
-        self.total_length = piece_mod.totalLength(self.meta.files);
-        self.num_pieces = piece_mod.numPieces(self.total_length, piece_length);
-        self.piece_len = piece_length;
+        // Now initialize storage and piece tracking. Hold snapshot_mutex across
+        // the geometry + bitfield swap so a concurrent `progressSnapshot` never
+        // reads a freed `our_bitfield` (the daemon reads it from another thread).
+        {
+            self.snapshot_mutex.lock();
+            defer self.snapshot_mutex.unlock();
 
-        self.our_bitfield.deinit(self.allocator);
-        self.our_bitfield = piece_mod.Bitfield.init(self.allocator, self.num_pieces) catch return error.OutOfMemory;
+            self.total_length = piece_mod.totalLength(self.meta.files);
+            self.num_pieces = piece_mod.numPieces(self.total_length, piece_length);
+            self.piece_len = piece_length;
 
-        self.allocator.free(self.piece_availability);
-        self.piece_availability = self.allocator.alloc(u32, self.num_pieces) catch return error.OutOfMemory;
-        @memset(self.piece_availability, 0);
+            self.our_bitfield.deinit(self.allocator);
+            self.our_bitfield = piece_mod.Bitfield.init(self.allocator, self.num_pieces) catch return error.OutOfMemory;
+
+            self.allocator.free(self.piece_availability);
+            self.piece_availability = self.allocator.alloc(u32, self.num_pieces) catch return error.OutOfMemory;
+            @memset(self.piece_availability, 0);
+        }
 
         // Reinitialize storage with the real metadata
         self.store.deinit();
