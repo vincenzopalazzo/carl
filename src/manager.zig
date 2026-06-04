@@ -27,6 +27,7 @@ const extension = @import("extension.zig");
 const relay_mod = @import("relay.zig");
 const nip35 = @import("nip35.zig");
 const peer_announce = @import("peer_announce.zig");
+const state_mod = @import("state.zig");
 const nostr_config = @import("nostr_config.zig");
 const nostr_mod = @import("nostr.zig");
 const secp = @import("secp.zig");
@@ -62,6 +63,9 @@ const ManagedTransfer = struct {
     id: []u8,
     name: []u8,
     magnet: []u8,
+    /// Owned recipe to re-create this transfer on restart: the original source
+    /// (magnet/url/.torrent path for a download, file path for a seed).
+    source: []u8,
     hash_hex: [40]u8,
     info_hash: [20]u8,
     route: api.Route,
@@ -110,6 +114,7 @@ const ManagedTransfer = struct {
         self.allocator.free(self.id);
         self.allocator.free(self.name);
         self.allocator.free(self.magnet);
+        self.allocator.free(self.source);
         self.allocator.destroy(self);
     }
 };
@@ -120,6 +125,9 @@ pub const Manager = struct {
     transfers: std.ArrayList(*ManagedTransfer) = .empty,
     next_id: usize = 1,
     cfg: Config,
+    /// While replaying persisted state on startup, suppress per-add persistence
+    /// (we write once at the end of `restore`).
+    restoring: bool = false,
 
     pub fn init(allocator: Allocator, cfg: Config) Allocator.Error!Manager {
         return .{
@@ -172,7 +180,7 @@ pub const Manager = struct {
             return err;
         };
         const magnet = if (std.mem.startsWith(u8, source, "magnet:")) source else "";
-        return self.register(built, route, resolved_proxy, socks_owned, want_nostr, false, magnet);
+        return self.register(built, route, resolved_proxy, socks_owned, want_nostr, false, magnet, source);
     }
 
     /// Create a torrent from a local file (or archive) and start seeding it. The
@@ -223,7 +231,7 @@ pub const Manager = struct {
         };
         defer self.allocator.free(magnet);
 
-        return self.register(built, route, resolved_proxy, socks_owned, want_nostr, true, magnet);
+        return self.register(built, route, resolved_proxy, socks_owned, want_nostr, true, magnet, path);
     }
 
     /// Register a built session as a managed transfer and spawn its thread.
@@ -240,6 +248,7 @@ pub const Manager = struct {
         want_nostr: bool,
         is_seed: bool,
         magnet_src: []const u8,
+        source_src: []const u8,
     ) Error![]u8 {
         var mt_owned = false;
         errdefer if (!mt_owned) {
@@ -263,12 +272,15 @@ pub const Manager = struct {
         errdefer if (!mt_owned) self.allocator.free(name);
         const magnet = try self.allocator.dupe(u8, magnet_src);
         errdefer if (!mt_owned) self.allocator.free(magnet);
+        const source = try self.allocator.dupe(u8, source_src);
+        errdefer if (!mt_owned) self.allocator.free(source);
 
         mt.* = .{
             .allocator = self.allocator,
             .id = id,
             .name = name,
             .magnet = magnet,
+            .source = source,
             .hash_hex = undefined,
             .info_hash = built.info_hash,
             .route = route,
@@ -302,6 +314,7 @@ pub const Manager = struct {
             return error.SessionInitFailed;
         };
 
+        self.persist();
         return self.allocator.dupe(u8, id);
     }
 
@@ -322,6 +335,7 @@ pub const Manager = struct {
 
         if (found) |mt| {
             mt.destroy(); // joins the thread outside the lock
+            self.persist();
             return true;
         }
         return false;
@@ -393,8 +407,9 @@ pub const Manager = struct {
 
     pub fn setRoute(self: *Manager, route: api.Route) void {
         self.mutex.lock();
-        defer self.mutex.unlock();
         self.cfg.route = route;
+        self.mutex.unlock();
+        self.persist();
     }
 
     /// A locked copy of the current download dir (for callers that need to build
@@ -410,10 +425,88 @@ pub const Manager = struct {
     pub fn setDownloadDir(self: *Manager, dir: []const u8) Allocator.Error!void {
         const dup = try self.allocator.dupe(u8, dir);
         self.mutex.lock();
-        defer self.mutex.unlock();
         self.allocator.free(self.cfg.download_dir);
         self.cfg.download_dir = dup;
+        self.mutex.unlock();
         std.fs.cwd().makePath(dup) catch {};
+        self.persist();
+    }
+
+    // -----------------------------------------------------------------------
+    // Persistence — restore the full set of transfers/seeds + settings on
+    // restart so nothing is lost. (Relays persist separately via nostr_config.)
+    // -----------------------------------------------------------------------
+
+    /// Write the current transfers + settings to the state file. Best-effort;
+    /// a no-op while `restore` is replaying. Snapshots under the lock, then does
+    /// file I/O unlocked.
+    pub fn persist(self: *Manager) void {
+        if (self.restoring) return;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        self.mutex.lock();
+        const route = self.cfg.route;
+        const dir = aa.dupe(u8, self.cfg.download_dir) catch {
+            self.mutex.unlock();
+            return;
+        };
+        var specs: std.ArrayList(state_mod.TransferSpec) = .empty;
+        for (self.transfers.items) |mt| {
+            const src = aa.dupe(u8, mt.source) catch break;
+            specs.append(aa, .{
+                .kind = if (mt.is_seed) .seed else .download,
+                .source = src,
+                .route = mt.route,
+                .nostr = mt.want_nostr,
+            }) catch break;
+        }
+        self.mutex.unlock();
+
+        state_mod.save(self.allocator, route, dir, specs.items) catch |e| {
+            log.warn("failed to persist daemon state: {}", .{e});
+        };
+    }
+
+    /// Replay persisted state on startup: apply settings and re-add every
+    /// transfer/seed. Downloads resume from on-disk pieces; seeds re-hash their
+    /// file. Call once, before serving. Blocking.
+    pub fn restore(self: *Manager) void {
+        const st = (state_mod.load(self.allocator) catch |e| {
+            log.warn("failed to load daemon state: {}", .{e});
+            return;
+        }) orelse return;
+        defer st.deinit(self.allocator);
+
+        self.mutex.lock();
+        self.cfg.route = st.route;
+        if (st.download_dir.len > 0) {
+            if (self.allocator.dupe(u8, st.download_dir)) |d| {
+                self.allocator.free(self.cfg.download_dir);
+                self.cfg.download_dir = d;
+            } else |_| {}
+        }
+        self.mutex.unlock();
+        std.fs.cwd().makePath(self.cfg.download_dir) catch {};
+
+        self.restoring = true;
+        var restored: usize = 0;
+        for (st.transfers) |t| {
+            const res = switch (t.kind) {
+                .download => self.addTransfer(t.source, t.route, t.nostr),
+                .seed => self.addSeed(t.source, t.route, t.nostr),
+            };
+            if (res) |id| {
+                self.allocator.free(id);
+                restored += 1;
+            } else |e| {
+                log.warn("restore: could not re-add '{s}': {}", .{ t.source, e });
+            }
+        }
+        self.restoring = false;
+        self.persist();
+        if (restored > 0) log.info("restored {d} transfer(s) from saved state", .{restored});
     }
 
     // -----------------------------------------------------------------------

@@ -35,6 +35,16 @@ carl daemon [--port p] [--bt-port p] [--route direct|proxy|tor] [--socks url] \
 
   The Tauri sidecar parses the `token:` line and presents it on every request.
 
+## Persistence
+
+The daemon persists its transfers, seeds, and editable settings (route +
+download dir) to `<config>/daemon-state.json`, rewritten on every change
+(add/remove/settings) — so a crash or restart loses nothing. On startup it
+replays that state: downloads resume from on-disk pieces (the session
+re-verifies them) and seeds re-hash their file. Relays persist separately via
+the relay config file. Transfers are stored as *specs* (source + route + nostr),
+not live session state, so the saved file is small and human-readable.
+
 ## Authentication
 
 Every request must present the token, or the daemon answers `401`:

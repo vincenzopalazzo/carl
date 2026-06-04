@@ -777,6 +777,9 @@ fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u
     };
     std.posix.sigaction(std.posix.SIG.INT, &act, null);
 
+    // Restore persisted transfers/seeds + settings so a restart loses nothing.
+    mgr.restore();
+
     // The token line is machine-readable (the GUI parses it); keep the format
     // stable: "token: <hex>".
     try stdout.print("carl daemon\n", .{});

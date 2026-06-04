@@ -25,6 +25,7 @@ pub const ws_server = @import("ws_server.zig");
 pub const http = @import("http.zig");
 pub const manager = @import("manager.zig");
 pub const daemon = @import("daemon.zig");
+pub const state = @import("state.zig");
 
 test {
     _ = bencode;
@@ -53,5 +54,6 @@ test {
     _ = http;
     _ = manager;
     _ = daemon;
+    _ = state;
     _ = @import("integration_test.zig");
 }
