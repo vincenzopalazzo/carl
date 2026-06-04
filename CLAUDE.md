@@ -19,3 +19,18 @@
 - Build: `zig build`
 - Test: `zig build test`
 - Format: `zig fmt src/`
+
+## Install (always use a fresh binary)
+
+Whenever you test `carl` by hand or run it via `$PATH`, rebuild and reinstall
+first so you are never running a stale binary (a stale `~/.local/bin/carl`
+silently produces wrong results — e.g. a 0-byte `unknown` file). After any code
+change, before manual/e2e testing:
+
+```sh
+zig build -Doptimize=ReleaseSafe
+cp zig-out/bin/carl ~/.local/bin/carl   # the binary `carl` on $PATH resolves to
+```
+
+Prefer invoking the freshly built `./zig-out/bin/carl` directly in scripts, and
+keep the installed `~/.local/bin/carl` in sync after every change.
