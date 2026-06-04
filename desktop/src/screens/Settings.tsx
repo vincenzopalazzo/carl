@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { Icon, OnionIcon } from "../components/icons";
 import { CopyField } from "../components/atoms";
 import { trunc } from "../components/format";
@@ -30,8 +31,51 @@ const ROUTES: [Route, string, string, string][] = [
 ];
 
 export function SettingsScreen() {
-  const { state, setRoute } = useCarl();
+  const { state, setRoute, updateSettings } = useCarl();
   const s = state.settings;
+
+  // Editable copies, re-seeded only when the server value actually changes (the
+  // deps are strings, so the 1s state push doesn't clobber in-progress edits).
+  const relaysJoined = s.relays.join("\n");
+  const [dir, setDir] = useState(s.downloadDir);
+  const [relaysText, setRelaysText] = useState(relaysJoined);
+  const [savingDir, setSavingDir] = useState(false);
+  const [savingRelays, setSavingRelays] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => setDir(s.downloadDir), [s.downloadDir]);
+  useEffect(() => setRelaysText(relaysJoined), [relaysJoined]);
+
+  const dirDirty = dir.trim() !== s.downloadDir && dir.trim().length > 0;
+  const relaysDirty = relaysText !== relaysJoined;
+
+  async function saveDir() {
+    setSavingDir(true);
+    setErr(null);
+    try {
+      await updateSettings({ downloadDir: dir.trim() });
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setSavingDir(false);
+    }
+  }
+
+  async function saveRelays() {
+    setSavingRelays(true);
+    setErr(null);
+    try {
+      const relays = relaysText
+        .split("\n")
+        .map((r) => r.trim())
+        .filter((r) => r.length > 0);
+      await updateSettings({ relays });
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setSavingRelays(false);
+    }
+  }
 
   return (
     <div className="screen">
@@ -124,10 +168,35 @@ export function SettingsScreen() {
               </label>
               <textarea
                 className="text-input mono relay-textarea"
-                value={s.relays.join("\n")}
-                rows={Math.max(3, s.relays.length)}
-                readOnly
+                value={relaysText}
+                rows={Math.max(3, relaysText.split("\n").length)}
+                onChange={(e) => setRelaysText(e.target.value)}
+                spellCheck={false}
               />
+              <div className="id-actions">
+                <button
+                  className={
+                    "btn btn-sm btn-primary" + (relaysDirty ? "" : " disabled")
+                  }
+                  disabled={!relaysDirty || savingRelays}
+                  onClick={saveRelays}
+                >
+                  <Icon name="check" size={13} stroke={2.2} />
+                  {savingRelays ? "Saving…" : "Save relays"}
+                </button>
+                {relaysDirty && (
+                  <button
+                    className="btn btn-sm"
+                    onClick={() => setRelaysText(relaysJoined)}
+                  >
+                    Reset
+                  </button>
+                )}
+              </div>
+              <span className="field-hint">
+                Saved to your carl config — search, peer-announce, and the CLI
+                all use this list.
+              </span>
             </div>
 
             <div className="field">
@@ -135,7 +204,7 @@ export function SettingsScreen() {
               <div className="identity-card">
                 <div className="id-row">
                   <span className="id-lbl">public key</span>
-                  {s.relays /* noop to keep layout */ && state.identity.npub ? (
+                  {state.identity.npub ? (
                     <CopyField
                       value={state.identity.npub}
                       label={trunc(state.identity.npub, 12)}
@@ -180,10 +249,25 @@ export function SettingsScreen() {
                 />
                 <input
                   className="text-input mono"
-                  value={s.downloadDir}
-                  readOnly
+                  value={dir}
+                  onChange={(e) => setDir(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && dirDirty) saveDir();
+                  }}
+                  spellCheck={false}
                 />
+                <button
+                  className="link-btn"
+                  onClick={saveDir}
+                  style={{ opacity: dirDirty ? 1 : 0.4 }}
+                >
+                  {savingDir ? "saving…" : "save"}
+                </button>
               </div>
+              <span className="field-hint">
+                New transfers download here. Existing transfers keep their
+                folder.
+              </span>
             </div>
             <div className="field-grid">
               <div className="field">
@@ -214,14 +298,12 @@ export function SettingsScreen() {
                 />
               </div>
             </div>
-            <div className="callout-note">
-              <Icon name="settings" size={15} stroke={1.8} />
-              <span>
-                General settings are read from the daemon's launch flags in this
-                build; editable settings persistence is a follow-up. The{" "}
-                <strong>route</strong> selector above is live.
-              </span>
-            </div>
+            {err && (
+              <div className="callout-note" style={{ color: "var(--danger)" }}>
+                <Icon name="close" size={15} stroke={1.8} />
+                <span>{err}</span>
+              </div>
+            )}
           </div>
         </section>
       </div>

@@ -90,13 +90,22 @@ export class DaemonClient {
     return this.json<DiscoverResult[]>(res);
   }
 
-  async setRoute(route: Route): Promise<Settings> {
+  /** Update any subset of settings (route, downloadDir, relays). */
+  async updateSettings(patch: {
+    route?: Route;
+    downloadDir?: string;
+    relays?: string[];
+  }): Promise<Settings> {
     const res = await fetch(`${this.cfg.base}/api/settings`, {
       method: "POST",
       headers: this.headers(),
-      body: JSON.stringify({ route }),
+      body: JSON.stringify(patch),
     });
     return this.json<Settings>(res);
+  }
+
+  setRoute(route: Route): Promise<Settings> {
+    return this.updateSettings({ route });
   }
 
   /**

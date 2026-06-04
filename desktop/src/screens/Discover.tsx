@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Icon, OnionIcon } from "../components/icons";
 import { RelayDot, CopyField } from "../components/atoms";
 import { fmtBytes, trunc } from "../components/format";
@@ -63,7 +63,7 @@ function DiscoverCard({
                 unverified
               </span>
             )}
-            <span className="dcard-author mono">{d.author}</span>
+            <span className="dcard-author mono">{trunc(d.author, 8)}</span>
             <span className="dcard-age">{d.age}</span>
           </div>
         </div>
@@ -124,28 +124,51 @@ export function DiscoverScreen() {
   const [q, setQ] = useState("");
   const [route, setRoute] = useState<Route>("tor");
   const [added, setAdded] = useState<Record<string, boolean>>({});
-  const [results, setResults] = useState<DiscoverResult[]>([]);
+  const [all, setAll] = useState<DiscoverResult[]>([]);
   const [loading, setLoading] = useState(false);
-  const [searched, setSearched] = useState(false);
+  const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  async function runSearch() {
+  // Query the relays. With an empty term the daemon returns recent NIP-35
+  // events, so opening Discover populates the list right away.
+  async function queryRelays(term: string) {
     setLoading(true);
     setError(null);
-    setSearched(true);
     try {
-      setResults(await search(q.trim()));
+      setAll(await search(term.trim()));
+      setLoaded(true);
     } catch (e) {
       setError(String(e));
-      setResults([]);
+      setAll([]);
     } finally {
       setLoading(false);
     }
   }
 
+  // Load recent events once on mount.
+  useEffect(() => {
+    queryRelays("");
+  }, []);
+
+  // Type-ahead filters the loaded set client-side (instant). Enter / the Search
+  // button re-queries the relays for a broader, fresher set.
+  const shown = useMemo(() => {
+    const t = q.trim().toLowerCase();
+    if (!t) return all;
+    return all.filter(
+      (d) =>
+        d.title.toLowerCase().includes(t) ||
+        d.desc.toLowerCase().includes(t),
+    );
+  }, [all, q]);
+
   async function download(d: DiscoverResult) {
     try {
-      await addTransfer(`magnet:?xt=urn:btih:${d.hash}&dn=${encodeURIComponent(d.title)}`, route, true);
+      await addTransfer(
+        `magnet:?xt=urn:btih:${d.hash}&dn=${encodeURIComponent(d.title)}`,
+        route,
+        true,
+      );
       setAdded((s) => ({ ...s, [d.id]: true }));
     } catch (e) {
       setError(String(e));
@@ -184,18 +207,14 @@ export function DiscoverScreen() {
 
       <div className="discover-searchbar">
         <div className="dsearch">
-          <Icon
-            name="search"
-            size={17}
-            style={{ color: "var(--fg-faint)" }}
-          />
+          <Icon name="search" size={17} style={{ color: "var(--fg-faint)" }} />
           <input
             value={q}
             onChange={(e) => setQ(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter") runSearch();
+              if (e.key === "Enter") queryRelays(q);
             }}
-            placeholder="Search torrents over Nostr — title or keyword (NIP-35). Enter to search."
+            placeholder="Filter the loaded events, or press Enter to query relays (NIP-35)"
             autoFocus
           />
           {q && (
@@ -203,6 +222,15 @@ export function DiscoverScreen() {
               <Icon name="close" size={13} />
             </button>
           )}
+          <button
+            className="btn btn-sm"
+            onClick={() => queryRelays(q)}
+            disabled={loading}
+            style={{ marginLeft: 6 }}
+          >
+            <Icon name="search" size={13} stroke={2} />
+            {loading ? "Searching…" : "Search"}
+          </button>
         </div>
         <RelayStrip />
       </div>
@@ -210,14 +238,16 @@ export function DiscoverScreen() {
       <div className="content">
         <div className="discover-resultbar">
           <span className="dr-count mono">
-            {loading ? "searching relays…" : `${results.length} events`}
+            {loading
+              ? "querying relays…"
+              : `${shown.length} of ${all.length} events`}
           </span>
           <span className="dr-sort">
             sorted by <strong>recent</strong>
           </span>
         </div>
         <div className="dcard-list">
-          {results.map((d) => (
+          {shown.map((d) => (
             <DiscoverCard
               key={d.id}
               d={d}
@@ -225,7 +255,7 @@ export function DiscoverScreen() {
               onDownload={download}
             />
           ))}
-          {!loading && results.length === 0 && (
+          {!loading && shown.length === 0 && (
             <div className="empty">
               <div className="empty-glyph">
                 <Icon name="search" size={26} />
@@ -233,16 +263,18 @@ export function DiscoverScreen() {
               <div className="empty-title">
                 {error
                   ? "Search failed"
-                  : searched
-                    ? "No matching events"
-                    : "Search Nostr for torrents"}
+                  : all.length === 0
+                    ? loaded
+                      ? "No torrent events found"
+                      : "Loading recent events…"
+                    : "No matches"}
               </div>
               <div className="empty-sub">
                 {error
                   ? error
-                  : searched
-                    ? `No NIP-35 torrent events on your relays match “${q}”. Try a broader term or add relays in Settings.`
-                    : "Type a query and press Enter. carl subscribes to your relays for signed (NIP-35) torrent events."}
+                  : all.length === 0
+                    ? "No signed NIP-35 torrent events on your relays right now — add relays in Settings, or check the relay strip above."
+                    : `None of the ${all.length} loaded events match “${q}”. Press Enter to query the relays directly.`}
               </div>
             </div>
           )}

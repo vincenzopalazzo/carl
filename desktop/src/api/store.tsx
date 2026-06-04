@@ -19,6 +19,11 @@ interface CarlContextValue {
   removeTransfer: (id: string) => Promise<void>;
   search: (query: string) => Promise<import("./types").DiscoverResult[]>;
   setRoute: (route: Route) => Promise<void>;
+  updateSettings: (patch: {
+    route?: Route;
+    downloadDir?: string;
+    relays?: string[];
+  }) => Promise<void>;
   refresh: () => Promise<void>;
 }
 
@@ -113,14 +118,19 @@ export function CarlProvider({ children }: { children: React.ReactNode }) {
     return c.search(query);
   }, []);
 
-  const setRoute = useCallback(
-    async (route: Route) => {
+  const updateSettings = useCallback(
+    async (patch: { route?: Route; downloadDir?: string; relays?: string[] }) => {
       const c = clientRef.current;
-      if (!c) return;
-      await c.setRoute(route);
+      if (!c) throw new Error("daemon not connected");
+      await c.updateSettings(patch);
       await refresh();
     },
     [refresh],
+  );
+
+  const setRoute = useCallback(
+    (route: Route) => updateSettings({ route }),
+    [updateSettings],
   );
 
   const value: CarlContextValue = {
@@ -131,6 +141,7 @@ export function CarlProvider({ children }: { children: React.ReactNode }) {
     removeTransfer,
     search,
     setRoute,
+    updateSettings,
     refresh,
   };
   return <CarlContext.Provider value={value}>{children}</CarlContext.Provider>;
