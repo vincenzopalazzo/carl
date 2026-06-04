@@ -39,6 +39,9 @@ const max_conns: u32 = 64;
 /// then stalls (or lies about Content-Length) can't wedge a thread forever.
 const recv_timeout_secs: u32 = 30;
 
+/// Max request size held in memory (covers the "Seed a file" upload body).
+const max_body: usize = 256 * 1024 * 1024;
+
 /// How often the background prober refreshes relay reachability. The daemon
 /// holds no persistent relay connections, so without this the UI could only
 /// ever show relays as "configured" (never connected).
@@ -236,6 +239,7 @@ const Conn = struct {
         // final parse, so the parsed Request's slices don't dangle on realloc.
         const probe = http.parse(buf.items) catch return self.sendStatus(.bad_request);
         const need = probe.head_len + probe.contentLength();
+        if (need > max_body) return self.sendStatus(.bad_request);
         while (buf.items.len < need) {
             const n = posix.recv(self.stream.handle, &tmp, 0) catch break;
             if (n == 0) break;
@@ -269,6 +273,7 @@ const Conn = struct {
         }
         if (std.mem.eql(u8, req.method, "POST")) {
             if (std.mem.eql(u8, path, "/api/transfers")) return self.addTransfer(body);
+            if (std.mem.eql(u8, path, "/api/seeds")) return self.createSeed(req, body);
             if (std.mem.eql(u8, path, "/api/search")) return self.search(req, body);
             if (std.mem.eql(u8, path, "/api/settings")) return self.updateSettings(body);
             return self.sendStatus(.not_found);
@@ -382,6 +387,48 @@ const Conn = struct {
 
         const id = self.daemon.manager.addTransfer(source, route_val, want_nostr) catch |err| {
             log.warn("addTransfer failed: {}", .{err});
+            return self.sendStatus(.bad_request);
+        };
+        defer a.free(id);
+
+        var j = api.Json.init(aa);
+        try j.beginObject();
+        try j.keyString("id", id);
+        try j.endObject();
+        try self.sendJson(.ok, j.buf.items);
+    }
+
+    /// POST /api/seeds — body is the raw file content (so a browser drag-drop or
+    /// the Tauri shell can upload directly). Headers: X-Carl-Filename (required),
+    /// X-Carl-Route (direct|proxy|tor, default tor), X-Carl-Nostr (true|false).
+    /// Writes the file into the download dir, creates a torrent in-process, and
+    /// starts seeding it; returns { id }.
+    fn createSeed(self: *Conn, req: *const http.Request, body: []const u8) !void {
+        const a = self.daemon.allocator;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        const raw_name = req.header("x-carl-filename") orelse return self.sendStatus(.bad_request);
+        // Sanitize to a bare filename — never let the client write outside the dir.
+        const filename = std.fs.path.basename(raw_name);
+        if (filename.len == 0 or body.len == 0) return self.sendStatus(.bad_request);
+        const route_val = api.Route.parse(req.header("x-carl-route") orelse "tor") orelse .tor;
+        const want_nostr = if (req.header("x-carl-nostr")) |h| std.mem.eql(u8, h, "true") else false;
+
+        const dir = self.daemon.manager.downloadDirDup(aa) catch return self.sendStatus(.internal_error);
+        std.fs.cwd().makePath(dir) catch {};
+        const full = std.fmt.allocPrint(aa, "{s}/{s}", .{ dir, filename }) catch
+            return self.sendStatus(.internal_error);
+        {
+            var f = std.fs.cwd().createFile(full, .{ .truncate = true }) catch
+                return self.sendStatus(.internal_error);
+            defer f.close();
+            f.writeAll(body) catch return self.sendStatus(.internal_error);
+        }
+
+        const id = self.daemon.manager.addSeed(full, route_val, want_nostr) catch |err| {
+            log.warn("addSeed failed: {}", .{err});
             return self.sendStatus(.bad_request);
         };
         defer a.free(id);

@@ -173,7 +173,10 @@ pub fn response(allocator: Allocator, status: Status, content_type: []const u8, 
     // without it the browser blocks every non-simple request.
     try buf.appendSlice(allocator, "Access-Control-Allow-Origin: *\r\n");
     try buf.appendSlice(allocator, "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n");
-    try buf.appendSlice(allocator, "Access-Control-Allow-Headers: X-Carl-Token, Content-Type\r\n");
+    // Wildcard so custom headers (X-Carl-Token and the X-Carl-Filename/Route/
+    // Nostr upload headers) all pass the browser preflight. Requests are never
+    // credentialed, so `*` applies; the token is the actual guard.
+    try buf.appendSlice(allocator, "Access-Control-Allow-Headers: *\r\n");
     try buf.appendSlice(allocator, "Connection: close\r\n\r\n");
     try buf.appendSlice(allocator, body);
     return buf.toOwnedSlice(allocator);

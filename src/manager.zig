@@ -25,6 +25,7 @@ const magnet_mod = @import("magnet.zig");
 const proxy_mod = @import("proxy.zig");
 const extension = @import("extension.zig");
 const relay_mod = @import("relay.zig");
+const nip35 = @import("nip35.zig");
 const peer_announce = @import("peer_announce.zig");
 const nostr_config = @import("nostr_config.zig");
 const nostr_mod = @import("nostr.zig");
@@ -65,6 +66,8 @@ const ManagedTransfer = struct {
     info_hash: [20]u8,
     route: api.Route,
     want_nostr: bool,
+    /// True for torrents we created and seed (vs. ones we download).
+    is_seed: bool,
     /// Tracker availability captured at add time (from the initial metainfo), so
     /// snapshots needn't read the session's `meta` across threads — which the
     /// magnet path replaces on metadata completion.
@@ -164,14 +167,80 @@ pub const Manager = struct {
 
         std.fs.cwd().makePath(self.cfg.download_dir) catch {};
 
-        var built = self.buildSession(source, resolved_proxy) catch |err| {
+        const built = self.buildSession(source, resolved_proxy) catch |err| {
             if (socks_owned) |s| self.allocator.free(s);
             return err;
         };
+        const magnet = if (std.mem.startsWith(u8, source, "magnet:")) source else "";
+        return self.register(built, route, resolved_proxy, socks_owned, want_nostr, false, magnet);
+    }
 
-        // Once `mt` owns session/meta/socks/strings, all later errors must clean
-        // up through `mt.destroy()` only — never the pre-ownership errdefers, or
-        // we'd double-free. `mt_owned` gates exactly that handoff.
+    /// Create a torrent from a local file (or archive) and start seeding it. The
+    /// file is hashed in-process — carl needs no external torrent tool. With
+    /// `want_nostr`, a NIP-35 torrent event is published so it's discoverable.
+    pub fn addSeed(self: *Manager, path: []const u8, route: api.Route, want_nostr: bool) Error![]u8 {
+        var socks_owned: ?[]u8 = null;
+        var resolved_proxy: ?proxy_mod.Proxy = null;
+        if (route != .direct) {
+            const dup = try self.allocator.dupe(u8, self.cfg.socks);
+            socks_owned = dup;
+            resolved_proxy = proxy_mod.parseUrl(dup) catch {
+                self.allocator.free(dup);
+                return error.BadProxy;
+            };
+        }
+
+        const mi = metainfo.createSingleFile(self.allocator, path, metainfo.default_piece_length) catch |e| {
+            if (socks_owned) |s| self.allocator.free(s);
+            return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.InvalidTorrent,
+            };
+        };
+        // Seed from the file's own directory so storage resolves it by name.
+        const data_dir = std.fs.path.dirname(path) orelse ".";
+        const session = self.allocator.create(session_mod.Session) catch {
+            if (socks_owned) |s| self.allocator.free(s);
+            mi.deinit(self.allocator);
+            return error.OutOfMemory;
+        };
+        session.* = session_mod.Session.init(self.allocator, mi, data_dir, .seed, self.cfg.listen_port, resolved_proxy, .any, false) catch {
+            if (socks_owned) |s| self.allocator.free(s);
+            self.allocator.destroy(session);
+            mi.deinit(self.allocator);
+            return error.SessionInitFailed;
+        };
+        const built = Built{ .session = session, .meta = mi, .info_hash = session.info_hash, .name = mi.name };
+
+        var hex: [40]u8 = undefined;
+        secp.toHex(&session.info_hash, &hex);
+        const magnet = std.fmt.allocPrint(self.allocator, "magnet:?xt=urn:btih:{s}&dn={s}", .{ hex, mi.name }) catch {
+            if (socks_owned) |s| self.allocator.free(s);
+            session.deinit();
+            self.allocator.destroy(session);
+            mi.deinit(self.allocator);
+            return error.OutOfMemory;
+        };
+        defer self.allocator.free(magnet);
+
+        return self.register(built, route, resolved_proxy, socks_owned, want_nostr, true, magnet);
+    }
+
+    /// Register a built session as a managed transfer and spawn its thread.
+    /// Shared by addTransfer (download) and addSeed (seed). On success takes
+    /// ownership of `built.session`, `built.meta`, and `socks_owned`; on any
+    /// error it frees them (the `mt_owned` flag gates that handoff so we never
+    /// double-free once `mt` owns everything).
+    fn register(
+        self: *Manager,
+        built: Built,
+        route: api.Route,
+        resolved_proxy: ?proxy_mod.Proxy,
+        socks_owned: ?[]u8,
+        want_nostr: bool,
+        is_seed: bool,
+        magnet_src: []const u8,
+    ) Error![]u8 {
         var mt_owned = false;
         errdefer if (!mt_owned) {
             built.session.deinit();
@@ -192,7 +261,7 @@ pub const Manager = struct {
         errdefer if (!mt_owned) self.allocator.free(id);
         const name = try self.allocator.dupe(u8, built.name);
         errdefer if (!mt_owned) self.allocator.free(name);
-        const magnet = try self.allocator.dupe(u8, if (std.mem.startsWith(u8, source, "magnet:")) source else "");
+        const magnet = try self.allocator.dupe(u8, magnet_src);
         errdefer if (!mt_owned) self.allocator.free(magnet);
 
         mt.* = .{
@@ -204,6 +273,7 @@ pub const Manager = struct {
             .info_hash = built.info_hash,
             .route = route,
             .want_nostr = want_nostr,
+            .is_seed = is_seed,
             .has_tracker = built.meta.announce.len > 0 or built.meta.announce_list != null,
             .has_http_tracker = std.mem.startsWith(u8, built.meta.announce, "http"),
             .socks_owned = socks_owned,
@@ -325,6 +395,14 @@ pub const Manager = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.cfg.route = route;
+    }
+
+    /// A locked copy of the current download dir (for callers that need to build
+    /// a path without racing `setDownloadDir`).
+    pub fn downloadDirDup(self: *Manager, a: Allocator) Allocator.Error![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return a.dupe(u8, self.cfg.download_dir);
     }
 
     /// Change the directory new transfers download into. Existing transfers keep
@@ -603,10 +681,36 @@ pub fn formatEta(buf: []u8, status: api.Status, remaining_bytes: u64, rate_bps: 
 // ---------------------------------------------------------------------------
 
 fn runThread(mt: *ManagedTransfer) void {
-    if (mt.want_nostr) collectNostrPeers(mt);
+    if (mt.want_nostr) {
+        if (mt.is_seed) publishSeedNostr(mt) else collectNostrPeers(mt);
+    }
     mt.session.run() catch |err| {
         log.err("transfer {s}: session error: {}", .{ mt.id, err });
     };
+}
+
+/// Publish a NIP-35 (kind-2003) torrent event for a seed so it's discoverable
+/// in Discover. Best-effort. The peer-announce (which needs a routable endpoint
+/// or an onion) is left to the CLI's `carl seed` for now; the torrent metadata
+/// event needs no reachable address and is enough to surface the torrent.
+fn publishSeedNostr(mt: *ManagedTransfer) void {
+    const a = mt.allocator;
+    const sk = nostr_config.readSecretKey(a) catch return; // no key → skip
+    const pk = secp.publicKeyFromSecret(sk) catch return;
+    var ev = nip35.buildFromMetainfo(a, sk, pk, mt.meta, mt.info_hash, "") catch return;
+    defer ev.deinit(a);
+
+    const relay_urls = nostr_config.readRelays(a) catch return;
+    defer nostr_config.freeRelays(a, relay_urls);
+
+    var acks: usize = 0;
+    for (relay_urls) |url| {
+        if (!mt.session.running) return;
+        var r = relay_mod.Relay.connect(a, url, mt.proxy) catch continue;
+        defer r.deinit();
+        if (relay_mod.publishAndWait(a, &r, ev, 5_000)) acks += 1;
+    }
+    if (acks > 0) log.info("seed {s}: published NIP-35 torrent event to {d} relay(s)", .{ mt.id, acks });
 }
 
 /// Pull peer-announce (kind-30078) endpoints for this info-hash off the

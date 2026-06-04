@@ -85,6 +85,23 @@ Adds and starts a transfer. Returns `{ "id": "t<N>" }`. `400` on a bad source.
 
 Stops and removes a transfer. `204` on success, `404` if unknown.
 
+### `POST /api/seeds`
+
+Create a torrent from a file and start seeding it. The request **body is the
+raw file content** (so a browser drag-drop or the Tauri shell can upload
+directly); metadata rides in headers:
+
+- `X-Carl-Filename` (required) — the file name (basename only; path components
+  are stripped).
+- `X-Carl-Route` — `direct|proxy|tor` (default `tor`).
+- `X-Carl-Nostr` — `true|false`; when true, publishes a NIP-35 torrent event so
+  it's discoverable.
+
+The daemon writes the file into the download dir, hashes it into a torrent
+in-process (no external tool), and seeds it. Returns `{ "id": "t<N>" }`. Bodies
+are capped at 256 MiB. (The peer-announce for a clearnet/onion endpoint is still
+the CLI's `carl seed` job; this publishes the discoverable torrent metadata.)
+
 ### `POST /api/search`
 
 Body `{ "query": "<text>" }` (or `?q=<text>`). Searches configured Nostr relays
