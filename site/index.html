@@ -73,6 +73,9 @@ body::before{ content:""; position:fixed; inset:0; z-index:0; pointer-events:non
 .install{ white-space:nowrap; }
 .install .prompt{ color:var(--accent-dim); }
 .install .cmd{ color:var(--fg); }
+.install .ai-tag{ display:inline-flex; align-items:center; gap:5px; flex:0 0 auto; font-size:11px; white-space:nowrap;
+  color:var(--accent-dim); background:var(--accent-soft); border:1px solid var(--accent-border); padding:3px 9px; border-radius:20px; }
+.install .ai-tag svg{ flex:0 0 auto; }
 .install .copy{ display:inline-flex; align-items:center; gap:6px; padding:6px 10px; border-radius:6px; white-space:nowrap;
   background:var(--bg-2); border:1px solid var(--border-soft); color:var(--fg-dim); font-size:11.5px; cursor:pointer; transition:.12s; }
 .install .copy:hover{ background:var(--bg-3); color:var(--fg); }
@@ -244,7 +247,8 @@ body::before{ content:""; position:fixed; inset:0; z-index:0; pointer-events:non
   <p class="hero-sub">carl is a lightweight BitTorrent client with Nostr-based discovery and first-class Tor anonymity. The polish of a modern desktop app — built for people who actually care about privacy.</p>
   <div class="hero-cta">
     <div class="install">
-      <span><span class="prompt">$</span> <span class="cmd">brew install carl</span></span>
+      <span class="ai-tag"><svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l1.9 6.3L20 10l-6.1 1.7L12 18l-1.9-6.3L4 10l6.1-1.7z"/></svg> paste into any AI</span>
+      <span class="cmd">Install carl from github.com/vincenzopalazzo/carl</span>
       <button class="copy" id="copyInstall">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 9h9v11H9zM6 15H4V4h11v2"/></svg>
         <span class="lbl">copy</span>
@@ -413,7 +417,8 @@ body::before{ content:""; position:fixed; inset:0; z-index:0; pointer-events:non
     <p>Free software. No accounts, no telemetry, no compromises.</p>
     <div class="hero-cta" style="margin-top:30px;">
       <div class="install">
-        <span><span class="prompt">$</span> <span class="cmd">brew install carl</span></span>
+        <span class="ai-tag"><svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l1.9 6.3L20 10l-6.1 1.7L12 18l-1.9-6.3L4 10l6.1-1.7z"/></svg> paste into any AI</span>
+        <span class="cmd">Install carl from github.com/vincenzopalazzo/carl</span>
         <button class="copy" id="copyInstall2">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 9h9v11H9zM6 15H4V4h11v2"/></svg>
           <span class="lbl">copy</span>
@@ -470,7 +475,7 @@ body::before{ content:""; position:fixed; inset:0; z-index:0; pointer-events:non
 function wireCopy(id){
   var b=document.getElementById(id); if(!b) return;
   b.addEventListener('click',function(){
-    try{ navigator.clipboard.writeText('brew install carl'); }catch(e){}
+    try{ navigator.clipboard.writeText('Install carl, a privacy-first BitTorrent client written in Zig, from https://github.com/vincenzopalazzo/carl on my machine: clone the repo, build it with `zig build` (Zig 0.15.x), and put the resulting binary on my PATH. Then show me how to add a magnet link.'); }catch(e){}
     b.classList.add('done'); b.querySelector('.lbl').textContent='copied';
     setTimeout(function(){ b.classList.remove('done'); b.querySelector('.lbl').textContent='copy'; },1400);
   });
