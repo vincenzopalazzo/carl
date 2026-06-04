@@ -154,6 +154,27 @@ pub fn freeRelays(allocator: Allocator, relays: [][]const u8) void {
     allocator.free(relays);
 }
 
+/// Overwrite `<config>/relays` with `relays` (one per line). Blank entries are
+/// skipped. Used by the daemon's settings endpoint so edits from the GUI
+/// persist and are visible to search, peer-announce, and the CLI.
+pub fn writeRelays(allocator: Allocator, relays: []const []const u8) !void {
+    const dir = try ensureConfigDir(allocator);
+    defer allocator.free(dir);
+
+    const path = try std.fmt.allocPrint(allocator, "{s}/relays", .{dir});
+    defer allocator.free(path);
+
+    var file = try std.fs.cwd().createFile(path, .{ .truncate = true, .mode = 0o600 });
+    defer file.close();
+
+    for (relays) |r| {
+        const t = std.mem.trim(u8, r, " \t\r\n");
+        if (t.len == 0) continue;
+        try file.writeAll(t);
+        try file.writeAll("\n");
+    }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================

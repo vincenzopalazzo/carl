@@ -402,8 +402,26 @@ const Conn = struct {
         const parsed = std.json.parseFromSlice(std.json.Value, aa, body, .{}) catch
             return self.sendStatus(.bad_request);
         if (parsed.value == .object) {
-            if (strField(parsed.value.object, "route")) |r| {
+            const obj = parsed.value.object;
+            if (strField(obj, "route")) |r| {
                 if (api.Route.parse(r)) |rt| self.daemon.manager.setRoute(rt);
+            }
+            if (strField(obj, "downloadDir")) |dir| {
+                if (dir.len > 0) self.daemon.manager.setDownloadDir(dir) catch {};
+            }
+            // Relays: a JSON array of strings, persisted to the config file so
+            // the prober, search, and the CLI all pick them up.
+            if (obj.get("relays")) |v| {
+                if (v == .array) {
+                    var list: std.ArrayList([]const u8) = .empty;
+                    for (v.array.items) |item| {
+                        if (item == .string) {
+                            const t = std.mem.trim(u8, item.string, " \t\r\n");
+                            if (t.len > 0) try list.append(aa, t);
+                        }
+                    }
+                    nostr_config.writeRelays(a, list.items) catch {};
+                }
             }
         }
         // Echo the (possibly updated) settings back.
@@ -627,7 +645,9 @@ fn percentDecode(arena: Allocator, s: []const u8) ![]u8 {
 // ===========================================================================
 
 fn runSearch(arena: Allocator, daemon: *Daemon, query: []const u8) ![]u8 {
-    const relay_urls = try nostr_config.readRelays(arena);
+    // Use the prober's health view: skip relays already known unreachable so a
+    // dead relay's connect timeout doesn't stall the whole search.
+    const health = daemon.healthSnapshot(arena) catch &.{};
 
     // Match the route the manager is configured for, so search over Tor/proxy
     // doesn't leak the real IP.
@@ -645,12 +665,14 @@ fn runSearch(arena: Allocator, daemon: *Daemon, query: []const u8) ![]u8 {
     var seen: std.ArrayList([40]u8) = .empty;
     const now = std.time.timestamp();
 
-    for (relay_urls) |url| {
+    for (health) |relay| {
         if (results.items.len >= 50) break;
+        if (std.mem.eql(u8, relay.state, "unreachable")) continue;
+        const url = relay.url;
         var r = relay_mod.Relay.connect(arena, url, proxy) catch continue;
         defer r.deinit();
         const events = relay_mod.subscribeAndCollect(arena, &r, filter, .{
-            .timeout_ms = 12_000,
+            .timeout_ms = 7_000,
             .max_events = 200,
             .verify_signatures = true,
         }) catch continue;

@@ -93,9 +93,17 @@ Returns `[DiscoverResult]`. Routed through the proxy when the route isn't direct
 
 ### `POST /api/settings`
 
-Body may contain `{ "route": "direct|proxy|tor" }`. Updates the default route
-for new transfers; echoes back the full `Settings`. (Other fields are read-only
-in this increment.)
+Body may contain any subset of:
+
+- `"route": "direct|proxy|tor"` — default route for new transfers.
+- `"downloadDir": "<path>"` — where new transfers download (created if needed;
+  existing transfers keep their directory).
+- `"relays": ["wss://…", "ws://…onion"]` — replaces the relay list, persisted to
+  the carl config so search, peer-announce, and the CLI all use it. The
+  background prober picks up the change on its next cycle.
+
+Echoes back the full `Settings`. `listenPort` / `maxActive` / `peerLimit` remain
+read-only in this increment.
 
 ## WebSocket — `GET /ws?token=<token>`
 

@@ -327,6 +327,17 @@ pub const Manager = struct {
         self.cfg.route = route;
     }
 
+    /// Change the directory new transfers download into. Existing transfers keep
+    /// their original directory; this affects subsequently added ones.
+    pub fn setDownloadDir(self: *Manager, dir: []const u8) Allocator.Error!void {
+        const dup = try self.allocator.dupe(u8, dir);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.allocator.free(self.cfg.download_dir);
+        self.cfg.download_dir = dup;
+        std.fs.cwd().makePath(dup) catch {};
+    }
+
     // -----------------------------------------------------------------------
     // Session construction
     // -----------------------------------------------------------------------
