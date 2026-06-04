@@ -124,6 +124,10 @@ pub const Conn = struct {
 
     const tls_io_buf_len = tls.max_ciphertext_record_len;
 
+    /// SO_RCVTIMEO (seconds) for the proxied-TLS path: bounds the handshake and
+    /// every read so an unresponsive relay fails instead of hanging.
+    const tls_proxy_handshake_secs: u32 = 20;
+
     const TlsProxyIo = struct {
         stream: std.net.Stream,
         socket_reader: std.net.Stream.Reader,
@@ -157,9 +161,30 @@ pub const Conn = struct {
         }
 
         if (url.secure) {
-            if (options.proxy != null) {
-                log.warn("wss over proxy is not supported; use relay.connect or clearnet", .{});
-                return error.ConnectFailed;
+            // wss:// through the proxy: tunnel TCP via SOCKS, then run TLS on top
+            // of the proxied stream so the proxy only sees ciphertext. The relay
+            // never learns our IP -- the whole connection rides the proxy/Tor.
+            if (options.proxy) |px| {
+                const stream = proxy_mod.connectThroughProxyHost(allocator, px, url.host, url.port) catch |err| {
+                    log.warn("wss proxy tunnel to {s}:{d} failed: {}", .{ url.host, url.port, err });
+                    return error.ConnectFailed;
+                };
+                var conn = Conn{
+                    .allocator = allocator,
+                    .stream = stream,
+                    .fragment_buf = .empty,
+                    .fragment_opcode = null,
+                };
+                conn.tls_proxy = connectTlsOverProxy(allocator, stream, url.host) catch |err| {
+                    // connectTlsOverProxy already closed `stream` on failure.
+                    conn.fragment_buf.deinit(allocator);
+                    log.warn("tls over proxy to {s}:{d} failed: {}", .{ url.host, url.port, err });
+                    return err;
+                };
+                conn.stream = conn.tls_proxy.?.stream;
+                errdefer conn.deinit();
+                try conn.performHandshake(url);
+                return conn;
             }
             const client = try allocator.create(std.http.Client);
             client.* = .{ .allocator = allocator };
@@ -198,10 +223,20 @@ pub const Conn = struct {
             return conn;
         }
 
-        const stream = tcpConnect(allocator, url.host, url.port) catch |err| {
-            log.warn("tcp connect to {s}:{d} failed: {}", .{ url.host, url.port, err });
-            return error.ConnectFailed;
-        };
+        // `ws://` (no TLS). Through a proxy this is how we reach a relay's
+        // `.onion` address: the SOCKS tunnel (Tor) provides the encryption and
+        // authenticates the address, so the plaintext WebSocket rides safely on
+        // top -- no redundant TLS layer needed.
+        const stream = if (options.proxy) |px|
+            proxy_mod.connectThroughProxyHost(allocator, px, url.host, url.port) catch |err| {
+                log.warn("ws proxy tunnel to {s}:{d} failed: {}", .{ url.host, url.port, err });
+                return error.ConnectFailed;
+            }
+        else
+            tcpConnect(allocator, url.host, url.port) catch |err| {
+                log.warn("tcp connect to {s}:{d} failed: {}", .{ url.host, url.port, err });
+                return error.ConnectFailed;
+            };
 
         var conn = Conn{
             .allocator = allocator,
@@ -212,9 +247,55 @@ pub const Conn = struct {
         };
         errdefer conn.deinit();
 
-        try conn.performHandshake(url);
+        // Set the recv timeout before the handshake so a silent onion relay
+        // can't hang us (the proxy dial leaves its own timeout, but be explicit).
         setRecvTimeout(conn.stream, 30);
+        try conn.performHandshake(url);
         return conn;
+    }
+
+    /// Run a TLS client handshake over an already-proxied `stream` and return a
+    /// heap-allocated `TlsProxyIo` that owns it (same TLS-over-a-raw-stream
+    /// mechanism as proxy.httpsExchange; the buffers + reader/writer live inside
+    /// the returned struct, which is heap-stable so TLS's pointers stay valid).
+    /// On any error the stream is closed and nothing leaks.
+    fn connectTlsOverProxy(allocator: Allocator, stream: std.net.Stream, host: []const u8) Error!*TlsProxyIo {
+        var owned = false;
+        defer if (!owned) stream.close();
+
+        const tp = allocator.create(TlsProxyIo) catch return error.OutOfMemory;
+        errdefer allocator.destroy(tp);
+
+        tp.stream = stream;
+        // Disable Nagle: the WS upgrade + REQ are tiny, and Nagle/delayed-ACK
+        // can otherwise hold a small response (the 101) for a long stall.
+        setTcpNoDelay(stream);
+        tp.socket_reader = stream.reader(&tp.socket_read_buf);
+        tp.socket_writer = stream.writer(&tp.socket_write_buf);
+
+        // A `.onion` host is cryptographically authenticated by Tor itself and
+        // cannot hold a CA-issued certificate, so skip CA verification there
+        // (the TLS is only for the channel). A clearnet wss relay is verified
+        // against the system CA bundle as usual.
+        const onion = std.mem.endsWith(u8, host, ".onion");
+        tp.ca_bundle = .{};
+        if (!onion) tp.ca_bundle.rescan(allocator) catch return error.TlsInitFailed;
+        errdefer tp.ca_bundle.deinit(allocator);
+
+        // SO_RCVTIMEO bounds the handshake and every later read so an
+        // unresponsive relay fails instead of hanging. std's File.Reader turns a
+        // read timeout into an error, which for our request/response +
+        // subscribe-until-timeout relay usage simply ends the op -- the intent.
+        setRecvTimeout(stream, tls_proxy_handshake_secs);
+        tp.tls = tls.Client.init(tp.socket_reader.interface(), &tp.socket_writer.interface, .{
+            .host = if (onion) .no_verification else .{ .explicit = host },
+            .ca = if (onion) .no_verification else .{ .bundle = tp.ca_bundle },
+            .write_buffer = &tp.tls_write_buf,
+            .read_buffer = &tp.tls_read_buf,
+        }) catch return error.TlsInitFailed;
+
+        owned = true; // tp now owns `stream`; TlsProxyIo.deinit closes it
+        return tp;
     }
 
     pub fn deinit(self: *Conn) void {
@@ -576,7 +657,21 @@ pub const Conn = struct {
             return r.readSliceShort(buf) catch return error.RecvFailed;
         }
         if (self.tls_proxy) |t| {
-            return t.tls.reader.readSliceShort(buf) catch return error.RecvFailed;
+            // readSliceShort() fills the whole buffer -- it loops until `buf` is
+            // full or EOF -- so it deadlocks reading a kept-alive HTTP/WS
+            // response that never reaches EOF (e.g. the 101 upgrade headers).
+            // fill(1) instead reads TLS records (transparently consuming
+            // post-handshake session tickets) until at least one application
+            // byte is available, then we hand back whatever is buffered.
+            t.tls.reader.fill(1) catch |err| switch (err) {
+                error.EndOfStream => return 0,
+                else => return error.RecvFailed,
+            };
+            const avail = t.tls.reader.buffered();
+            const k = @min(avail.len, buf.len);
+            @memcpy(buf[0..k], avail[0..k]);
+            t.tls.reader.toss(k);
+            return k;
         }
         const n = posix.recv(self.stream.handle, buf, 0) catch |err| switch (err) {
             error.WouldBlock => return error.Timeout,
@@ -594,6 +689,11 @@ pub const Conn = struct {
         }
     }
 };
+
+fn setTcpNoDelay(stream: std.net.Stream) void {
+    const one: c_int = 1;
+    posix.setsockopt(stream.handle, posix.IPPROTO.TCP, posix.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
+}
 
 fn setRecvTimeout(stream: std.net.Stream, sec: u32) void {
     const tv: posix.timeval = .{ .sec = @intCast(sec), .usec = 0 };
