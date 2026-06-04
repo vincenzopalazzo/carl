@@ -30,11 +30,21 @@ const log = std.log.scoped(.daemon);
 /// How often the WebSocket pushes a fresh state snapshot.
 const push_interval_ns: u64 = std.time.ns_per_s;
 
+/// Cap on concurrent connections, so a misbehaving client can't spawn unbounded
+/// threads. A single GUI uses ~2 (one REST poll + one WebSocket); the headroom
+/// covers bursts.
+const max_conns: u32 = 64;
+
+/// Recv timeout (seconds) on accepted sockets, so a client that connects and
+/// then stalls (or lies about Content-Length) can't wedge a thread forever.
+const recv_timeout_secs: u32 = 30;
+
 pub const Daemon = struct {
     allocator: Allocator,
     manager: *manager_mod.Manager,
     token: []const u8,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+    conns: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     /// Bind to 127.0.0.1:`port` and serve until `running` is cleared. Blocking.
     pub fn serve(self: *Daemon, port: u16) !void {
@@ -54,12 +64,23 @@ pub const Daemon = struct {
             const conn = server.accept() catch {
                 continue;
             };
+
+            // Shed load past the cap rather than spawning unbounded threads.
+            if (self.conns.fetchAdd(1, .monotonic) >= max_conns) {
+                _ = self.conns.fetchSub(1, .monotonic);
+                conn.stream.close();
+                continue;
+            }
+            setRecvTimeout(conn.stream, recv_timeout_secs);
+
             const ctx = self.allocator.create(Conn) catch {
+                _ = self.conns.fetchSub(1, .monotonic);
                 conn.stream.close();
                 continue;
             };
             ctx.* = .{ .daemon = self, .stream = conn.stream };
             const t = std.Thread.spawn(.{}, Conn.run, .{ctx}) catch {
+                _ = self.conns.fetchSub(1, .monotonic);
                 conn.stream.close();
                 self.allocator.destroy(ctx);
                 continue;
@@ -80,6 +101,7 @@ const Conn = struct {
     fn run(self: *Conn) void {
         const a = self.daemon.allocator;
         defer {
+            _ = self.daemon.conns.fetchSub(1, .monotonic);
             self.stream.close();
             a.destroy(self);
         }
@@ -157,10 +179,10 @@ const Conn = struct {
     fn tokenOk(self: *Conn, req: *const http.Request) bool {
         const expected = self.daemon.token;
         if (req.header("x-carl-token")) |h| {
-            if (std.mem.eql(u8, h, expected)) return true;
+            if (constantTimeEql(h, expected)) return true;
         }
         if (req.queryParam("token")) |q| {
-            if (std.mem.eql(u8, q, expected)) return true;
+            if (constantTimeEql(q, expected)) return true;
         }
         return false;
     }
@@ -171,7 +193,10 @@ const Conn = struct {
         const a = self.daemon.allocator;
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
-        const json = try buildStateJson(arena.allocator(), self.daemon);
+        const aa = arena.allocator();
+        const relay_urls = try nostr_config.readRelays(aa);
+        const npub = try readNpub(aa);
+        const json = try buildStateJson(aa, self.daemon, relay_urls, npub);
         try self.sendJson(.ok, json);
     }
 
@@ -286,8 +311,8 @@ const Conn = struct {
         defer arena.deinit();
         const aa = arena.allocator();
 
-        // Query from JSON body {"query": "..."} or ?q= fallback.
-        var query: []const u8 = req.queryParam("q") orelse "";
+        // Query from JSON body {"query": "..."} or ?q= fallback (percent-decoded).
+        var query: []const u8 = if (req.queryParam("q")) |q| (percentDecode(aa, q) catch q) else "";
         if (body.len > 0) {
             if (std.json.parseFromSlice(std.json.Value, aa, body, .{})) |p| {
                 if (p.value == .object) {
@@ -320,13 +345,21 @@ const Conn = struct {
             "Sec-WebSocket-Accept: {s}\r\n\r\n", .{accept}) catch return;
         self.sendAll(upgrade) catch return;
 
+        // Read identity + relay config once for the lifetime of the connection
+        // (a connection-scoped arena), so the per-tick push doesn't hit the
+        // filesystem every second. Transfers/seeds are still read live per tick.
+        var conn_arena = std.heap.ArenaAllocator.init(a);
+        defer conn_arena.deinit();
+        const relay_urls: []const []const u8 = nostr_config.readRelays(conn_arena.allocator()) catch &.{};
+        const npub: []const u8 = readNpub(conn_arena.allocator()) catch "";
+
         // Push a fresh snapshot every interval until the client closes (send
         // fails) or the daemon stops. We don't read client frames — a localhost
         // GUI only needs the push channel — so a closed socket is detected by
         // the next send failing.
         while (self.daemon.running.load(.acquire) and !session_mod.shutdown_requested.load(.acquire)) {
             var arena = std.heap.ArenaAllocator.init(a);
-            const json = buildStateJson(arena.allocator(), self.daemon) catch {
+            const json = buildStateJson(arena.allocator(), self.daemon, relay_urls, npub) catch {
                 arena.deinit();
                 break;
             };
@@ -377,12 +410,14 @@ const Conn = struct {
 // ===========================================================================
 
 /// The combined initial-load payload and the per-tick WebSocket push.
-fn buildStateJson(arena: Allocator, daemon: *Daemon) ![]u8 {
+///
+/// `relay_urls` and `npub` are passed in (read from config by the caller)
+/// rather than read here, so the WebSocket push can read them once per
+/// connection instead of hitting the filesystem on every tick. Transfers and
+/// seeds are always read live from the manager.
+fn buildStateJson(arena: Allocator, daemon: *Daemon, relay_urls: []const []const u8, npub: []const u8) ![]u8 {
     const transfers = try daemon.manager.snapshot(arena);
     const seeds = try daemon.manager.seeds(arena);
-    const relays = try readRelayStates(arena);
-    const settings_relays = try nostr_config.readRelays(arena);
-    const npub = try readNpub(arena);
 
     var j = api.Json.init(arena);
     try j.beginObject();
@@ -396,12 +431,12 @@ fn buildStateJson(arena: Allocator, daemon: *Daemon) ![]u8 {
     try j.endArray();
     try j.key("relays");
     try j.beginArray();
-    for (relays) |r| try api.writeRelay(&j, r);
+    for (relay_urls) |url| try api.writeRelay(&j, .{ .url = url, .state = "configured", .net = relayNet(url), .events = 0 });
     try j.endArray();
     try j.key("identity");
     try api.writeIdentity(&j, .{ .npub = npub });
     try j.key("settings");
-    try api.writeSettings(&j, daemon.manager.settings(settings_relays));
+    try api.writeSettings(&j, daemon.manager.settings(relay_urls));
     try j.endObject();
     return j.buf.items;
 }
@@ -432,6 +467,54 @@ fn readNpub(arena: Allocator) ![]const u8 {
 fn strField(obj: std.json.ObjectMap, name: []const u8) ?[]const u8 {
     const v = obj.get(name) orelse return null;
     return if (v == .string) v.string else null;
+}
+
+/// Set a recv timeout on an accepted socket so a stalled client can't wedge its
+/// thread forever. Best-effort (a failed setsockopt just leaves the default).
+fn setRecvTimeout(stream: std.net.Stream, secs: u32) void {
+    const tv = posix.timeval{ .sec = @intCast(secs), .usec = 0 };
+    posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+}
+
+/// Length-checked, content-constant-time slice equality for the auth token.
+/// (The token length is not secret, so an early length mismatch is fine.)
+fn constantTimeEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    var diff: u8 = 0;
+    for (a, b) |x, y| diff |= x ^ y;
+    return diff == 0;
+}
+
+fn hexDigit(c: u8) ?u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => null,
+    };
+}
+
+/// Percent-decode a query-string value (`%XX` escapes, `+` → space). Caller
+/// owns the result.
+fn percentDecode(arena: Allocator, s: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(arena);
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
+        if (c == '%' and i + 2 < s.len) {
+            if (hexDigit(s[i + 1])) |hi| {
+                if (hexDigit(s[i + 2])) |lo| {
+                    try out.append(arena, (hi << 4) | lo);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        try out.append(arena, if (c == '+') ' ' else c);
+        i += 1;
+    }
+    return out.toOwnedSlice(arena);
 }
 
 // ===========================================================================
@@ -578,7 +661,8 @@ test "buildStateJson: produces the five top-level keys" {
 
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    const json = try buildStateJson(arena.allocator(), &d);
+    const relays = [_][]const u8{ "wss://relay.damus.io", "ws://abc.onion" };
+    const json = try buildStateJson(arena.allocator(), &d, &relays, "npub1test");
 
     var p = try std.json.parseFromSlice(std.json.Value, arena.allocator(), json, .{});
     defer p.deinit();
@@ -589,4 +673,28 @@ test "buildStateJson: produces the five top-level keys" {
     try testing.expect(o.get("identity").? == .object);
     try testing.expect(o.get("settings").? == .object);
     try testing.expectEqual(@as(usize, 0), o.get("transfers").?.array.items.len);
+    try testing.expectEqual(@as(usize, 2), o.get("relays").?.array.items.len);
+    try testing.expectEqualStrings("tor", o.get("relays").?.array.items[1].object.get("net").?.string);
+    try testing.expectEqualStrings("npub1test", o.get("identity").?.object.get("npub").?.string);
+}
+
+test "constantTimeEql" {
+    try testing.expect(constantTimeEql("abc123", "abc123"));
+    try testing.expect(!constantTimeEql("abc123", "abc124"));
+    try testing.expect(!constantTimeEql("abc", "abcd")); // length mismatch
+    try testing.expect(constantTimeEql("", ""));
+}
+
+test "percentDecode: escapes and plus" {
+    const a = testing.allocator;
+    const r1 = try percentDecode(a, "big%20buck+bunny");
+    defer a.free(r1);
+    try testing.expectEqualStrings("big buck bunny", r1);
+    // Trailing/invalid escapes are passed through literally.
+    const r2 = try percentDecode(a, "100%");
+    defer a.free(r2);
+    try testing.expectEqualStrings("100%", r2);
+    const r3 = try percentDecode(a, "%zz");
+    defer a.free(r3);
+    try testing.expectEqualStrings("%zz", r3);
 }

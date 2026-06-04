@@ -360,6 +360,9 @@ pub const Manager = struct {
     }
 
     fn fromMetainfo(self: *Manager, mi: metainfo.Metainfo, proxy: ?proxy_mod.Proxy) Error!Built {
+        // On a failed Session.init the metainfo is ours to free (it only becomes
+        // the session's on success); mirrors the magnet path's errdefer.
+        errdefer mi.deinit(self.allocator);
         const session = self.allocator.create(session_mod.Session) catch return error.OutOfMemory;
         errdefer self.allocator.destroy(session);
         session.* = session_mod.Session.init(self.allocator, mi, self.cfg.download_dir, .download, self.cfg.listen_port, proxy, .any, false) catch {
