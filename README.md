@@ -169,6 +169,29 @@ real IP is not leaked to trackers.
 Full details (proxy split, security, E2E test, troubleshooting):
 [docs/tor-hidden-service.md](docs/tor-hidden-service.md).
 
+#### Keeping relay traffic off clearnet
+
+With `--proxy`, relay connections are tunneled too, so the relay never learns
+your real IP:
+
+- `wss://` relays run cert-verified TLS on top of the proxied stream -- the
+  proxy only ever sees ciphertext. Works with public relays over Tor.
+- `ws://` relays (e.g. a relay's `.onion` address) ride the SOCKS tunnel
+  directly; Tor secures the plaintext WebSocket. CA verification is skipped for
+  `.onion` hosts since Tor authenticates the address.
+
+```sh
+# Public wss relay, fully over Tor:
+carl search "ubuntu" --relay wss://nos.lol --proxy socks5h://127.0.0.1:9050
+
+# Onion relay (clearnet never touched at all):
+carl search "ubuntu" --relay ws://<relay-v3-address>.onion \
+    --proxy socks5h://127.0.0.1:9050
+```
+
+Relays default to `~/.config/carl/relays` (one URL per line) when not passed
+explicitly. See [issue #30](https://github.com/vincenzopalazzo/carl/issues/30).
+
 ### Download using Nostr peer-discovery
 
 ```sh

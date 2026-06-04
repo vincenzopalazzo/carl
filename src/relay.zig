@@ -29,13 +29,11 @@ pub const Relay = struct {
     conn: ws.Conn,
 
     pub fn connect(allocator: Allocator, url: []const u8, proxy: ?proxy_mod.Proxy) Error!Relay {
-        // `wss://` over SOCKS is not implemented yet; use clearnet for relays while
-        // `--proxy` still tunnels BitTorrent peer TCP (including `.onion` hosts).
-        const relay_proxy = effectiveRelayProxy(url, proxy);
-        if (proxy != null and relay_proxy == null) {
-            log.debug("relay {s}: clearnet wss (peer traffic still uses --proxy)", .{url});
-        }
-        const conn = ws.Conn.connect(allocator, url, .{ .proxy = relay_proxy }) catch |err| {
+        // Relay traffic is tunneled through `--proxy` so the relay never sees our
+        // real IP -- `ws://` rides the SOCKS tunnel directly (e.g. an onion
+        // relay; Tor secures it), `wss://` runs cert-verified TLS on top of the
+        // proxied stream (the proxy only ever sees ciphertext).
+        const conn = ws.Conn.connect(allocator, url, .{ .proxy = proxy }) catch |err| {
             log.warn("relay connect to {s} failed: {}", .{ url, err });
             return error.ConnectFailed;
         };
@@ -250,14 +248,6 @@ pub const default_relays: []const []const u8 = &.{
     "wss://relay.nostr.band",
 };
 
-/// Nostr relays are `wss://`; proxied WebSocket TLS is not supported yet.
-fn effectiveRelayProxy(url: []const u8, proxy: ?proxy_mod.Proxy) ?proxy_mod.Proxy {
-    if (proxy == null) return null;
-    if (std.mem.startsWith(u8, url, "wss://") or std.mem.startsWith(u8, url, "ws://"))
-        return null;
-    return proxy;
-}
-
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -268,12 +258,6 @@ fn effectiveRelayProxy(url: []const u8, proxy: ?proxy_mod.Proxy) ?proxy_mod.Prox
 test "default_relays is non-empty and all wss://" {
     try std.testing.expect(default_relays.len >= 1);
     for (default_relays) |r| try std.testing.expect(std.mem.startsWith(u8, r, "wss://"));
-}
-
-test "effectiveRelayProxy strips wss proxy" {
-    const px = proxy_mod.Proxy{ .scheme = .socks5h, .host = "127.0.0.1", .port = 9050 };
-    try std.testing.expect(effectiveRelayProxy("wss://nos.lol", px) == null);
-    try std.testing.expect(effectiveRelayProxy("http://tracker", px) != null);
 }
 
 test "SearchOptions defaults are sensible" {

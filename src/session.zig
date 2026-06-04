@@ -80,6 +80,18 @@ pub const Session = struct {
     metadata_download: ?extension.MetadataDownload,
     metadata_only: bool, // true when started from magnet link
 
+    /// When true, `download` keeps running as a seeder after the download
+    /// completes instead of exiting. Off by default: `download` should finish
+    /// and return; use `carl seed` (or `download --seed`) to keep seeding.
+    /// Defaulted so the init struct literal need not set it.
+    seed_after_complete: bool = false,
+
+    /// True once `onMetadataComplete` has replaced `meta` with a freshly
+    /// allocated, fully-owned Metainfo (magnet path). The original `meta` is
+    /// owned by the caller; this replacement is owned by the session and freed
+    /// in `deinit`. Defaulted so the init struct literal need not set it.
+    meta_owned: bool = false,
+
     // BEP 5 DHT
     dht_instance: ?dht_mod.Dht,
     dht_failed: bool,
@@ -222,6 +234,9 @@ pub const Session = struct {
         if (self.listener) |*l| l.deinit();
         self.our_bitfield.deinit(self.allocator);
         self.store.deinit();
+        // The magnet path replaces `meta` with a session-owned copy; free it.
+        // The original caller-owned `meta` is freed by the caller.
+        if (self.meta_owned) self.meta.deinit(self.allocator);
     }
 
     pub fn run(self: *Session) !void {
@@ -272,6 +287,16 @@ pub const Session = struct {
             if (self.mode == .download and !self.metadata_only and self.num_pieces > 0 and self.our_bitfield.isComplete()) {
                 stdout.print("\ndownload complete!\n", .{}) catch {};
                 self.doMultiTrackerAnnounce(.completed) catch {};
+
+                // By default `download` is done now -- stop the loop and let the
+                // process exit instead of lingering as a seeder forever (which,
+                // when proxied, can't even accept incoming peers). Opt back into
+                // seed-after-download with `--seed`.
+                if (!self.seed_after_complete) {
+                    self.running = false;
+                    break;
+                }
+
                 // Don't open an inbound listener when proxied (would leak our IP).
                 if (self.listener == null and self.proxy == null) {
                     const bind_ip: [4]u8 = switch (self.listen_bind) {
@@ -620,10 +645,11 @@ pub const Session = struct {
                     } else if (complete) {
                         log.info("all metadata pieces received, verifying...", .{});
                         if (md.assemble() catch null) |raw_info| {
+                            // onMetadataComplete dupes what it keeps, so the
+                            // assembled buffer is ours to free either way.
+                            defer self.allocator.free(raw_info);
                             log.info("metadata verified! parsing torrent info...", .{});
-                            self.onMetadataComplete(raw_info) catch {
-                                self.allocator.free(raw_info);
-                            };
+                            self.onMetadataComplete(raw_info) catch {};
                         } else {
                             log.warn("metadata hash mismatch, retrying...", .{});
                             // Reset and try again
@@ -687,6 +713,39 @@ pub const Session = struct {
         p.enqueueMessage(.{ .extended = payload }) catch {};
     }
 
+    /// Deep-copy a BEP-12 announce-list (tiers of tracker URLs). Returns null
+    /// for a null input. On failure, frees everything allocated so far.
+    fn dupeAnnounceList(
+        allocator: std.mem.Allocator,
+        src: ?[]const []const []const u8,
+    ) error{OutOfMemory}!?[]const []const []const u8 {
+        const tiers = src orelse return null;
+        const out = try allocator.alloc([]const []const u8, tiers.len);
+        var done: usize = 0;
+        errdefer {
+            for (out[0..done]) |tier| {
+                for (tier) |url| allocator.free(url);
+                allocator.free(tier);
+            }
+            allocator.free(out);
+        }
+        for (tiers, 0..) |tier, i| {
+            const out_tier = try allocator.alloc([]const u8, tier.len);
+            var filled: usize = 0;
+            errdefer {
+                for (out_tier[0..filled]) |url| allocator.free(url);
+                allocator.free(out_tier);
+            }
+            for (tier, 0..) |url, j| {
+                out_tier[j] = try allocator.dupe(u8, url);
+                filled = j + 1;
+            }
+            out[i] = out_tier;
+            done = i + 1;
+        }
+        return out;
+    }
+
     fn onMetadataComplete(self: *Session, raw_info: []const u8) !void {
         // Parse the info dict to build a Metainfo struct
         const info_val = bencode.decode(self.allocator, raw_info) catch return error.InvalidMetadata;
@@ -737,10 +796,28 @@ pub const Session = struct {
             return error.OutOfMemory;
         };
 
-        // Update session with the new metadata
+        // Dupe announce + announce_list so the replacement Metainfo owns every
+        // field. The original `meta` (and its announce/announce_list) stays
+        // owned by the caller; mixing the two would risk a double free.
+        const announce_dup = self.allocator.dupe(u8, self.meta.announce) catch {
+            self.allocator.free(name);
+            self.allocator.free(pieces);
+            self.allocator.free(raw_info_dup);
+            return error.OutOfMemory;
+        };
+        const announce_list_dup = dupeAnnounceList(self.allocator, self.meta.announce_list) catch {
+            self.allocator.free(name);
+            self.allocator.free(pieces);
+            self.allocator.free(raw_info_dup);
+            self.allocator.free(announce_dup);
+            return error.OutOfMemory;
+        };
+
+        // Update session with the new metadata. From here `meta` is fully owned
+        // by the session and freed in deinit (see `meta_owned`).
         self.meta = .{
-            .announce = self.meta.announce,
-            .announce_list = self.meta.announce_list,
+            .announce = announce_dup,
+            .announce_list = announce_list_dup,
             .name = name,
             .piece_length = piece_length,
             .pieces = pieces,
@@ -751,6 +828,7 @@ pub const Session = struct {
             .raw_info = raw_info_dup,
             .url_list = null,
         };
+        self.meta_owned = true;
 
         // Now initialize storage and piece tracking
         self.total_length = piece_mod.totalLength(self.meta.files);

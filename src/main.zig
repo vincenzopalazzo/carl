@@ -46,6 +46,10 @@ pub fn main() !void {
         // e.g. magnet:?xt=...&dn=... becomes multiple argv entries when unquoted.
         // Note: consumed fragments remain in args[3..] but are harmless —
         // parseFlag only matches "--output-dir" / "--port" which can't collide.
+        // `source` is either a borrowed argv slice (non-magnet) or an owned
+        // reassembled buffer (magnet split on '&' by the shell); only free the
+        // latter.
+        var source_owned = false;
         const source = blk: {
             if (!std.mem.startsWith(u8, args[2], "magnet:")) break :blk args[2];
             var parts: std.ArrayList(u8) = .empty;
@@ -56,12 +60,15 @@ pub fn main() !void {
                 parts.append(allocator, '&') catch @panic("OOM");
                 parts.appendSlice(allocator, a) catch @panic("OOM");
             }
+            source_owned = true;
             break :blk @as([]const u8, allocator.dupe(u8, parts.items) catch @panic("OOM"));
         };
+        defer if (source_owned) allocator.free(source);
         const output_dir = parseFlag(args[3..], "--output-dir") orelse ".";
         const port = parsePort(args[3..]);
         const want_nostr = parseFlagPresent(args[3..], "--nostr");
-        try cmdDownload(allocator, source, output_dir, port, parseProxy(args[3..]), want_nostr);
+        const want_seed = parseFlagPresent(args[3..], "--seed");
+        try cmdDownload(allocator, source, output_dir, port, parseProxy(args[3..]), want_nostr, want_seed);
     } else if (std.mem.eql(u8, command, "seed")) {
         if (args.len < 4) {
             log.err("usage: carl seed <file.torrent> <data-dir> [--port p] [--nostr] [--external-ip ip] [--tor-seed] [--tor-control addr] [--tor-cookie path] [--tor-onion-port p] [--tor-socks url] [--description \"...\"]", .{});
@@ -106,9 +113,11 @@ fn printUsage() void {
         \\commands:
         \\  info <file.torrent>                              show torrent metadata
         \\  announce <file.torrent> [--proxy url]            query tracker for peers
-        \\  download <source> [--output-dir d] [--port p] [--proxy url] [--nostr]
+        \\  download <source> [--output-dir d] [--port p] [--proxy url] [--nostr] [--seed]
         \\           source: file.torrent, magnet:?..., or http(s):// URL
         \\           --nostr: also subscribe to nostr peer-announce events
+        \\           --seed: keep seeding after the download completes
+        \\                   (default: exit once the download is done)
         \\  seed <file.torrent> <data-dir> [--port p] [--proxy url] [--nostr] [--external-ip <ip>]
         \\           [--tor-seed] [--tor-control host:port] [--tor-cookie path]
         \\           [--tor-onion-port p] [--tor-socks url] [--description "..."]
@@ -217,7 +226,7 @@ fn cmdAnnounce(allocator: std.mem.Allocator, stdout: anytype, path: []const u8, 
     }
 }
 
-fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []const u8, port: u16, proxy: ?carl.proxy.Proxy, want_nostr: bool) !void {
+fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []const u8, port: u16, proxy: ?carl.proxy.Proxy, want_nostr: bool, want_seed: bool) !void {
     if (std.mem.startsWith(u8, source, "magnet:")) {
         // Magnet link
         const ml = carl.magnet.parse(allocator, source) catch |err| {
@@ -346,6 +355,7 @@ fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []c
         session.info_hash = ml.info_hash; // Use magnet's hash, not SHA1("")
         session.metadata_download = carl.extension.MetadataDownload.init(allocator, ml.info_hash);
         session.metadata_only = true;
+        session.seed_after_complete = want_seed;
         if (want_nostr) {
             collectNostrPeers(allocator, ml.info_hash, &session);
         }
@@ -367,21 +377,22 @@ fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []c
             std.process.exit(1);
         };
         defer mi.deinit(allocator);
-        startDownload(allocator, mi, output_dir, port, proxy, want_nostr);
+        startDownload(allocator, mi, output_dir, port, proxy, want_nostr, want_seed);
     } else {
         // File path
         const mi = readTorrent(allocator, source);
         defer mi.deinit(allocator);
-        startDownload(allocator, mi, output_dir, port, proxy, want_nostr);
+        startDownload(allocator, mi, output_dir, port, proxy, want_nostr, want_seed);
     }
 }
 
-fn startDownload(allocator: std.mem.Allocator, mi: carl.metainfo.Metainfo, output_dir: []const u8, port: u16, proxy: ?carl.proxy.Proxy, want_nostr: bool) void {
+fn startDownload(allocator: std.mem.Allocator, mi: carl.metainfo.Metainfo, output_dir: []const u8, port: u16, proxy: ?carl.proxy.Proxy, want_nostr: bool, want_seed: bool) void {
     std.fs.cwd().makePath(output_dir) catch {};
     var session = carl.session.Session.init(allocator, mi, output_dir, .download, port, proxy, .any, false) catch |err| {
         log.err("failed to initialize session: {}", .{err});
         std.process.exit(1);
     };
+    session.seed_after_complete = want_seed;
     defer session.deinit();
     if (want_nostr) {
         const info_hash = carl.metainfo.infoHash(mi.raw_info);
