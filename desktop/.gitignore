@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.local
+
+# Tauri
+src-tauri/target/
+src-tauri/gen/
+
+# editor / OS
+.DS_Store
+*.log
