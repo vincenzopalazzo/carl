@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>carl — privacy-first BitTorrent</title>
+<style>
+/* Self-hosted fonts — no third-party requests, per carl's no-telemetry promise.
+   Newsreader & IBM Plex Sans are variable (400–600); IBM Plex Mono is static per weight.
+   Latin subset only (the page is English); italic is synthesized as it was upstream. */
+@font-face{font-family:'Newsreader';font-style:normal;font-weight:400 600;font-display:swap;src:url(assets/fonts/newsreader.woff2) format('woff2');}
+@font-face{font-family:'IBM Plex Sans';font-style:normal;font-weight:400 600;font-display:swap;src:url(assets/fonts/ibm-plex-sans.woff2) format('woff2');}
+@font-face{font-family:'IBM Plex Mono';font-style:normal;font-weight:400;font-display:swap;src:url(assets/fonts/ibm-plex-mono-400.woff2) format('woff2');}
+@font-face{font-family:'IBM Plex Mono';font-style:normal;font-weight:500;font-display:swap;src:url(assets/fonts/ibm-plex-mono-500.woff2) format('woff2');}
+@font-face{font-family:'IBM Plex Mono';font-style:normal;font-weight:600;font-display:swap;src:url(assets/fonts/ibm-plex-mono-600.woff2) format('woff2');}
+:root{
+  --bg-0:#0c0d11; --bg-1:#111319; --bg-2:#161922; --bg-3:#1c2029; --bg-hover:#222632;
+  --border:#262b36; --border-soft:#1c212b;
+  --fg:#e8eaf0; --fg-dim:#9aa1b1; --fg-faint:#666e7e;
+  --accent:#8b7cf6; --accent-soft:rgba(139,124,246,0.14); --accent-border:rgba(139,124,246,0.4); --accent-dim:#a99ff8;
+  --clearnet:#d6a44e; --proxy:#5aa6db; --tor:#46c08a;
+  --serif:"Newsreader",Georgia,serif;
+  --sans:"IBM Plex Sans",-apple-system,BlinkMacSystemFont,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,Menlo,monospace;
+  --maxw:1120px;
+}
+*{ box-sizing:border-box; margin:0; padding:0; }
+html{ scroll-behavior:smooth; }
+body{ font-family:var(--sans); background:var(--bg-0); color:var(--fg); font-size:16px; line-height:1.55;
+  -webkit-font-smoothing:antialiased; overflow-x:hidden; }
+.mono{ font-family:var(--mono); }
+a{ color:inherit; text-decoration:none; }
+.wrap{ max-width:var(--maxw); margin:0 auto; padding:0 28px; }
+section{ position:relative; }
+
+/* subtle grid + glow backdrop */
+body::before{ content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
+  background:
+    radial-gradient(820px 520px at 78% -8%, rgba(139,124,246,0.13), transparent 60%),
+    radial-gradient(680px 480px at 8% 8%, rgba(70,192,138,0.05), transparent 55%);
+}
+.app-content{ position:relative; z-index:1; }
+
+/* ---------- nav ---------- */
+.nav{ position:sticky; top:0; z-index:50; backdrop-filter:blur(12px);
+  background:rgba(12,13,17,0.72); border-bottom:1px solid var(--border-soft); }
+.nav-inner{ display:flex; align-items:center; gap:28px; height:62px; }
+.brand{ display:flex; align-items:baseline; gap:8px; }
+.brand-mark{ color:var(--accent); align-self:center; display:flex; }
+.brand-word{ font-family:var(--serif); font-size:24px; font-weight:500; letter-spacing:-0.01em; line-height:1; }
+.brand-ver{ font-family:var(--mono); font-size:10px; color:var(--fg-faint); }
+.nav-links{ display:flex; gap:26px; margin-left:14px; }
+.nav-links a{ font-size:13.5px; color:var(--fg-dim); transition:color .12s; white-space:nowrap; }
+.nav-links a:hover{ color:var(--fg); }
+.nav-right{ margin-left:auto; display:flex; align-items:center; gap:14px; }
+
+/* ---------- buttons ---------- */
+.btn{ display:inline-flex; align-items:center; gap:8px; padding:10px 17px; border-radius:8px; white-space:nowrap;
+  font-size:14px; font-weight:500; border:1px solid var(--border); background:var(--bg-2); color:var(--fg); transition:.13s; cursor:pointer; }
+.btn:hover{ background:var(--bg-3); border-color:#333a47; }
+.btn-primary{ background:var(--accent); color:#0c0d11; border-color:transparent; font-weight:600; }
+.btn-primary:hover{ background:var(--accent-dim); }
+.btn-ghost{ background:transparent; }
+.btn svg{ flex:0 0 auto; }
+
+/* ---------- hero ---------- */
+.hero{ padding:78px 0 56px; text-align:center; }
+.eyebrow{ display:inline-flex; align-items:center; gap:10px; font-family:var(--mono); font-size:12px; white-space:nowrap;
+  color:var(--fg-dim); background:var(--bg-1); border:1px solid var(--border-soft); padding:6px 13px; border-radius:20px; margin-bottom:26px; }
+.eyebrow .dot{ width:6px; height:6px; border-radius:50%; background:var(--tor); box-shadow:0 0 0 3px rgba(70,192,138,.18); }
+.hero h1{ font-family:var(--serif); font-weight:500; font-size:clamp(38px,6vw,68px); line-height:1.04;
+  letter-spacing:-0.02em; max-width:16ch; margin:0 auto; text-wrap:balance; }
+.hero h1 .em{ font-style:italic; color:var(--accent-dim); }
+.hero-sub{ font-size:clamp(16px,2vw,19px); color:var(--fg-dim); max-width:60ch; margin:24px auto 0; text-wrap:pretty; }
+.hero-cta{ display:flex; align-items:center; justify-content:center; gap:14px; margin-top:34px; flex-wrap:wrap; }
+.install{ display:inline-flex; align-items:center; gap:14px; background:var(--bg-1); border:1px solid var(--border);
+  border-radius:9px; padding:11px 12px 11px 17px; font-family:var(--mono); font-size:14px; }
+.install{ white-space:nowrap; }
+.install .prompt{ color:var(--accent-dim); }
+.install .cmd{ color:var(--fg); }
+.install .ai-tag{ display:inline-flex; align-items:center; gap:5px; flex:0 0 auto; font-size:11px; white-space:nowrap;
+  color:var(--accent-dim); background:var(--accent-soft); border:1px solid var(--accent-border); padding:3px 9px; border-radius:20px; }
+.install .ai-tag svg{ flex:0 0 auto; }
+.install .copy{ display:inline-flex; align-items:center; gap:6px; padding:6px 10px; border-radius:6px; white-space:nowrap;
+  background:var(--bg-2); border:1px solid var(--border-soft); color:var(--fg-dim); font-size:11.5px; cursor:pointer; transition:.12s; }
+.install .copy:hover{ background:var(--bg-3); color:var(--fg); }
+.install .copy.done{ color:var(--tor); border-color:rgba(70,192,138,.3); }
+.hero-trust{ margin-top:24px; font-size:13px; color:var(--fg-faint); }
+
+/* ---------- hero mockup ---------- */
+.hero-shot{ margin:54px auto 0; max-width:1080px; position:relative; }
+.hero-shot::before{ content:""; position:absolute; inset:-6% -4% 8%; background:radial-gradient(60% 60% at 50% 0%, rgba(139,124,246,0.22), transparent 70%);
+  filter:blur(20px); z-index:-1; }
+.shot-frame{ border:1px solid var(--border); border-radius:14px; overflow:hidden; background:var(--bg-1);
+  box-shadow:0 40px 90px -30px rgba(0,0,0,.8), 0 0 0 1px rgba(255,255,255,0.02) inset; }
+.shot-bar{ display:flex; align-items:center; gap:8px; padding:11px 15px; border-bottom:1px solid var(--border-soft); background:var(--bg-1); }
+.shot-bar .tl{ width:11px; height:11px; border-radius:50%; background:#2b303c; }
+.shot-bar .tl.r{ background:#3a2e30; }
+.shot-bar .tl.y{ background:#3a372a; }
+.shot-bar .tl.g{ background:#2c3a32; }
+.shot-bar .url{ margin-left:14px; font-family:var(--mono); font-size:11.5px; color:var(--fg-faint); }
+.shot-frame img{ display:block; width:100%; height:auto; }
+
+/* ---------- route strip ---------- */
+.routes-strip{ border-top:1px solid var(--border-soft); border-bottom:1px solid var(--border-soft); padding:30px 0; margin-top:84px; }
+.routes-grid{ display:grid; grid-template-columns:repeat(3,1fr); gap:1px; background:var(--border-soft); border:1px solid var(--border-soft); border-radius:12px; overflow:hidden; }
+.route-cell{ background:var(--bg-0); padding:22px 24px; }
+.route-cell .badge{ display:inline-flex; align-items:center; gap:6px; font-size:12.5px; font-weight:500; padding:3px 10px; border-radius:20px; border:1px solid transparent; }
+.b-clearnet{ color:var(--clearnet); background:rgba(214,164,78,0.1); border-color:rgba(214,164,78,0.25); }
+.b-proxy{ color:var(--proxy); background:rgba(90,166,219,0.1); border-color:rgba(90,166,219,0.25); }
+.b-tor{ color:var(--tor); background:rgba(70,192,138,0.1); border-color:rgba(70,192,138,0.28); }
+.route-cell h4{ font-size:15px; font-weight:600; margin:13px 0 5px; }
+.route-cell p{ font-size:13px; color:var(--fg-dim); }
+
+/* ---------- section heads ---------- */
+.sec{ padding:88px 0; }
+.sec-eyebrow{ font-family:var(--mono); font-size:12px; color:var(--accent-dim); letter-spacing:0.04em; text-transform:uppercase; }
+.sec-title{ font-family:var(--serif); font-weight:500; font-size:clamp(28px,4vw,42px); letter-spacing:-0.015em; margin-top:12px; max-width:18ch; line-height:1.1; text-wrap:balance; }
+.sec-lead{ font-size:17px; color:var(--fg-dim); max-width:56ch; margin-top:16px; text-wrap:pretty; }
+
+/* ---------- pillars ---------- */
+.pillar{ display:grid; grid-template-columns:1fr 1fr; gap:56px; align-items:center; padding:46px 0; }
+.pillar.rev{ direction:rtl; }
+.pillar.rev > *{ direction:ltr; }
+.pillar-text h3{ font-family:var(--serif); font-weight:500; font-size:clamp(24px,3vw,32px); letter-spacing:-0.01em; line-height:1.12; }
+.pillar-text .ey{ font-family:var(--mono); font-size:12px; color:var(--accent-dim); text-transform:uppercase; letter-spacing:0.04em; margin-bottom:13px; display:block; }
+.pillar-text p{ font-size:15.5px; color:var(--fg-dim); margin-top:16px; max-width:46ch; text-wrap:pretty; }
+.pillar-text ul{ list-style:none; margin-top:20px; display:flex; flex-direction:column; gap:11px; }
+.pillar-text li{ display:flex; align-items:flex-start; gap:11px; font-size:14.5px; color:var(--fg); }
+.pillar-text li svg{ color:var(--accent-dim); flex:0 0 auto; margin-top:3px; }
+.pillar-visual{ background:var(--bg-1); border:1px solid var(--border-soft); border-radius:14px; padding:24px; min-height:280px; display:flex; flex-direction:column; box-shadow:0 24px 60px -34px rgba(0,0,0,.7); }
+
+/* mini discover card */
+.mini-label{ font-family:var(--mono); font-size:10.5px; color:var(--fg-faint); text-transform:uppercase; letter-spacing:0.06em; margin-bottom:14px; }
+.mcard{ background:var(--bg-2); border:1px solid var(--border-soft); border-radius:10px; padding:15px; }
+.mcard-title{ font-family:var(--serif); font-size:17px; font-weight:500; }
+.mcard-sig{ display:flex; align-items:center; gap:9px; margin-top:8px; }
+.sig-ok{ display:inline-flex; align-items:center; gap:4px; font-size:11px; color:var(--tor); background:rgba(70,192,138,0.1); padding:2px 7px; border-radius:5px; }
+.mcard-author{ font-family:var(--mono); font-size:11px; color:var(--fg-faint); }
+.mcard-meta{ display:flex; gap:22px; margin-top:14px; }
+.mcard-meta .v{ font-family:var(--mono); font-size:13px; white-space:nowrap; }
+.mcard-meta .l{ font-size:9.5px; color:var(--fg-faint); text-transform:uppercase; letter-spacing:0.05em; }
+.mcard-hash{ margin-top:14px; font-family:var(--mono); font-size:11.5px; color:var(--fg-dim); background:var(--bg-1); border:1px solid var(--border-soft); border-radius:6px; padding:8px 10px; display:flex; justify-content:space-between; align-items:center; }
+.relay-line{ display:flex; align-items:center; gap:16px; margin-top:16px; }
+.rl-dot{ display:inline-flex; align-items:center; gap:6px; font-family:var(--mono); font-size:11px; color:var(--fg-dim); }
+.rl-dot::before{ content:""; width:7px; height:7px; border-radius:50%; background:var(--tor); }
+.rl-dot.tor::before{ box-shadow:0 0 0 2px rgba(70,192,138,.25); }
+.rl-dot.off::before{ background:#d9726b; }
+
+/* mini onion callout */
+.onion-mini{ background:linear-gradient(160deg, rgba(70,192,138,0.09), rgba(70,192,138,0.02)); border:1px solid rgba(70,192,138,0.28); border-radius:11px; padding:17px; }
+.om-head{ display:flex; align-items:center; gap:11px; }
+.om-head > div{ flex:1; min-width:0; }
+.om-ic{ width:34px; height:34px; border-radius:9px; background:rgba(70,192,138,0.14); color:var(--tor); display:flex; align-items:center; justify-content:center; }
+.om-title{ font-size:13.5px; font-weight:600; }
+.om-sub{ font-size:11.5px; color:var(--fg-dim); }
+.om-live{ margin-left:auto; font-size:11px; color:var(--tor); display:flex; align-items:center; gap:5px; }
+.om-live::before{ content:""; width:6px; height:6px; border-radius:50%; background:var(--tor); }
+.om-addr{ margin-top:14px; font-family:var(--mono); font-size:11.5px; color:var(--fg); background:var(--bg-1); border:1px solid var(--border-soft); border-radius:7px; padding:10px 12px; display:flex; justify-content:space-between; gap:10px; align-items:center; }
+.om-foot{ margin-top:13px; display:flex; gap:16px; flex-wrap:wrap; font-size:11px; }
+.om-foot span{ display:flex; align-items:center; gap:6px; color:var(--fg-dim); }
+.om-foot .leak{ color:var(--tor); }
+
+/* mini transfer row */
+.row-mini{ background:var(--bg-2); border:1px solid var(--border-soft); border-radius:10px; padding:14px; }
+.rm-line{ display:flex; align-items:center; gap:9px; }
+.rm-name{ font-family:var(--mono); font-size:12.5px; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.rm-pill{ display:inline-flex; align-items:center; gap:5px; font-size:10px; padding:2px 8px; border-radius:20px; }
+.rm-bar{ height:6px; border-radius:3px; background:var(--bg-3); margin-top:12px; overflow:hidden;
+  background-image:repeating-linear-gradient(90deg,transparent 0 7px,rgba(0,0,0,.25) 7px 8px); }
+.rm-fill{ height:100%; width:64%; background:var(--accent); background-image:repeating-linear-gradient(90deg,var(--accent) 0 7px,rgba(255,255,255,.14) 7px 8px); border-radius:3px; }
+.piece-grid{ display:grid; grid-template-columns:repeat(auto-fill,12px); gap:3px; margin-top:16px; }
+.pc{ width:12px; height:12px; border-radius:2px; }
+.pc-0{ background:var(--bg-3); } .pc-1{ background:var(--accent); } .pc-2{ background:var(--accent-dim); }
+
+/* ---------- feature grid ---------- */
+.feat-grid{ display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin-top:46px; }
+.feat{ background:var(--bg-1); border:1px solid var(--border-soft); border-radius:12px; padding:24px; transition:.14s; }
+.feat:hover{ border-color:var(--border); transform:translateY(-2px); }
+.feat-ic{ width:38px; height:38px; border-radius:10px; background:var(--accent-soft); color:var(--accent-dim); display:flex; align-items:center; justify-content:center; margin-bottom:16px; }
+.feat h4{ font-size:16px; font-weight:600; }
+.feat p{ font-size:13.5px; color:var(--fg-dim); margin-top:8px; text-wrap:pretty; }
+
+/* ---------- closing cta ---------- */
+.cta-band{ text-align:center; padding:96px 0; border-top:1px solid var(--border-soft); }
+.cta-band h2{ font-family:var(--serif); font-weight:500; font-size:clamp(30px,4.5vw,48px); letter-spacing:-0.02em; max-width:18ch; margin:0 auto; line-height:1.06; text-wrap:balance; }
+.cta-band p{ color:var(--fg-dim); margin-top:18px; font-size:17px; }
+
+/* ---------- footer ---------- */
+.footer{ border-top:1px solid var(--border-soft); padding:50px 0 40px; }
+.foot-grid{ display:grid; grid-template-columns:1.6fr 1fr 1fr 1fr; gap:36px; }
+.foot-brand .brand-word{ font-size:26px; }
+.foot-tag{ font-size:13px; color:var(--fg-dim); margin-top:12px; max-width:30ch; }
+.foot-col h5{ font-size:11px; text-transform:uppercase; letter-spacing:0.06em; color:var(--fg-faint); margin-bottom:14px; }
+.foot-col a{ display:block; font-size:13.5px; color:var(--fg-dim); padding:5px 0; transition:.12s; }
+.foot-col a:hover{ color:var(--fg); }
+.foot-bottom{ display:flex; justify-content:space-between; align-items:center; margin-top:44px; padding-top:24px; border-top:1px solid var(--border-soft); font-size:12.5px; color:var(--fg-faint); flex-wrap:wrap; gap:12px; }
+.foot-bottom .mono{ font-size:11.5px; }
+
+/* ---------- reveal animation ---------- */
+.reveal{ opacity:0; transform:translateY(18px); transition:opacity .6s ease, transform .6s ease; }
+.reveal.in{ opacity:1; transform:none; }
+@media (prefers-reduced-motion:reduce){ .reveal{ opacity:1; transform:none; transition:none; } html{ scroll-behavior:auto; } }
+
+/* ---------- responsive ---------- */
+@media (max-width:900px){
+  .nav-links{ display:none; }
+  .pillar{ grid-template-columns:1fr; gap:32px; }
+  .pillar.rev{ direction:ltr; }
+  .feat-grid{ grid-template-columns:1fr 1fr; }
+  .routes-grid{ grid-template-columns:1fr; }
+  .foot-grid{ grid-template-columns:1fr 1fr; gap:28px; }
+}
+@media (max-width:600px){
+  .feat-grid{ grid-template-columns:1fr; }
+  .install{ flex-wrap:wrap; }
+  .foot-grid{ grid-template-columns:1fr; }
+}
+</style>
+</head>
+<body>
+<div class="app-content">
+
+<!-- NAV -->
+<nav class="nav">
+  <div class="wrap nav-inner">
+    <a class="brand" href="#top">
+      <span class="brand-mark"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/></svg></span>
+      <span class="brand-word">carl</span>
+      <span class="brand-ver">0.9.2</span>
+    </a>
+    <div class="nav-links">
+      <a href="#discover">Discover</a>
+      <a href="#anonymity">Anonymity</a>
+      <a href="#features">Features</a>
+      <a href="https://github.com/vincenzopalazzo/carl">Get carl</a>
+    </div>
+    <div class="nav-right">
+      <a class="btn btn-ghost" href="https://github.com/vincenzopalazzo/carl" aria-label="GitHub">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2A10 10 0 0 0 8.84 21.5c.5.08.66-.22.66-.48v-1.7c-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.1-1.46-1.1-1.46-.9-.62.07-.6.07-.6 1 .07 1.53 1.03 1.53 1.03.9 1.52 2.34 1.08 2.91.83.1-.65.35-1.09.63-1.34-2.22-.25-4.55-1.11-4.55-4.94 0-1.09.39-1.98 1.03-2.68-.1-.25-.45-1.27.1-2.65 0 0 .84-.27 2.75 1.02a9.5 9.5 0 0 1 5 0c1.9-1.29 2.74-1.02 2.74-1.02.55 1.38.2 2.4.1 2.65.64.7 1.03 1.59 1.03 2.68 0 3.84-2.34 4.69-4.57 4.94.36.31.68.92.68 1.85v2.74c0 .27.16.57.67.48A10 10 0 0 0 12 2z"/></svg>
+        GitHub
+      </a>
+      <a class="btn btn-primary" href="https://github.com/vincenzopalazzo/carl/releases">Download</a>
+    </div>
+  </div>
+</nav>
+
+<!-- HERO -->
+<header class="hero wrap" id="top">
+  <span class="eyebrow"><span class="dot"></span> open source · macOS · Linux · Windows</span>
+  <h1>Torrents that stay <span class="em">your</span> business.</h1>
+  <p class="hero-sub">carl is a lightweight BitTorrent client with Nostr-based discovery and first-class Tor anonymity. The polish of a modern desktop app — built for people who actually care about privacy.</p>
+  <div class="hero-cta">
+    <div class="install">
+      <span class="ai-tag"><svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l1.9 6.3L20 10l-6.1 1.7L12 18l-1.9-6.3L4 10l6.1-1.7z"/></svg> paste into any AI</span>
+      <span class="cmd">Install carl from github.com/vincenzopalazzo/carl</span>
+      <button class="copy" id="copyInstall">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 9h9v11H9zM6 15H4V4h11v2"/></svg>
+        <span class="lbl">copy</span>
+      </button>
+    </div>
+    <a class="btn" href="https://github.com/vincenzopalazzo/carl"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2A10 10 0 0 0 8.84 21.5c.5.08.66-.22.66-.48v-1.7c-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.1-1.46-1.1-1.46-.9-.62.07-.6.07-.6 1 .07 1.53 1.03 1.53 1.03.9 1.52 2.34 1.08 2.91.83.1-.65.35-1.09.63-1.34-2.22-.25-4.55-1.11-4.55-4.94 0-1.09.39-1.98 1.03-2.68-.1-.25-.45-1.27.1-2.65 0 0 .84-.27 2.75 1.02a9.5 9.5 0 0 1 5 0c1.9-1.29 2.74-1.02 2.74-1.02.55 1.38.2 2.4.1 2.65.64.7 1.03 1.59 1.03 2.68 0 3.84-2.34 4.69-4.57 4.94.36.31.68.92.68 1.85v2.74c0 .27.16.57.67.48A10 10 0 0 0 12 2z"/></svg> View source</a>
+  </div>
+  <p class="hero-trust">No accounts. No telemetry. Your identity is a local Nostr key you control.</p>
+
+  <div class="hero-shot reveal">
+    <div class="shot-frame">
+      <div class="shot-bar">
+        <span class="tl r"></span><span class="tl y"></span><span class="tl g"></span>
+        <span class="url">carl — transfers</span>
+      </div>
+      <img src="assets/hero-transfers.png" alt="carl Transfers screen" />
+    </div>
+  </div>
+</header>
+
+<!-- ROUTE STRIP -->
+<section class="routes-strip">
+  <div class="wrap">
+    <div class="routes-grid reveal">
+      <div class="route-cell">
+        <span class="badge b-clearnet"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.5 2.5 15 0 18M12 3c-2.5 2.5-2.5 15 0 18"/></svg> clearnet</span>
+        <h4>Direct &amp; fast</h4>
+        <p>Connect straight to peers when privacy isn’t the priority. Trackers and DHT fully enabled.</p>
+      </div>
+      <div class="route-cell">
+        <span class="badge b-proxy"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"/></svg> proxied</span>
+        <h4>Through a SOCKS5 tunnel</h4>
+        <p>Route every connection over a proxy. DNS resolves remotely with <span class="mono">socks5h://</span> — no leaks.</p>
+      </div>
+      <div class="route-cell">
+        <span class="badge b-tor"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/></svg> tor</span>
+        <h4>Anonymous by default</h4>
+        <p>Download over Tor and seed as a <span class="mono">.onion</span> hidden service. Your IP never appears.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- PILLAR: DISCOVER -->
+<section class="sec wrap" id="discover">
+  <div class="pillar">
+    <div class="pillar-text reveal">
+      <span class="ey">Discover over Nostr</span>
+      <h3>Find torrents on a network nobody can seize.</h3>
+      <p>carl searches a decentralized relay network for torrent events (NIP-35) — no central indexer to censor, take down, or log your queries. Publish your own with a keystroke.</p>
+      <ul>
+        <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l4 4 10-10"/></svg> Every event is Schnorr-signed — trust what you download.</li>
+        <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l4 4 10-10"/></svg> See exactly which relays each result came from.</li>
+        <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l4 4 10-10"/></svg> Add your own relays over <span class="mono">wss://</span> — one per line.</li>
+      </ul>
+    </div>
+    <div class="pillar-visual reveal">
+      <div class="mini-label">discover · nostr search</div>
+      <div class="mcard">
+        <div class="mcard-title">Debian 12.5 — Full DVD set</div>
+        <div class="mcard-sig">
+          <span class="sig-ok"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l4 4 10-10"/></svg> signed</span>
+          <span class="mcard-author">npub1deb…22qx</span>
+        </div>
+        <div class="mcard-meta">
+          <div><div class="v">3.70 GB</div><div class="l">size</div></div>
+          <div><div class="v">3</div><div class="l">files</div></div>
+          <div><div class="v">4</div><div class="l">trackers</div></div>
+        </div>
+        <div class="mcard-hash"><span>btih:a1d9f3c2…4e9a2d6f</span><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 9h9v11H9zM6 15H4V4h11v2"/></svg></div>
+      </div>
+      <div class="relay-line">
+        <span class="rl-dot">relay.damus.io</span>
+        <span class="rl-dot tor">relay…onion</span>
+        <span class="rl-dot off">nostr.band</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- PILLAR: ANONYMITY -->
+<section class="sec wrap" id="anonymity" style="padding-top:0;">
+  <div class="pillar rev">
+    <div class="pillar-text reveal">
+      <span class="ey">Anonymous by design</span>
+      <h3>Seed without ever revealing where you are.</h3>
+      <p>Turn on Tor and carl seeds as a hidden service: peers reach you over a <span class="mono">.onion</span> address while your IP stays invisible. The moment a proxy or Tor is set, DHT and UDP trackers switch off — by design, not as an afterthought.</p>
+      <ul>
+        <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l4 4 10-10"/></svg> A live leak-check confirms nothing is escaping the tunnel.</li>
+        <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l4 4 10-10"/></svg> Announce your onion over Nostr — no tracker required.</li>
+        <li><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l4 4 10-10"/></svg> Routing state is on every row — never buried in a menu.</li>
+      </ul>
+    </div>
+    <div class="pillar-visual reveal">
+      <div class="mini-label">seeding · tor hidden service</div>
+      <div class="onion-mini">
+        <div class="om-head">
+          <span class="om-ic"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/></svg></span>
+          <div><div class="om-title">Seeding as a hidden service</div><div class="om-sub">Peers reach you over this address.</div></div>
+          <span class="om-live">online</span>
+        </div>
+        <div class="om-addr"><span>g7k3xqp4nfz2vw9d6r8slmc1ojtb5h…v3sba.onion</span><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 9h9v11H9zM6 15H4V4h11v2"/></svg></div>
+        <div class="om-foot">
+          <span>published to <strong style="color:var(--fg)">4 relays</strong></span>
+          <span class="leak"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"/></svg> no IP leaked</span>
+        </div>
+      </div>
+      <div class="mini-label" style="margin-top:20px;">transfers · piece progress</div>
+      <div class="row-mini">
+        <div class="rm-line">
+          <span class="rm-pill b-tor"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="4"/></svg> tor</span>
+          <span class="rm-name">archlinux-2026.06.01.iso</span>
+          <span class="mono" style="font-size:11px;color:var(--fg-dim);">64%</span>
+        </div>
+        <div class="rm-bar"><div class="rm-fill"></div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- FEATURES -->
+<section class="sec wrap" id="features">
+  <div class="reveal">
+    <span class="sec-eyebrow">Built for the details</span>
+    <h2 class="sec-title">Everything technical, surfaced — nothing buried.</h2>
+    <p class="sec-lead">Peers, pieces, magnet links, SOCKS proxies and onion addresses, treated as first-class, copyable elements.</p>
+  </div>
+  <div class="feat-grid">
+    <div class="feat reveal">
+      <div class="feat-ic"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="9" width="18" height="6" rx="2"/><path d="M3 12h7"/></svg></div>
+      <h4>Piece-level progress</h4>
+      <p>A segmented progress bar per transfer and a full have/missing heatmap in the detail view.</p>
+    </div>
+    <div class="feat reveal">
+      <div class="feat-ic"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M9 9h9v11H9zM6 15H4V4h11v2"/></svg></div>
+      <h4>Copyable everywhere</h4>
+      <p>Info-hashes, magnet links and <span class="mono">.onion</span> addresses are one click from your clipboard.</p>
+    </div>
+    <div class="feat reveal">
+      <div class="feat-ic"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="M6 8.5v3a3 3 0 0 0 3 3h6a3 3 0 0 0 3-3v-3M12 14.5v1"/></svg></div>
+      <h4>Three discovery sources</h4>
+      <p>Trackers, DHT and Nostr peer-announce, clearly distinguished — you always know where peers came from.</p>
+    </div>
+    <div class="feat reveal">
+      <div class="feat-ic"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"/><path d="M9 12l2 2 4-4" stroke-width="1.9"/></svg></div>
+      <h4>Live leak-check</h4>
+      <p>A constant indicator of whether traffic is genuinely confined to your proxy or Tor circuit.</p>
+    </div>
+    <div class="feat reveal">
+      <div class="feat-ic"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/></svg></div>
+      <h4>Onion seeding</h4>
+      <p>Share a file as a hidden service in two clicks, with the generated address front and center.</p>
+    </div>
+    <div class="feat reveal">
+      <div class="feat-ic"><svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="2"/><circle cx="5" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/></svg></div>
+      <h4>Relay status at a glance</h4>
+      <p>See every configured relay as a dot — connected, unreachable, clearnet or Tor.</p>
+    </div>
+  </div>
+</section>
+
+<!-- CLOSING CTA -->
+<section class="cta-band">
+  <div class="wrap reveal">
+    <h2>Privacy you can see on every row.</h2>
+    <p>Free software. No accounts, no telemetry, no compromises.</p>
+    <div class="hero-cta" style="margin-top:30px;">
+      <div class="install">
+        <span class="ai-tag"><svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l1.9 6.3L20 10l-6.1 1.7L12 18l-1.9-6.3L4 10l6.1-1.7z"/></svg> paste into any AI</span>
+        <span class="cmd">Install carl from github.com/vincenzopalazzo/carl</span>
+        <button class="copy" id="copyInstall2">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 9h9v11H9zM6 15H4V4h11v2"/></svg>
+          <span class="lbl">copy</span>
+        </button>
+      </div>
+      <a class="btn btn-primary" href="https://github.com/vincenzopalazzo/carl">Get carl on GitHub</a>
+    </div>
+  </div>
+</section>
+
+<!-- FOOTER -->
+<footer class="footer">
+  <div class="wrap">
+    <div class="foot-grid">
+      <div class="foot-brand">
+        <a class="brand" href="#top">
+          <span class="brand-mark"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/></svg></span>
+          <span class="brand-word">carl</span>
+        </a>
+        <p class="foot-tag">curl, but for torrents. A privacy-first BitTorrent client with Nostr discovery and Tor anonymity.</p>
+      </div>
+      <div class="foot-col">
+        <h5>Product</h5>
+        <a href="#features">Transfers</a>
+        <a href="#discover">Discover</a>
+        <a href="#anonymity">Seeding</a>
+        <a href="https://github.com/vincenzopalazzo/carl">Settings</a>
+      </div>
+      <div class="foot-col">
+        <h5>Resources</h5>
+        <a href="https://github.com/vincenzopalazzo/carl#readme">Documentation</a>
+        <a href="https://github.com/vincenzopalazzo/carl#readme">CLI reference</a>
+        <a href="https://github.com/nostr-protocol/nips/blob/master/35.md">NIP-35 spec</a>
+        <a href="https://github.com/vincenzopalazzo/carl/blob/main/docs/tor-hidden-service.md">Tor setup</a>
+      </div>
+      <div class="foot-col">
+        <h5>Project</h5>
+        <a href="https://github.com/vincenzopalazzo/carl">GitHub</a>
+        <a href="https://github.com/vincenzopalazzo/carl/releases">Releases</a>
+        <a href="https://github.com/vincenzopalazzo/carl/issues">Issues</a>
+        <a href="https://github.com/vincenzopalazzo/carl/blob/main/LICENSE">License (GPL-2.0)</a>
+      </div>
+    </div>
+    <div class="foot-bottom">
+      <span>© 2026 the carl project · free software, GPL-2.0</span>
+      <span class="mono">npub1carl9x7k3qp4n…fwd2v3sba</span>
+    </div>
+  </div>
+</footer>
+
+</div>
+
+<script>
+function wireCopy(id){
+  var b=document.getElementById(id); if(!b) return;
+  b.addEventListener('click',function(){
+    try{ navigator.clipboard.writeText('Install carl, a privacy-first BitTorrent client written in Zig, from https://github.com/vincenzopalazzo/carl on my machine: clone the repo, build it with `zig build` (Zig 0.15.x), and put the resulting binary on my PATH. Then show me how to add a magnet link.'); }catch(e){}
+    b.classList.add('done'); b.querySelector('.lbl').textContent='copied';
+    setTimeout(function(){ b.classList.remove('done'); b.querySelector('.lbl').textContent='copy'; },1400);
+  });
+}
+wireCopy('copyInstall'); wireCopy('copyInstall2');
+
+var io=new IntersectionObserver(function(es){
+  es.forEach(function(e){ if(e.isIntersecting){ e.target.classList.add('in'); io.unobserve(e.target); } });
+},{threshold:0.12});
+document.querySelectorAll('.reveal').forEach(function(el){ io.observe(el); });
+</script>
+</body>
+</html>
