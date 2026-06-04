@@ -68,6 +68,11 @@ The combined initial-load payload (and the per-tick WebSocket push). Object:
 ### `GET /api/transfers` → `[Transfer]`
 ### `GET /api/seeds` → `[Seed]`
 ### `GET /api/relays` → `[Relay]`
+
+A background prober refreshes relay reachability every ~30s (open + close a
+connection per relay, through the configured route), so `state` reflects real
+`connected` / `unreachable` status rather than just `configured`. The same
+status rides in `GET /api/state` and the WebSocket push.
 ### `GET /api/identity` → `Identity`
 ### `GET /api/settings` → `Settings`
 
@@ -137,6 +142,6 @@ These are part of the contract but return empty / derived values until later PRs
 - **"Seed a file" creation flow** — creating a torrent from a local file and Tor
   hidden-service generation. `seeds()` currently reflects transfers that have
   reached the seeding state.
-- **Live relay connection state** — the daemon reports configured relays as
-  `"configured"`; it does not hold persistent relay connections to report
-  connected/unreachable.
+- **Per-relay event counts** — relay reachability is now probed live (see
+  `GET /api/relays`), but `events` is still reported as `0`; surfacing real
+  per-relay event throughput is a follow-up.

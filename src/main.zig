@@ -789,11 +789,13 @@ fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u
         std.process.exit(1);
     };
 
-    // Connection/WebSocket threads are detached; give them a brief window to
-    // observe the shutdown flag and finish touching the allocator before
-    // `mgr.deinit()` and the GPA teardown run. (A full join of connection
-    // threads is a follow-up; see docs/daemon-api.md.)
-    std.Thread.sleep(300 * std.time.ns_per_ms);
+    // Connection/WebSocket threads and the relay prober are detached; give them
+    // a brief window to observe the shutdown flag and finish touching the
+    // allocator before `daemon.deinit()`, `mgr.deinit()`, and the GPA teardown
+    // run. (A full join of background threads is a follow-up; see
+    // docs/daemon-api.md.)
+    std.Thread.sleep(400 * std.time.ns_per_ms);
+    daemon.deinit();
 }
 
 // -------------------------------------------------------------------------

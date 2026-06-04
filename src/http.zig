@@ -168,8 +168,11 @@ pub fn response(allocator: Allocator, status: Status, content_type: []const u8, 
     try buf.appendSlice(allocator, clen_line);
     // The GUI runs in a webview on a different origin (tauri://, file://,
     // http://localhost), so allow cross-origin reads. The token guard, not
-    // CORS, is what protects the daemon.
+    // CORS, is what protects the daemon. `Allow-Methods` is required for the
+    // browser preflight to permit POST/DELETE (and the X-Carl-Token GET) —
+    // without it the browser blocks every non-simple request.
     try buf.appendSlice(allocator, "Access-Control-Allow-Origin: *\r\n");
+    try buf.appendSlice(allocator, "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n");
     try buf.appendSlice(allocator, "Access-Control-Allow-Headers: X-Carl-Token, Content-Type\r\n");
     try buf.appendSlice(allocator, "Connection: close\r\n\r\n");
     try buf.appendSlice(allocator, body);
@@ -232,6 +235,9 @@ test "jsonResponse: well-formed status line, content-length, body" {
     try testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n"));
     try testing.expect(std.mem.indexOf(u8, resp, "Content-Type: application/json\r\n") != null);
     try testing.expect(std.mem.indexOf(u8, resp, "Content-Length: 11\r\n") != null);
+    // CORS preflight needs Allow-Methods or the browser blocks POST/DELETE.
+    try testing.expect(std.mem.indexOf(u8, resp, "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, resp, "Access-Control-Allow-Origin: *\r\n") != null);
     try testing.expect(std.mem.endsWith(u8, resp, body));
 }
 

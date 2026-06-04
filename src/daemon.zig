@@ -39,12 +39,20 @@ const max_conns: u32 = 64;
 /// then stalls (or lies about Content-Length) can't wedge a thread forever.
 const recv_timeout_secs: u32 = 30;
 
+/// How often the background prober refreshes relay reachability. The daemon
+/// holds no persistent relay connections, so without this the UI could only
+/// ever show relays as "configured" (never connected).
+const probe_interval_ns: u64 = 30 * std.time.ns_per_s;
+
 pub const Daemon = struct {
     allocator: Allocator,
     manager: *manager_mod.Manager,
     token: []const u8,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
     conns: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// Last relay-health probe result (owned). Guarded by `health_mutex`.
+    health_mutex: std.Thread.Mutex = .{},
+    health: []api.Relay = &.{},
 
     /// Bind to 127.0.0.1:`port` and serve until `running` is cleared. Blocking.
     pub fn serve(self: *Daemon, port: u16) !void {
@@ -53,6 +61,13 @@ pub const Daemon = struct {
         defer server.deinit();
 
         log.info("daemon listening on http://127.0.0.1:{d}", .{port});
+
+        // Background relay-health prober: refreshes connected/unreachable status
+        // so the UI's relay strip is real, without probing on every state tick.
+        if (std.Thread.spawn(.{}, Daemon.relayHealthLoop, .{self})) |p| {
+            p.detach();
+        } else |_| {}
+
         // Poll the listen socket with a timeout rather than blocking in
         // accept(): Zig's accept() retries on EINTR, so a bare accept would
         // never observe the SIGINT-set `shutdown_requested`. Polling lets the
@@ -91,6 +106,99 @@ pub const Daemon = struct {
 
     pub fn stop(self: *Daemon) void {
         self.running.store(false, .release);
+    }
+
+    /// Free the cached relay health. Call after `serve` returns (and the prober
+    /// has wound down) before the allocator is torn down.
+    pub fn deinit(self: *Daemon) void {
+        self.health_mutex.lock();
+        const h = self.health;
+        self.health = &.{};
+        self.health_mutex.unlock();
+        freeHealth(self.allocator, h);
+    }
+
+    /// Snapshot current relay health into `arena`. Before the first probe lands,
+    /// falls back to the configured list (state "configured").
+    fn healthSnapshot(self: *Daemon, arena: Allocator) ![]api.Relay {
+        self.health_mutex.lock();
+        defer self.health_mutex.unlock();
+        if (self.health.len == 0) {
+            const urls = try nostr_config.readRelays(arena);
+            const out = try arena.alloc(api.Relay, urls.len);
+            for (urls, 0..) |url, i| {
+                out[i] = .{ .url = url, .state = "configured", .net = relayNet(url), .events = 0 };
+            }
+            return out;
+        }
+        const out = try arena.alloc(api.Relay, self.health.len);
+        for (self.health, 0..) |r, i| {
+            // state/net are static strings; only url is owned by the cache.
+            out[i] = .{ .url = try arena.dupe(u8, r.url), .state = r.state, .net = r.net, .events = r.events };
+        }
+        return out;
+    }
+
+    fn relayHealthLoop(self: *Daemon) void {
+        while (self.running.load(.acquire) and !session_mod.shutdown_requested.load(.acquire)) {
+            self.probeRelays();
+            var slept: u64 = 0;
+            while (slept < probe_interval_ns and
+                self.running.load(.acquire) and
+                !session_mod.shutdown_requested.load(.acquire)) : (slept += 250 * std.time.ns_per_ms)
+            {
+                std.Thread.sleep(250 * std.time.ns_per_ms);
+            }
+        }
+    }
+
+    /// Probe each configured relay once (open + close a connection) and publish
+    /// the connected/unreachable result. Onion relays are only probed when a
+    /// proxy is set (otherwise they're unreachable by definition).
+    fn probeRelays(self: *Daemon) void {
+        const a = self.allocator;
+        const urls = nostr_config.readRelays(a) catch return;
+        defer nostr_config.freeRelays(a, urls);
+
+        var proxy: ?proxy_mod.Proxy = null;
+        if (self.manager.cfg.route != .direct) {
+            proxy = proxy_mod.parseUrl(self.manager.cfg.socks) catch null;
+        }
+
+        var list: std.ArrayList(api.Relay) = .empty;
+        for (urls) |url| {
+            const onion = std.mem.indexOf(u8, url, ".onion") != null;
+            var state: []const u8 = "configured";
+            if (!(onion and proxy == null)) {
+                if (relay_mod.Relay.connect(a, url, proxy)) |r| {
+                    var rc = r;
+                    rc.deinit();
+                    state = "connected";
+                } else |_| {
+                    state = "unreachable";
+                }
+            }
+            const dup = a.dupe(u8, url) catch {
+                freeHealth(a, list.toOwnedSlice(a) catch &.{});
+                return;
+            };
+            list.append(a, .{ .url = dup, .state = state, .net = relayNet(url), .events = 0 }) catch {
+                a.free(dup);
+                freeHealth(a, list.toOwnedSlice(a) catch &.{});
+                return;
+            };
+        }
+        const fresh = list.toOwnedSlice(a) catch {
+            for (list.items) |r| a.free(r.url);
+            list.deinit(a);
+            return;
+        };
+
+        self.health_mutex.lock();
+        const old = self.health;
+        self.health = fresh;
+        self.health_mutex.unlock();
+        freeHealth(a, old);
     }
 };
 
@@ -194,9 +302,9 @@ const Conn = struct {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const aa = arena.allocator();
-        const relay_urls = try nostr_config.readRelays(aa);
+        const relays = try self.daemon.healthSnapshot(aa);
         const npub = try readNpub(aa);
-        const json = try buildStateJson(aa, self.daemon, relay_urls, npub);
+        const json = try buildStateJson(aa, self.daemon, relays, npub);
         try self.sendJson(.ok, json);
     }
 
@@ -228,7 +336,7 @@ const Conn = struct {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const aa = arena.allocator();
-        const relays = try readRelayStates(aa);
+        const relays = try self.daemon.healthSnapshot(aa);
         var j = api.Json.init(aa);
         try j.beginArray();
         for (relays) |r| try api.writeRelay(&j, r);
@@ -345,12 +453,10 @@ const Conn = struct {
             "Sec-WebSocket-Accept: {s}\r\n\r\n", .{accept}) catch return;
         self.sendAll(upgrade) catch return;
 
-        // Read identity + relay config once for the lifetime of the connection
-        // (a connection-scoped arena), so the per-tick push doesn't hit the
-        // filesystem every second. Transfers/seeds are still read live per tick.
+        // Read the npub once for the connection (it's read from the keyfile);
+        // relay health is an in-memory snapshot taken cheaply per tick.
         var conn_arena = std.heap.ArenaAllocator.init(a);
         defer conn_arena.deinit();
-        const relay_urls: []const []const u8 = nostr_config.readRelays(conn_arena.allocator()) catch &.{};
         const npub: []const u8 = readNpub(conn_arena.allocator()) catch "";
 
         // Push a fresh snapshot every interval until the client closes (send
@@ -359,7 +465,8 @@ const Conn = struct {
         // the next send failing.
         while (self.daemon.running.load(.acquire) and !session_mod.shutdown_requested.load(.acquire)) {
             var arena = std.heap.ArenaAllocator.init(a);
-            const json = buildStateJson(arena.allocator(), self.daemon, relay_urls, npub) catch {
+            const relays: []const api.Relay = self.daemon.healthSnapshot(arena.allocator()) catch &.{};
+            const json = buildStateJson(arena.allocator(), self.daemon, relays, npub) catch {
                 arena.deinit();
                 break;
             };
@@ -415,9 +522,13 @@ const Conn = struct {
 /// rather than read here, so the WebSocket push can read them once per
 /// connection instead of hitting the filesystem on every tick. Transfers and
 /// seeds are always read live from the manager.
-fn buildStateJson(arena: Allocator, daemon: *Daemon, relay_urls: []const []const u8, npub: []const u8) ![]u8 {
+fn buildStateJson(arena: Allocator, daemon: *Daemon, relays: []const api.Relay, npub: []const u8) ![]u8 {
     const transfers = try daemon.manager.snapshot(arena);
     const seeds = try daemon.manager.seeds(arena);
+
+    // Settings echoes the relay URLs; derive them from the probed list.
+    const relay_urls = try arena.alloc([]const u8, relays.len);
+    for (relays, 0..) |r, i| relay_urls[i] = r.url;
 
     var j = api.Json.init(arena);
     try j.beginObject();
@@ -431,7 +542,7 @@ fn buildStateJson(arena: Allocator, daemon: *Daemon, relay_urls: []const []const
     try j.endArray();
     try j.key("relays");
     try j.beginArray();
-    for (relay_urls) |url| try api.writeRelay(&j, .{ .url = url, .state = "configured", .net = relayNet(url), .events = 0 });
+    for (relays) |r| try api.writeRelay(&j, r);
     try j.endArray();
     try j.key("identity");
     try api.writeIdentity(&j, .{ .npub = npub });
@@ -441,16 +552,10 @@ fn buildStateJson(arena: Allocator, daemon: *Daemon, relay_urls: []const []const
     return j.buf.items;
 }
 
-/// Read configured relays into `api.Relay` rows. The daemon doesn't hold
-/// persistent relay connections, so state is reported as "configured"; the
-/// clearnet/tor split is derived from the URL.
-fn readRelayStates(arena: Allocator) ![]api.Relay {
-    const urls = try nostr_config.readRelays(arena);
-    const out = try arena.alloc(api.Relay, urls.len);
-    for (urls, 0..) |url, i| {
-        out[i] = .{ .url = url, .state = "configured", .net = relayNet(url), .events = 0 };
-    }
-    return out;
+/// Free an owned relay-health list (the url strings, then the slice).
+fn freeHealth(a: Allocator, list: []api.Relay) void {
+    for (list) |r| a.free(r.url);
+    if (list.len > 0) a.free(list);
 }
 
 fn relayNet(url: []const u8) []const u8 {
@@ -661,7 +766,10 @@ test "buildStateJson: produces the five top-level keys" {
 
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    const relays = [_][]const u8{ "wss://relay.damus.io", "ws://abc.onion" };
+    const relays = [_]api.Relay{
+        .{ .url = "wss://relay.damus.io", .state = "connected", .net = "clearnet", .events = 0 },
+        .{ .url = "ws://abc.onion", .state = "unreachable", .net = "tor", .events = 0 },
+    };
     const json = try buildStateJson(arena.allocator(), &d, &relays, "npub1test");
 
     var p = try std.json.parseFromSlice(std.json.Value, arena.allocator(), json, .{});
@@ -674,6 +782,7 @@ test "buildStateJson: produces the five top-level keys" {
     try testing.expect(o.get("settings").? == .object);
     try testing.expectEqual(@as(usize, 0), o.get("transfers").?.array.items.len);
     try testing.expectEqual(@as(usize, 2), o.get("relays").?.array.items.len);
+    try testing.expectEqualStrings("connected", o.get("relays").?.array.items[0].object.get("state").?.string);
     try testing.expectEqualStrings("tor", o.get("relays").?.array.items[1].object.get("net").?.string);
     try testing.expectEqualStrings("npub1test", o.get("identity").?.object.get("npub").?.string);
 }
