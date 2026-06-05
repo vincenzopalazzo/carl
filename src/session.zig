@@ -80,6 +80,14 @@ pub const Session = struct {
     // `snapshot_mutex`; freed in deinit. Defaulted so init need not set it.
     torrent_blob: ?[]u8 = null,
 
+    // Cross-thread progress snapshot. The daemon reads live progress from
+    // another thread; rather than have it touch `our_bitfield`/`peers` (which
+    // the session thread mutates), the session keeps these atomics exact —
+    // restated after every change — and the daemon reads only these. Defaulted
+    // so init need not set them; `init` seeds `have_pieces` from resume.
+    have_pieces: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    peer_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
     // Choking state
     last_unchoke_time: i64,
     last_optimistic_time: i64,
@@ -136,6 +144,13 @@ pub const Session = struct {
         const total_length = piece_mod.totalLength(meta.files);
         const num_pieces = piece_mod.numPieces(total_length, meta.piece_length);
         const info_hash = metainfo.infoHash(meta.raw_info);
+
+        // Own our copy of output_dir: callers pass arena/manager-owned buffers
+        // (e.g. the seed-upload arena, or cfg.download_dir which setDownloadDir
+        // frees) that don't outlive this session, and we reuse it later when a
+        // magnet resolves (storage re-init). Freed in deinit.
+        const output_dir_owned = try allocator.dupe(u8, output_dir);
+        errdefer allocator.free(output_dir_owned);
 
         var peer_id: [20]u8 = undefined;
         @memcpy(peer_id[0..8], "-CA0010-");
@@ -199,7 +214,8 @@ pub const Session = struct {
             .piece_availability = piece_availability,
             .listener = listener,
             .listen_port = listen_port,
-            .output_dir = output_dir,
+            .output_dir = output_dir_owned,
+            .have_pieces = std.atomic.Value(usize).init(our_bitfield.count()),
             .mode = mode,
             .tracker_interval = 1800,
             .last_announce_time = 0,
@@ -245,6 +261,7 @@ pub const Session = struct {
         if (self.metadata_download) |*md| md.deinit();
         if (self.listener) |*l| l.deinit();
         if (self.torrent_blob) |b| self.allocator.free(b);
+        self.allocator.free(self.output_dir);
         self.our_bitfield.deinit(self.allocator);
         self.store.deinit();
         // The magnet path replaces `meta` with a session-owned copy; free it.
@@ -279,13 +296,17 @@ pub const Session = struct {
     pub fn progressSnapshot(self: *Session) Progress {
         self.snapshot_mutex.lock();
         defer self.snapshot_mutex.unlock();
+        // `have`/`peers` come from atomics the session thread keeps exact, so we
+        // never touch `our_bitfield`/`peers` (mutated lockless on that thread).
+        // `num_pieces`/`total_length` are still read under the mutex because the
+        // metadata-complete transition reassigns them.
         return .{
-            .have = self.our_bitfield.count(),
+            .have = @intCast(self.have_pieces.load(.monotonic)),
             .num_pieces = self.num_pieces,
             .downloaded = self.downloaded,
             .uploaded = self.uploaded,
             .total_length = self.total_length,
-            .peers = @intCast(self.peers.items.len),
+            .peers = @intCast(self.peer_count.load(.monotonic)),
             .mode = self.mode,
             .metadata_only = self.metadata_only,
         };
@@ -599,6 +620,7 @@ pub const Session = struct {
                 };
                 self.our_bitfield.setPiece(pd.index);
                 self.downloaded += pp_ptr.piece_len;
+                self.have_pieces.store(self.our_bitfield.count(), .monotonic);
 
                 self.printProgress() catch {};
 
@@ -895,6 +917,8 @@ pub const Session = struct {
 
             self.our_bitfield.deinit(self.allocator);
             self.our_bitfield = piece_mod.Bitfield.init(self.allocator, self.num_pieces) catch return error.OutOfMemory;
+            // Fresh bitfield for a just-resolved magnet: we have nothing yet.
+            self.have_pieces.store(0, .monotonic);
 
             self.allocator.free(self.piece_availability);
             self.piece_availability = self.allocator.alloc(u32, self.num_pieces) catch return error.OutOfMemory;
@@ -1195,6 +1219,12 @@ pub const Session = struct {
 
     fn maintenance(self: *Session) !void {
         const now = std.time.timestamp();
+
+        // Publish the live peer count for the daemon's cross-thread snapshot.
+        // Refreshed each tick here (and just below after pruning) so the daemon
+        // never reads `self.peers` directly. One tick of staleness is invisible
+        // to the 1 Hz snapshot.
+        self.peer_count.store(self.peers.items.len, .monotonic);
 
         // Remove disconnected peers and update availability
         var i: usize = 0;
@@ -1587,6 +1617,7 @@ pub const Session = struct {
         self.store.writePiece(piece_idx, data) catch return false;
         self.our_bitfield.setPiece(piece_idx);
         self.downloaded += plen;
+        self.have_pieces.store(self.our_bitfield.count(), .monotonic);
 
         self.printProgress() catch {};
 

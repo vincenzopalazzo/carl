@@ -35,6 +35,7 @@ extern fn sqlite3_column_int(s: ?*Stmt, i: c_int) c_int;
 
 const SQLITE_OK: c_int = 0;
 const SQLITE_ROW: c_int = 100;
+const SQLITE_DONE: c_int = 101;
 // SQLITE_TRANSIENT = (void*)-1 → tells SQLite to copy bound text immediately.
 const SQLITE_TRANSIENT: ?*const anyopaque = @ptrFromInt(@as(usize, std.math.maxInt(usize)));
 
@@ -144,7 +145,7 @@ fn saveTo(
         bindText(stmt, 2, s.source);
         bindText(stmt, 3, s.route.jsonName());
         _ = sqlite3_bind_int(stmt, 4, if (s.nostr) 1 else 0);
-        _ = sqlite3_step(stmt);
+        if (sqlite3_step(stmt) != SQLITE_DONE) return error.DbExec;
     }
 
     try exec(db, "COMMIT");
@@ -200,7 +201,7 @@ fn upsertSetting(db: *Sqlite, key: []const u8, value: []const u8) Error!void {
     defer _ = sqlite3_finalize(stmt);
     bindText(stmt, 1, key);
     bindText(stmt, 2, value);
-    _ = sqlite3_step(stmt);
+    if (sqlite3_step(stmt) != SQLITE_DONE) return error.DbExec;
 }
 
 fn getSetting(a: Allocator, db: *Sqlite, key: []const u8) Error!?[]u8 {

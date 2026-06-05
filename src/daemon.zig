@@ -248,6 +248,10 @@ const Conn = struct {
             if (n == 0) break;
             try buf.appendSlice(a, tmp[0..n]);
         }
+        // A short read (recv timeout / peer hangup) leaves a truncated body. Do
+        // not process it: POST /api/seeds would write a partial file and seed a
+        // corrupt torrent.
+        if (buf.items.len < need) return self.sendStatus(.bad_request);
 
         const req = http.parse(buf.items) catch return self.sendStatus(.bad_request);
         const body_end = @min(buf.items.len, req.head_len + req.contentLength());
