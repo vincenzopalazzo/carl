@@ -20,6 +20,12 @@ pub const peer_announce = @import("peer_announce.zig");
 pub const tor_control = @import("tor_control.zig");
 pub const relay = @import("relay.zig");
 pub const nostr_config = @import("nostr_config.zig");
+pub const api = @import("api.zig");
+pub const ws_server = @import("ws_server.zig");
+pub const http = @import("http.zig");
+pub const manager = @import("manager.zig");
+pub const daemon = @import("daemon.zig");
+pub const state = @import("state.zig");
 
 test {
     _ = bencode;
@@ -43,5 +49,11 @@ test {
     _ = tor_control;
     _ = relay;
     _ = nostr_config;
+    _ = api;
+    _ = ws_server;
+    _ = http;
+    _ = manager;
+    _ = daemon;
+    _ = state;
     _ = @import("integration_test.zig");
 }

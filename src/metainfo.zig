@@ -303,7 +303,108 @@ pub fn infoHash(raw_info: []const u8) [20]u8 {
     return out;
 }
 
+/// Default piece size for created torrents (256 KiB).
+pub const default_piece_length: u32 = 256 * 1024;
+
+/// Create a single-file torrent (metainfo) from a file on disk: hash it into
+/// `piece_length` pieces, build the canonical info dict, and return a
+/// fully-owned `Metainfo` (free with `deinit`). No trackers — discovery is via
+/// Nostr / DHT. A `.tar`/`.zip`/`.pdf` is just a single file, so this covers the
+/// "seed an archive" case directly. Streams the file so large inputs don't load
+/// into memory at once.
+pub fn createSingleFile(allocator: Allocator, path: []const u8, piece_length: u32) MetainfoError!Metainfo {
+    var file = std.fs.cwd().openFile(path, .{}) catch return error.InvalidTorrent;
+    defer file.close();
+
+    const base = std.fs.path.basename(path);
+    if (base.len == 0) return error.InvalidTorrent;
+    const name = allocator.dupe(u8, base) catch return error.OutOfMemory;
+    errdefer allocator.free(name);
+
+    var pieces_buf: std.ArrayList(u8) = .empty;
+    errdefer pieces_buf.deinit(allocator);
+    const chunk = allocator.alloc(u8, piece_length) catch return error.OutOfMemory;
+    defer allocator.free(chunk);
+
+    var total: u64 = 0;
+    while (true) {
+        const n = file.readAll(chunk) catch return error.InvalidTorrent;
+        if (n == 0) break;
+        var digest: [20]u8 = undefined;
+        std.crypto.hash.Sha1.hash(chunk[0..n], &digest, .{});
+        pieces_buf.appendSlice(allocator, &digest) catch return error.OutOfMemory;
+        total += n;
+        if (n < piece_length) break; // final (partial) piece
+    }
+    const pieces = pieces_buf.toOwnedSlice(allocator) catch return error.OutOfMemory;
+    errdefer allocator.free(pieces);
+
+    // Canonical info dict — keys MUST be in sorted byte order for a stable
+    // info-hash: "length" < "name" < "piece length" < "pieces".
+    const info_val = bencode.Value{ .dict = &[_]bencode.Value.DictEntry{
+        .{ .key = "length", .value = .{ .integer = @intCast(total) } },
+        .{ .key = "name", .value = .{ .string = name } },
+        .{ .key = "piece length", .value = .{ .integer = @intCast(piece_length) } },
+        .{ .key = "pieces", .value = .{ .string = pieces } },
+    } };
+    const raw_info = bencode.encode(allocator, info_val) catch return error.OutOfMemory;
+    errdefer allocator.free(raw_info);
+
+    const path_comp = allocator.alloc([]const u8, 1) catch return error.OutOfMemory;
+    errdefer allocator.free(path_comp);
+    path_comp[0] = allocator.dupe(u8, name) catch return error.OutOfMemory;
+    errdefer allocator.free(path_comp[0]);
+    const files = allocator.alloc(FileInfo, 1) catch return error.OutOfMemory;
+    errdefer allocator.free(files);
+    files[0] = .{ .length = total, .path = path_comp };
+
+    const announce = allocator.dupe(u8, "") catch return error.OutOfMemory;
+    errdefer allocator.free(announce);
+
+    return Metainfo{
+        .announce = announce,
+        .announce_list = null,
+        .name = name,
+        .piece_length = piece_length,
+        .pieces = pieces,
+        .files = files,
+        .comment = null,
+        .creation_date = null,
+        .created_by = null,
+        .raw_info = raw_info,
+        .url_list = null,
+    };
+}
+
 // --- Tests ---
+
+test "createSingleFile: hashes a file into a valid metainfo" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // 10 bytes with piece_length 4 → 3 pieces (4 + 4 + 2).
+    try tmp.dir.writeFile(.{ .sub_path = "data.bin", .data = "0123456789" });
+    const path = try tmp.dir.realpathAlloc(allocator, "data.bin");
+    defer allocator.free(path);
+
+    const mi = try createSingleFile(allocator, path, 4);
+    defer mi.deinit(allocator);
+
+    try std.testing.expectEqualStrings("data.bin", mi.name);
+    try std.testing.expectEqual(@as(u64, 10), mi.files[0].length);
+    try std.testing.expectEqual(@as(usize, 60), mi.pieces.len); // 3 × 20
+    try std.testing.expectEqual(@as(u64, 4), mi.piece_length);
+
+    // raw_info must re-decode to a dict carrying the expected fields, and the
+    // info-hash is the SHA-1 of those bytes (deterministic).
+    const decoded = try bencode.decode(allocator, mi.raw_info);
+    defer decoded.deinit(allocator);
+    try std.testing.expectEqual(@as(i64, 10), decoded.dictGet("length").?.asInt().?);
+    try std.testing.expectEqualStrings("data.bin", decoded.dictGet("name").?.asString().?);
+    const ih = infoHash(mi.raw_info);
+    try std.testing.expectEqual(@as(usize, 20), ih.len);
+}
 
 test "parse single-file torrent" {
     const allocator = std.testing.allocator;

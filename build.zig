@@ -56,6 +56,32 @@ pub fn build(b: *std.Build) void {
     secp.installHeadersDirectory(secp_dep.path("include"), "", .{});
 
     // ----------------------------------------------------------------
+    // SQLite — vendored amalgamation, built as a static C lib. Avoids a
+    // system libsqlite3 dependency so the build is identical everywhere.
+    // ----------------------------------------------------------------
+    const sqlite_dep = b.dependency("sqlite", .{});
+    const sqlite = b.addLibrary(.{
+        .name = "sqlite3",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    sqlite.root_module.addCSourceFile(.{
+        .file = sqlite_dep.path("sqlite3.c"),
+        .flags = &.{
+            "-DSQLITE_THREADSAFE=1",
+            "-DSQLITE_DQS=0",
+            "-DSQLITE_OMIT_LOAD_EXTENSION",
+            "-DSQLITE_DEFAULT_MEMSTATUS=0",
+            "-Wno-unused-function",
+        },
+    });
+    sqlite.root_module.addIncludePath(sqlite_dep.path("."));
+
+    // ----------------------------------------------------------------
     // carl library module
     // ----------------------------------------------------------------
     const lib_mod = b.addModule("carl", .{
@@ -65,6 +91,8 @@ pub fn build(b: *std.Build) void {
     });
     lib_mod.linkLibrary(secp);
     lib_mod.addIncludePath(secp_dep.path("include"));
+    // SQLite for durable daemon-state persistence (vendored static lib).
+    lib_mod.linkLibrary(sqlite);
 
     // ----------------------------------------------------------------
     // CLI executable
@@ -83,6 +111,7 @@ pub fn build(b: *std.Build) void {
     });
     exe.linkLibrary(secp);
     exe.root_module.addIncludePath(secp_dep.path("include"));
+    exe.linkLibrary(sqlite);
 
     b.installArtifact(exe);
 

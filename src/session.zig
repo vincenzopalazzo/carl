@@ -68,6 +68,26 @@ pub const Session = struct {
     // Control
     running: bool,
 
+    // Guards the fields read by `progressSnapshot` against the metadata-complete
+    // transition (which reallocates `our_bitfield`). Lets the daemon read live
+    // progress from another thread without a use-after-free. Defaulted so the
+    // init struct literal need not set it.
+    snapshot_mutex: std.Thread.Mutex = .{},
+
+    // The resolved `.torrent` bytes, built once metadata completes (magnet path)
+    // so the daemon can persist it and resume the torrent fully — verifying
+    // on-disk pieces — instead of re-bootstrapping a magnet. Guarded by
+    // `snapshot_mutex`; freed in deinit. Defaulted so init need not set it.
+    torrent_blob: ?[]u8 = null,
+
+    // Cross-thread progress snapshot. The daemon reads live progress from
+    // another thread; rather than have it touch `our_bitfield`/`peers` (which
+    // the session thread mutates), the session keeps these atomics exact —
+    // restated after every change — and the daemon reads only these. Defaulted
+    // so init need not set them; `init` seeds `have_pieces` from resume.
+    have_pieces: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    peer_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
     // Choking state
     last_unchoke_time: i64,
     last_optimistic_time: i64,
@@ -124,6 +144,13 @@ pub const Session = struct {
         const total_length = piece_mod.totalLength(meta.files);
         const num_pieces = piece_mod.numPieces(total_length, meta.piece_length);
         const info_hash = metainfo.infoHash(meta.raw_info);
+
+        // Own our copy of output_dir: callers pass arena/manager-owned buffers
+        // (e.g. the seed-upload arena, or cfg.download_dir which setDownloadDir
+        // frees) that don't outlive this session, and we reuse it later when a
+        // magnet resolves (storage re-init). Freed in deinit.
+        const output_dir_owned = try allocator.dupe(u8, output_dir);
+        errdefer allocator.free(output_dir_owned);
 
         var peer_id: [20]u8 = undefined;
         @memcpy(peer_id[0..8], "-CA0010-");
@@ -187,7 +214,8 @@ pub const Session = struct {
             .piece_availability = piece_availability,
             .listener = listener,
             .listen_port = listen_port,
-            .output_dir = output_dir,
+            .output_dir = output_dir_owned,
+            .have_pieces = std.atomic.Value(usize).init(our_bitfield.count()),
             .mode = mode,
             .tracker_interval = 1800,
             .last_announce_time = 0,
@@ -232,11 +260,56 @@ pub const Session = struct {
         if (self.dht_instance) |*d| d.deinit();
         if (self.metadata_download) |*md| md.deinit();
         if (self.listener) |*l| l.deinit();
+        if (self.torrent_blob) |b| self.allocator.free(b);
+        self.allocator.free(self.output_dir);
         self.our_bitfield.deinit(self.allocator);
         self.store.deinit();
         // The magnet path replaces `meta` with a session-owned copy; free it.
         // The original caller-owned `meta` is freed by the caller.
         if (self.meta_owned) self.meta.deinit(self.allocator);
+    }
+
+    /// A consistent, race-safe view of the session's live progress, for other
+    /// threads (the daemon). Reads are taken under `snapshot_mutex` so the
+    /// magnet metadata-complete transition (which reallocates `our_bitfield`)
+    /// can't be observed half-applied.
+    pub const Progress = struct {
+        have: u32,
+        num_pieces: u32,
+        downloaded: u64,
+        uploaded: u64,
+        total_length: u64,
+        peers: u32,
+        mode: Mode,
+        metadata_only: bool,
+    };
+
+    /// A copy of the resolved `.torrent` bytes, or null if metadata isn't in
+    /// yet (or this was never a magnet). Caller owns the result.
+    pub fn copyTorrent(self: *Session, a: Allocator) ?[]u8 {
+        self.snapshot_mutex.lock();
+        defer self.snapshot_mutex.unlock();
+        const blob = self.torrent_blob orelse return null;
+        return a.dupe(u8, blob) catch null;
+    }
+
+    pub fn progressSnapshot(self: *Session) Progress {
+        self.snapshot_mutex.lock();
+        defer self.snapshot_mutex.unlock();
+        // `have`/`peers` come from atomics the session thread keeps exact, so we
+        // never touch `our_bitfield`/`peers` (mutated lockless on that thread).
+        // `num_pieces`/`total_length` are still read under the mutex because the
+        // metadata-complete transition reassigns them.
+        return .{
+            .have = @intCast(self.have_pieces.load(.monotonic)),
+            .num_pieces = self.num_pieces,
+            .downloaded = self.downloaded,
+            .uploaded = self.uploaded,
+            .total_length = self.total_length,
+            .peers = @intCast(self.peer_count.load(.monotonic)),
+            .mode = self.mode,
+            .metadata_only = self.metadata_only,
+        };
     }
 
     pub fn run(self: *Session) !void {
@@ -547,6 +620,7 @@ pub const Session = struct {
                 };
                 self.our_bitfield.setPiece(pd.index);
                 self.downloaded += pp_ptr.piece_len;
+                self.have_pieces.store(self.our_bitfield.count(), .monotonic);
 
                 self.printProgress() catch {};
 
@@ -830,17 +904,26 @@ pub const Session = struct {
         };
         self.meta_owned = true;
 
-        // Now initialize storage and piece tracking
-        self.total_length = piece_mod.totalLength(self.meta.files);
-        self.num_pieces = piece_mod.numPieces(self.total_length, piece_length);
-        self.piece_len = piece_length;
+        // Now initialize storage and piece tracking. Hold snapshot_mutex across
+        // the geometry + bitfield swap so a concurrent `progressSnapshot` never
+        // reads a freed `our_bitfield` (the daemon reads it from another thread).
+        {
+            self.snapshot_mutex.lock();
+            defer self.snapshot_mutex.unlock();
 
-        self.our_bitfield.deinit(self.allocator);
-        self.our_bitfield = piece_mod.Bitfield.init(self.allocator, self.num_pieces) catch return error.OutOfMemory;
+            self.total_length = piece_mod.totalLength(self.meta.files);
+            self.num_pieces = piece_mod.numPieces(self.total_length, piece_length);
+            self.piece_len = piece_length;
 
-        self.allocator.free(self.piece_availability);
-        self.piece_availability = self.allocator.alloc(u32, self.num_pieces) catch return error.OutOfMemory;
-        @memset(self.piece_availability, 0);
+            self.our_bitfield.deinit(self.allocator);
+            self.our_bitfield = piece_mod.Bitfield.init(self.allocator, self.num_pieces) catch return error.OutOfMemory;
+            // Fresh bitfield for a just-resolved magnet: we have nothing yet.
+            self.have_pieces.store(0, .monotonic);
+
+            self.allocator.free(self.piece_availability);
+            self.piece_availability = self.allocator.alloc(u32, self.num_pieces) catch return error.OutOfMemory;
+            @memset(self.piece_availability, 0);
+        }
 
         // Reinitialize storage with the real metadata
         self.store.deinit();
@@ -851,6 +934,15 @@ pub const Session = struct {
         self.metadata_only = false;
         if (self.metadata_download) |*md| md.deinit();
         self.metadata_download = null;
+
+        // Capture the now-resolved .torrent so the daemon can persist it and
+        // resume this torrent fully on restart. Built here where `meta` is
+        // settled; published under snapshot_mutex for the reader thread.
+        if (buildTorrentBytes(self.allocator, self.meta)) |blob| {
+            self.snapshot_mutex.lock();
+            self.torrent_blob = blob;
+            self.snapshot_mutex.unlock();
+        } else |_| {}
 
         // Re-parse any bitfields that arrived before we knew the piece count, so
         // peers connected during the metadata phase are usable for downloading
@@ -1127,6 +1219,12 @@ pub const Session = struct {
 
     fn maintenance(self: *Session) !void {
         const now = std.time.timestamp();
+
+        // Publish the live peer count for the daemon's cross-thread snapshot.
+        // Refreshed each tick here (and just below after pruning) so the daemon
+        // never reads `self.peers` directly. One tick of staleness is invisible
+        // to the 1 Hz snapshot.
+        self.peer_count.store(self.peers.items.len, .monotonic);
 
         // Remove disconnected peers and update availability
         var i: usize = 0;
@@ -1519,6 +1617,7 @@ pub const Session = struct {
         self.store.writePiece(piece_idx, data) catch return false;
         self.our_bitfield.setPiece(piece_idx);
         self.downloaded += plen;
+        self.have_pieces.store(self.our_bitfield.count(), .monotonic);
 
         self.printProgress() catch {};
 
@@ -1584,3 +1683,16 @@ pub const Session = struct {
         }
     }
 };
+
+/// Re-encode a resolved Metainfo into full `.torrent` bytes: a top-level dict
+/// `{ "announce", "info" }`. The info dict is decoded from `raw_info` and
+/// re-encoded canonically, so the info-hash is preserved. Caller owns the result.
+fn buildTorrentBytes(a: Allocator, meta: metainfo.Metainfo) ![]u8 {
+    const info_val = try bencode.decode(a, meta.raw_info);
+    defer info_val.deinit(a);
+    const entries = [_]bencode.Value.DictEntry{
+        .{ .key = "announce", .value = .{ .string = meta.announce } },
+        .{ .key = "info", .value = info_val },
+    };
+    return bencode.encode(a, .{ .dict = &entries });
+}
