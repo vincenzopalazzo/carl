@@ -145,6 +145,9 @@ pub const Daemon = struct {
     fn relayHealthLoop(self: *Daemon) void {
         while (self.running.load(.acquire) and !session_mod.shutdown_requested.load(.acquire)) {
             self.probeRelays();
+            // Persist any newly-resolved magnet torrents (headless coverage; the
+            // WS push also does this ~1/s when the GUI is connected).
+            self.manager.checkpoint();
             var slept: u64 = 0;
             while (slept < probe_interval_ns and
                 self.running.load(.acquire) and
@@ -529,6 +532,9 @@ const Conn = struct {
         // GUI only needs the push channel — so a closed socket is detected by
         // the next send failing.
         while (self.daemon.running.load(.acquire) and !session_mod.shutdown_requested.load(.acquire)) {
+            // Cheap when nothing changed; captures a resolved magnet's .torrent
+            // within ~1s so a restart resumes it as a complete torrent.
+            self.daemon.manager.checkpoint();
             var arena = std.heap.ArenaAllocator.init(a);
             const relays: []const api.Relay = self.daemon.healthSnapshot(arena.allocator()) catch &.{};
             const json = buildStateJson(arena.allocator(), self.daemon, relays, npub) catch {

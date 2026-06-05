@@ -8,6 +8,12 @@
             .url = "https://github.com/bitcoin-core/secp256k1/archive/refs/tags/v0.6.0.tar.gz",
             .hash = "N-V-__8AADJMTgDEfe07_P0Y5osu_kf-DbxYeyW8DVvtN-wv",
         },
+        // SQLite amalgamation, compiled into a static lib (vendored — no system
+        // dependency, builds the same everywhere) for daemon-state persistence.
+        .sqlite = .{
+            .url = "https://www.sqlite.org/2025/sqlite-amalgamation-3510000.zip",
+            .hash = "N-V-__8AALNYqgDpBBECZ3Jn_VpVGjX4xX7uTSZg00tYjmy3",
+        },
     },
     .paths = .{
         "build.zig",

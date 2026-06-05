@@ -38,12 +38,18 @@ carl daemon [--port p] [--bt-port p] [--route direct|proxy|tor] [--socks url] \
 ## Persistence
 
 The daemon persists its transfers, seeds, and editable settings (route +
-download dir) to `<config>/daemon-state.json`, rewritten on every change
-(add/remove/settings) — so a crash or restart loses nothing. On startup it
-replays that state: downloads resume from on-disk pieces (the session
-re-verifies them) and seeds re-hash their file. Relays persist separately via
-the relay config file. Transfers are stored as *specs* (source + route + nostr),
-not live session state, so the saved file is small and human-readable.
+download dir) to a **SQLite** database, `<config>/carl.db`, rewritten in a
+single transaction on every change (add/remove/settings) — so a crash or
+restart loses nothing (verified across `kill -9`). On startup it replays that
+state. Transfers are stored as re-create *specs* (kind + source + route +
+nostr), not live session state.
+
+For true resume, once a magnet's metadata completes the daemon writes the
+resolved `.torrent` next to the data (`<download_dir>/<infohash>.carl.torrent`)
+and repoints that transfer's persisted source at it — so after a restart a
+finished download comes back as a **complete** torrent (the session verifies the
+on-disk pieces) rather than re-fetching metadata. Relays/identity persist
+separately via `nostr_config`.
 
 ## Authentication
 

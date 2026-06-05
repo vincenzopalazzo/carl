@@ -91,6 +91,9 @@ const ManagedTransfer = struct {
     last_ms: i64 = 0,
     rate_down: u64 = 0,
     rate_up: u64 = 0,
+    /// True once a resolved magnet's .torrent has been written and `source`
+    /// repointed at it, so the checkpoint doesn't redo it.
+    resolved: bool = false,
 
     fn stop(self: *ManagedTransfer) void {
         // Signal the session loop to exit; it re-checks `running` every poll
@@ -507,6 +510,46 @@ pub const Manager = struct {
         self.restoring = false;
         self.persist();
         if (restored > 0) log.info("restored {d} transfer(s) from saved state", .{restored});
+    }
+
+    /// Capture any download whose (magnet) metadata has resolved: write the real
+    /// `.torrent` next to the data, repoint the persisted source at it, and
+    /// re-persist. A subsequent restart then resumes the torrent fully —
+    /// verifying on-disk pieces — instead of re-bootstrapping the magnet. Called
+    /// periodically by the daemon; idempotent (the `resolved` flag).
+    pub fn checkpoint(self: *Manager) void {
+        var changed = false;
+        self.mutex.lock();
+        for (self.transfers.items) |mt| {
+            if (mt.is_seed or mt.resolved) continue;
+            const blob = mt.session.copyTorrent(self.allocator) orelse continue;
+            defer self.allocator.free(blob);
+            // Name the file by info-hash (safe; the display name may contain /).
+            const path = std.fmt.allocPrint(self.allocator, "{s}/{s}.carl.torrent", .{ self.cfg.download_dir, &mt.hash_hex }) catch continue;
+            var wrote = true;
+            {
+                var f = std.fs.cwd().createFile(path, .{ .truncate = true }) catch {
+                    self.allocator.free(path);
+                    continue;
+                };
+                defer f.close();
+                f.writeAll(blob) catch {
+                    wrote = false;
+                };
+            }
+            if (!wrote) {
+                self.allocator.free(path);
+                continue;
+            }
+            // Repoint the persisted recipe at the resolved .torrent (ownership of
+            // `path` moves to mt.source).
+            self.allocator.free(mt.source);
+            mt.source = path;
+            mt.resolved = true;
+            changed = true;
+        }
+        self.mutex.unlock();
+        if (changed) self.persist();
     }
 
     // -----------------------------------------------------------------------

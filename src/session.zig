@@ -74,6 +74,12 @@ pub const Session = struct {
     // init struct literal need not set it.
     snapshot_mutex: std.Thread.Mutex = .{},
 
+    // The resolved `.torrent` bytes, built once metadata completes (magnet path)
+    // so the daemon can persist it and resume the torrent fully — verifying
+    // on-disk pieces — instead of re-bootstrapping a magnet. Guarded by
+    // `snapshot_mutex`; freed in deinit. Defaulted so init need not set it.
+    torrent_blob: ?[]u8 = null,
+
     // Choking state
     last_unchoke_time: i64,
     last_optimistic_time: i64,
@@ -238,6 +244,7 @@ pub const Session = struct {
         if (self.dht_instance) |*d| d.deinit();
         if (self.metadata_download) |*md| md.deinit();
         if (self.listener) |*l| l.deinit();
+        if (self.torrent_blob) |b| self.allocator.free(b);
         self.our_bitfield.deinit(self.allocator);
         self.store.deinit();
         // The magnet path replaces `meta` with a session-owned copy; free it.
@@ -259,6 +266,15 @@ pub const Session = struct {
         mode: Mode,
         metadata_only: bool,
     };
+
+    /// A copy of the resolved `.torrent` bytes, or null if metadata isn't in
+    /// yet (or this was never a magnet). Caller owns the result.
+    pub fn copyTorrent(self: *Session, a: Allocator) ?[]u8 {
+        self.snapshot_mutex.lock();
+        defer self.snapshot_mutex.unlock();
+        const blob = self.torrent_blob orelse return null;
+        return a.dupe(u8, blob) catch null;
+    }
 
     pub fn progressSnapshot(self: *Session) Progress {
         self.snapshot_mutex.lock();
@@ -894,6 +910,15 @@ pub const Session = struct {
         self.metadata_only = false;
         if (self.metadata_download) |*md| md.deinit();
         self.metadata_download = null;
+
+        // Capture the now-resolved .torrent so the daemon can persist it and
+        // resume this torrent fully on restart. Built here where `meta` is
+        // settled; published under snapshot_mutex for the reader thread.
+        if (buildTorrentBytes(self.allocator, self.meta)) |blob| {
+            self.snapshot_mutex.lock();
+            self.torrent_blob = blob;
+            self.snapshot_mutex.unlock();
+        } else |_| {}
 
         // Re-parse any bitfields that arrived before we knew the piece count, so
         // peers connected during the metadata phase are usable for downloading
@@ -1627,3 +1652,16 @@ pub const Session = struct {
         }
     }
 };
+
+/// Re-encode a resolved Metainfo into full `.torrent` bytes: a top-level dict
+/// `{ "announce", "info" }`. The info dict is decoded from `raw_info` and
+/// re-encoded canonically, so the info-hash is preserved. Caller owns the result.
+fn buildTorrentBytes(a: Allocator, meta: metainfo.Metainfo) ![]u8 {
+    const info_val = try bencode.decode(a, meta.raw_info);
+    defer info_val.deinit(a);
+    const entries = [_]bencode.Value.DictEntry{
+        .{ .key = "announce", .value = .{ .string = meta.announce } },
+        .{ .key = "info", .value = info_val },
+    };
+    return bencode.encode(a, .{ .dict = &entries });
+}
