@@ -1,0 +1,27 @@
+{
+  "name": "carl-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Desktop GUI for carl — privacy-first BitTorrent client",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "@tauri-apps/api": "^2.1.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.1.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.6.3",
+    "vite": "^6.0.3"
+  }
+}

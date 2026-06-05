@@ -1,0 +1,38 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "carl",
+  "version": "0.1.0",
+  "identifier": "org.carl.desktop",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5180",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "carl",
+        "width": 1240,
+        "height": 820,
+        "minWidth": 900,
+        "minHeight": 600,
+        "theme": "Dark"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}
