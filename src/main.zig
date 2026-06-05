@@ -130,7 +130,7 @@ fn printUsage() void {
         \\           search nostr relays for kind-2003 torrent events
         \\  nostr-keygen                                     generate a fresh nostr key
         \\  daemon [--port p] [--bt-port p] [--route direct|proxy|tor] [--socks url]
-        \\         [--download-dir d] [--token tok]
+        \\         [--download-dir d] [--token tok] [--parent-pid pid]
         \\           run a localhost HTTP+WebSocket API for the desktop GUI.
         \\           binds 127.0.0.1 only; every request needs the printed token
         \\           (X-Carl-Token header, or ?token= for the /ws upgrade).
@@ -732,6 +732,23 @@ fn daemonSigintHandler(_: i32) callconv(.c) void {
     carl.session.shutdown_requested.store(true, .release);
 }
 
+/// Watch the spawning parent (the desktop shell). If it dies — including a hard
+/// SIGKILL/crash that bypasses the shell's own cleanup — request shutdown so we
+/// never linger as an orphan holding the port. `kill(pid, 0)` probes existence:
+/// ProcessNotFound means the parent is gone; PermissionDenied means it's alive.
+fn parentWatchdog(parent_pid: std.posix.pid_t) void {
+    while (!carl.session.shutdown_requested.load(.acquire)) {
+        std.Thread.sleep(std.time.ns_per_s);
+        std.posix.kill(parent_pid, 0) catch |err| switch (err) {
+            error.ProcessNotFound => {
+                carl.session.shutdown_requested.store(true, .release);
+                return;
+            },
+            else => {}, // alive (e.g. PermissionDenied) — keep watching
+        };
+    }
+}
+
 fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u8) !void {
     const port = parsePortFlag(extra, "--port", 8088);
     const bt_port = parsePortFlag(extra, "--bt-port", 6881);
@@ -776,6 +793,16 @@ fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u
         .flags = 0,
     };
     std.posix.sigaction(std.posix.SIG.INT, &act, null);
+
+    // Optional parent-death watchdog: the desktop shell passes --parent-pid so a
+    // hard-killed app doesn't leave the daemon orphaned on the port.
+    if (parseFlag(extra, "--parent-pid")) |pid_str| {
+        if (std.fmt.parseInt(std.posix.pid_t, pid_str, 10)) |pid| {
+            if (std.Thread.spawn(.{}, parentWatchdog, .{pid})) |t| {
+                t.detach();
+            } else |e| log.warn("parent watchdog failed to start: {}", .{e});
+        } else |_| log.warn("invalid --parent-pid '{s}', ignoring", .{pid_str});
+    }
 
     // Restore persisted transfers/seeds + settings so a restart loses nothing.
     mgr.restore();

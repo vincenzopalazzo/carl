@@ -14,8 +14,12 @@ identity/relays/settings read the real config. See **Not yet wired** at the end.
 
 ```sh
 carl daemon [--port p] [--bt-port p] [--route direct|proxy|tor] [--socks url] \
-            [--download-dir d] [--token tok]
+            [--download-dir d] [--token tok] [--parent-pid pid]
 ```
+
+- `--parent-pid`: when set (the desktop shell passes its own PID), a watchdog
+  shuts the daemon down if that process dies — so a hard-killed app never leaves
+  an orphaned daemon holding the port.
 
 - Binds **127.0.0.1 only**. Never exposed off the loopback interface.
 - `--port` (default `8088`): the HTTP/WebSocket port.
