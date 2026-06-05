@@ -37,11 +37,14 @@ export function CarlProvider({ children }: { children: React.ReactNode }) {
   const clientRef = useRef<DaemonClient | null>(null);
 
   // Resolve config, fetch the initial snapshot, and subscribe to the live
-  // WebSocket. Reconnects with a fixed backoff if the socket drops.
+  // WebSocket. Reconnects with exponential backoff (capped, jittered) if the
+  // socket drops, so a down daemon isn't hammered every tick.
   useEffect(() => {
     let ws: WebSocket | null = null;
     let retry: ReturnType<typeof setTimeout> | null = null;
     let cancelled = false;
+    let backoff = 1000;
+    const MAX_BACKOFF = 15000;
 
     async function start() {
       try {
@@ -70,10 +73,24 @@ export function CarlProvider({ children }: { children: React.ReactNode }) {
         },
         (isConnected) => {
           setConnected(isConnected);
-          if (!isConnected && !cancelled) {
-            // The socket dropped (daemon restart / not up yet) — retry.
+          if (isConnected) {
+            backoff = 1000; // reset on success
+            // Refresh the snapshot immediately so a reconnect doesn't show
+            // stale data until the first WS tick arrives.
+            client
+              .getState()
+              .then((s) => {
+                setState(s);
+                setError(null);
+              })
+              .catch(() => {});
+          } else if (!cancelled) {
+            // The socket dropped (daemon restart / not up yet) — retry with
+            // capped, jittered exponential backoff.
             if (retry) clearTimeout(retry);
-            retry = setTimeout(() => connect(client), 1500);
+            const delay = backoff + Math.random() * 500;
+            backoff = Math.min(backoff * 2, MAX_BACKOFF);
+            retry = setTimeout(() => connect(client), delay);
           }
         },
       );

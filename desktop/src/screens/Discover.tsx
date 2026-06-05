@@ -3,7 +3,7 @@ import { Icon, OnionIcon } from "../components/icons";
 import { RelayDot, CopyField } from "../components/atoms";
 import { fmtBytes, trunc } from "../components/format";
 import { useCarl } from "../api/store";
-import type { DiscoverResult, Relay, Route } from "../api/types";
+import type { DiscoverResult, Relay } from "../api/types";
 
 function relayShortName(r: Relay): string {
   const host = r.url.replace(/^wss?:\/\//, "");
@@ -122,7 +122,6 @@ function DiscoverCard({
 export function DiscoverScreen() {
   const { search, addTransfer } = useCarl();
   const [q, setQ] = useState("");
-  const [route, setRoute] = useState<Route>("tor");
   const [added, setAdded] = useState<Record<string, boolean>>({});
   const [all, setAll] = useState<DiscoverResult[]>([]);
   const [loading, setLoading] = useState(false);
@@ -164,9 +163,11 @@ export function DiscoverScreen() {
 
   async function download(d: DiscoverResult) {
     try {
+      // Downloads are Tor-only (same guarantee as the manual Add flow) so a
+      // download never exposes your IP to peers.
       await addTransfer(
         `magnet:?xt=urn:btih:${d.hash}&dn=${encodeURIComponent(d.title)}`,
-        route,
+        "tor",
         true,
       );
       setAdded((s) => ({ ...s, [d.id]: true }));
@@ -183,24 +184,10 @@ export function DiscoverScreen() {
         </div>
         <div className="topbar-r">
           <div
-            className="route-select"
-            title="Route queries & downloads through"
+            className="route-lock"
+            title="Downloads are routed through Tor — your IP is never exposed"
           >
-            {(
-              [
-                ["direct", "Direct"],
-                ["proxy", "Proxy"],
-                ["tor", "Tor"],
-              ] as const
-            ).map(([id, l]) => (
-              <button
-                key={id}
-                className={"rsl-btn" + (route === id ? " active rt-" + id : "")}
-                onClick={() => setRoute(id)}
-              >
-                {l}
-              </button>
-            ))}
+            🧅 Downloads via Tor
           </div>
         </div>
       </div>

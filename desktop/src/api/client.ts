@@ -17,6 +17,14 @@ export interface DaemonConfig {
   token: string;
 }
 
+/** Abort a stuck request so the UI falls back to its offline state instead of
+ *  awaiting a hung daemon socket forever. */
+const REQUEST_TIMEOUT_MS = 8000;
+
+/** Matches the daemon's body cap (docs/daemon-api.md) — guard before reading the
+ *  whole file into memory so a huge drop fails fast with a clear message. */
+const MAX_SEED_BYTES = 256 * 1024 * 1024;
+
 function isTauri(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
@@ -51,11 +59,18 @@ export class DaemonClient {
     return (await res.json()) as T;
   }
 
-  async getState(): Promise<AppState> {
-    const res = await fetch(`${this.cfg.base}/api/state`, {
-      headers: this.headers(),
+  /** fetch() with the daemon token + a timeout so a hung socket can't wedge the
+   *  UI. Caller-supplied headers/options win. */
+  private fetch(path: string, init: RequestInit = {}): Promise<Response> {
+    return fetch(`${this.cfg.base}${path}`, {
+      ...init,
+      headers: { ...this.headers(), ...(init.headers ?? {}) },
+      signal: init.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
-    return this.json<AppState>(res);
+  }
+
+  async getState(): Promise<AppState> {
+    return this.json<AppState>(await this.fetch("/api/state"));
   }
 
   async addTransfer(
@@ -63,28 +78,23 @@ export class DaemonClient {
     route: Route,
     nostr: boolean,
   ): Promise<{ id: string }> {
-    const res = await fetch(`${this.cfg.base}/api/transfers`, {
+    const res = await this.fetch("/api/transfers", {
       method: "POST",
-      headers: this.headers(),
       body: JSON.stringify({ source, route, nostr }),
     });
     return this.json<{ id: string }>(res);
   }
 
   async removeTransfer(id: string): Promise<void> {
-    const res = await fetch(`${this.cfg.base}/api/transfers/${id}`, {
-      method: "DELETE",
-      headers: this.headers(),
-    });
+    const res = await this.fetch(`/api/transfers/${id}`, { method: "DELETE" });
     if (!res.ok && res.status !== 404) {
       throw new Error(`${res.status} ${res.statusText}`);
     }
   }
 
   async search(query: string): Promise<DiscoverResult[]> {
-    const res = await fetch(`${this.cfg.base}/api/search`, {
+    const res = await this.fetch("/api/search", {
       method: "POST",
-      headers: this.headers(),
       body: JSON.stringify({ query }),
     });
     return this.json<DiscoverResult[]>(res);
@@ -96,9 +106,8 @@ export class DaemonClient {
     downloadDir?: string;
     relays?: string[];
   }): Promise<Settings> {
-    const res = await fetch(`${this.cfg.base}/api/settings`, {
+    const res = await this.fetch("/api/settings", {
       method: "POST",
-      headers: this.headers(),
       body: JSON.stringify(patch),
     });
     return this.json<Settings>(res);
@@ -118,6 +127,12 @@ export class DaemonClient {
     route: Route,
     nostr: boolean,
   ): Promise<{ id: string }> {
+    if (file.size > MAX_SEED_BYTES) {
+      const mib = (n: number) => Math.round(n / (1024 * 1024));
+      throw new Error(
+        `file is ${mib(file.size)} MiB; the daemon accepts up to ${mib(MAX_SEED_BYTES)} MiB`,
+      );
+    }
     const bytes = await file.arrayBuffer();
     const res = await fetch(`${this.cfg.base}/api/seeds`, {
       method: "POST",

@@ -48,8 +48,16 @@ fn resolve_carl_bin() -> String {
 /// Spawn `carl daemon` and block (with a timeout) until it reports its token.
 fn spawn_daemon(port: u16) -> Result<(Child, DaemonConfig), String> {
     let bin = resolve_carl_bin();
+    // Pass our PID so the daemon's watchdog shuts it down if this shell dies
+    // without a clean exit (crash / force-quit), instead of orphaning it.
     let mut child = Command::new(&bin)
-        .args(["daemon", "--port", &port.to_string()])
+        .args([
+            "daemon",
+            "--port",
+            &port.to_string(),
+            "--parent-pid",
+            &std::process::id().to_string(),
+        ])
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|e| format!("failed to spawn '{bin}': {e}"))?;
@@ -115,7 +123,13 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building the carl application")
         .run(|app_handle, event| {
-            if let tauri::RunEvent::Exit = event {
+            // Kill the daemon on either teardown event. The daemon's --parent-pid
+            // watchdog is the backstop for crash/force-quit paths that never emit
+            // these (or where `panic = abort` skips unwinding).
+            if matches!(
+                event,
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+            ) {
                 let state = app_handle.state::<DaemonState>();
                 // Bind the taken child first so the MutexGuard temporary drops
                 // before `state` does (avoids an E0597 borrow-lifetime error).
