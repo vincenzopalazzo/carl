@@ -7,6 +7,7 @@
 //              matching the demo daemon.
 import type {
   AppState,
+  CreateTorrentResult,
   DiscoverResult,
   Route,
   Settings,
@@ -146,6 +147,25 @@ export class DaemonClient {
       body: bytes,
     });
     return this.json<{ id: string }>(res);
+  }
+
+  /**
+   * Build a .torrent on disk from a server-side path (a file OR a directory).
+   * Unlike createSeed this uploads no bytes — folders can't be a single body —
+   * so the daemon reads `path` directly and writes `<path>.torrent` (or the
+   * daemon's chosen location). Trackers are optional (Nostr/DHT discovery).
+   * Returns the written path, info-hash, total size, and file count.
+   */
+  async createTorrent(
+    path: string,
+    trackers: string[],
+    comment?: string,
+  ): Promise<CreateTorrentResult> {
+    const res = await this.fetch("/api/torrents", {
+      method: "POST",
+      body: JSON.stringify({ path, trackers, comment }),
+    });
+    return this.json<CreateTorrentResult>(res);
   }
 
   /**

@@ -376,6 +376,191 @@ pub fn createSingleFile(allocator: Allocator, path: []const u8, piece_length: u3
     };
 }
 
+/// Options for building a .torrent. Trackers are optional — carl discovers
+/// peers via Nostr/DHT — but when present the first becomes `announce` and each
+/// gets its own `announce-list` tier (BEP 12).
+pub const CreateOptions = struct {
+    piece_length: u32 = default_piece_length,
+    /// Tracker announce URLs. Empty = a trackerless torrent (Nostr/DHT only).
+    trackers: []const []const u8 = &.{},
+    comment: ?[]const u8 = null,
+    created_by: ?[]const u8 = "carl",
+    /// Unix timestamp for the `creation date` field; null omits it. Pass
+    /// `std.time.timestamp()` from a caller that wants it stamped.
+    creation_date: ?i64 = null,
+};
+
+/// Result of `buildTorrent`: the bencoded .torrent bytes (owned by the caller —
+/// free with the same allocator) plus a summary of what was hashed.
+pub const CreateResult = struct {
+    data: []u8,
+    info_hash: [20]u8,
+    total_length: u64,
+    file_count: usize,
+};
+
+const FileWork = struct {
+    /// Path relative to the torrent root directory.
+    rel: []const u8,
+};
+
+fn lessByRel(_: void, a: FileWork, b: FileWork) bool {
+    return std.mem.lessThan(u8, a.rel, b.rel);
+}
+
+fn hashPiece(aa: Allocator, pieces: *std.ArrayList(u8), data: []const u8) MetainfoError!void {
+    var digest: [20]u8 = undefined;
+    std.crypto.hash.Sha1.hash(data, &digest, .{});
+    pieces.appendSlice(aa, &digest) catch return error.OutOfMemory;
+}
+
+/// Split a relative path on the OS separator into a bencode list of string
+/// components, e.g. "sub/dir/f.txt" → ["sub","dir","f.txt"]. Arena-allocated.
+fn pathComponents(aa: Allocator, rel: []const u8) MetainfoError![]bencode.Value {
+    var comps: std.ArrayList(bencode.Value) = .empty;
+    var it = std.mem.splitScalar(u8, rel, std.fs.path.sep);
+    while (it.next()) |c| {
+        if (c.len == 0) continue;
+        const dup = aa.dupe(u8, c) catch return error.OutOfMemory;
+        comps.append(aa, .{ .string = dup }) catch return error.OutOfMemory;
+    }
+    return comps.toOwnedSlice(aa) catch return error.OutOfMemory;
+}
+
+/// Build a complete .torrent from a file OR a directory and return its bencoded
+/// bytes. Directories become multi-file torrents whose pieces are hashed as one
+/// continuous stream across file boundaries (BEP 3), with files sorted by path
+/// for a deterministic, reproducible info-hash. Trackers/comment/created-by live
+/// in the top-level dict, so they never affect the info-hash. Streams every file
+/// so large inputs don't load into memory at once. Caller owns `result.data`.
+pub fn buildTorrent(allocator: Allocator, path: []const u8, opts: CreateOptions) MetainfoError!CreateResult {
+    const piece_length: u32 = if (opts.piece_length == 0) default_piece_length else opts.piece_length;
+
+    // Everything intermediate (Value tree, piece buffer, per-file dicts) lives in
+    // an arena; only the returned `data` is allocated with `allocator`.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const base = std.fs.path.basename(path);
+    if (base.len == 0) return error.InvalidTorrent;
+    const name = aa.dupe(u8, base) catch return error.OutOfMemory;
+
+    const st = std.fs.cwd().statFile(path) catch return error.InvalidTorrent;
+
+    var pieces: std.ArrayList(u8) = .empty;
+    var total: u64 = 0;
+    var file_count: usize = 0;
+
+    const chunk = aa.alloc(u8, piece_length) catch return error.OutOfMemory;
+    var filled: usize = 0; // bytes pending in `chunk` toward the current piece
+
+    // Info-dict entries are built in sorted key order so the output re-parses
+    // (bencode requires sorted dict keys) and matches other clients' info-hash.
+    var info_entries: std.ArrayList(bencode.Value.DictEntry) = .empty;
+
+    if (st.kind == .directory) {
+        var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch return error.InvalidTorrent;
+        defer dir.close();
+
+        // Collect every regular file (relative to the dir), then sort for a
+        // deterministic piece layout.
+        var works: std.ArrayList(FileWork) = .empty;
+        var walker = dir.walk(aa) catch return error.OutOfMemory;
+        while (walker.next() catch return error.InvalidTorrent) |entry| {
+            if (entry.kind != .file) continue;
+            const rel = aa.dupe(u8, entry.path) catch return error.OutOfMemory;
+            works.append(aa, .{ .rel = rel }) catch return error.OutOfMemory;
+        }
+        if (works.items.len == 0) return error.InvalidTorrent; // empty directory
+        std.mem.sort(FileWork, works.items, {}, lessByRel);
+
+        // Hash all files as one continuous stream — pieces span file boundaries —
+        // while building the `files` list (each a {length, path} dict).
+        var files_list: std.ArrayList(bencode.Value) = .empty;
+        for (works.items) |w| {
+            var f = dir.openFile(w.rel, .{}) catch return error.InvalidTorrent;
+            defer f.close();
+            var flen: u64 = 0;
+            while (true) {
+                const n = f.readAll(chunk[filled..]) catch return error.InvalidTorrent;
+                if (n == 0) break;
+                filled += n;
+                total += n;
+                flen += n;
+                if (filled == piece_length) {
+                    try hashPiece(aa, &pieces, chunk);
+                    filled = 0;
+                }
+            }
+            file_count += 1;
+            const comps = try pathComponents(aa, w.rel);
+            // File dict keys sorted: "length" < "path".
+            const fd = aa.alloc(bencode.Value.DictEntry, 2) catch return error.OutOfMemory;
+            fd[0] = .{ .key = "length", .value = .{ .integer = @intCast(flen) } };
+            fd[1] = .{ .key = "path", .value = .{ .list = comps } };
+            files_list.append(aa, .{ .dict = fd }) catch return error.OutOfMemory;
+        }
+        if (filled > 0) try hashPiece(aa, &pieces, chunk[0..filled]); // final partial piece
+
+        const files_slice = files_list.toOwnedSlice(aa) catch return error.OutOfMemory;
+        // Info keys sorted: "files" < "name" < "piece length" < "pieces".
+        info_entries.append(aa, .{ .key = "files", .value = .{ .list = files_slice } }) catch return error.OutOfMemory;
+        info_entries.append(aa, .{ .key = "name", .value = .{ .string = name } }) catch return error.OutOfMemory;
+        info_entries.append(aa, .{ .key = "piece length", .value = .{ .integer = @intCast(piece_length) } }) catch return error.OutOfMemory;
+        info_entries.append(aa, .{ .key = "pieces", .value = .{ .string = pieces.items } }) catch return error.OutOfMemory;
+    } else {
+        var f = std.fs.cwd().openFile(path, .{}) catch return error.InvalidTorrent;
+        defer f.close();
+        while (true) {
+            const n = f.readAll(chunk[filled..]) catch return error.InvalidTorrent;
+            if (n == 0) break;
+            filled += n;
+            total += n;
+            if (filled == piece_length) {
+                try hashPiece(aa, &pieces, chunk);
+                filled = 0;
+            }
+        }
+        if (filled > 0) try hashPiece(aa, &pieces, chunk[0..filled]);
+        file_count = 1;
+        // Info keys sorted: "length" < "name" < "piece length" < "pieces".
+        info_entries.append(aa, .{ .key = "length", .value = .{ .integer = @intCast(total) } }) catch return error.OutOfMemory;
+        info_entries.append(aa, .{ .key = "name", .value = .{ .string = name } }) catch return error.OutOfMemory;
+        info_entries.append(aa, .{ .key = "piece length", .value = .{ .integer = @intCast(piece_length) } }) catch return error.OutOfMemory;
+        info_entries.append(aa, .{ .key = "pieces", .value = .{ .string = pieces.items } }) catch return error.OutOfMemory;
+    }
+
+    const info_val = bencode.Value{ .dict = info_entries.items };
+
+    // info-hash = SHA-1 of the canonical info-dict bytes.
+    const raw_info = bencode.encode(aa, info_val) catch return error.OutOfMemory;
+    var info_hash: [20]u8 = undefined;
+    std.crypto.hash.Sha1.hash(raw_info, &info_hash, .{});
+
+    // Top-level dict, keys appended in sorted order, optional fields skipped when
+    // absent: "announce" < "announce-list" < "comment" < "created by" <
+    // "creation date" < "info".
+    var top: std.ArrayList(bencode.Value.DictEntry) = .empty;
+    if (opts.trackers.len > 0) {
+        top.append(aa, .{ .key = "announce", .value = .{ .string = opts.trackers[0] } }) catch return error.OutOfMemory;
+        const tiers = aa.alloc(bencode.Value, opts.trackers.len) catch return error.OutOfMemory;
+        for (opts.trackers, 0..) |t, i| {
+            const tier = aa.alloc(bencode.Value, 1) catch return error.OutOfMemory;
+            tier[0] = .{ .string = t };
+            tiers[i] = .{ .list = tier };
+        }
+        top.append(aa, .{ .key = "announce-list", .value = .{ .list = tiers } }) catch return error.OutOfMemory;
+    }
+    if (opts.comment) |c| top.append(aa, .{ .key = "comment", .value = .{ .string = c } }) catch return error.OutOfMemory;
+    if (opts.created_by) |cb| top.append(aa, .{ .key = "created by", .value = .{ .string = cb } }) catch return error.OutOfMemory;
+    if (opts.creation_date) |cd| top.append(aa, .{ .key = "creation date", .value = .{ .integer = cd } }) catch return error.OutOfMemory;
+    top.append(aa, .{ .key = "info", .value = info_val }) catch return error.OutOfMemory;
+
+    const data = bencode.encode(allocator, .{ .dict = top.items }) catch return error.OutOfMemory;
+    return .{ .data = data, .info_hash = info_hash, .total_length = total, .file_count = file_count };
+}
+
 // --- Tests ---
 
 test "createSingleFile: hashes a file into a valid metainfo" {
@@ -404,6 +589,106 @@ test "createSingleFile: hashes a file into a valid metainfo" {
     try std.testing.expectEqualStrings("data.bin", decoded.dictGet("name").?.asString().?);
     const ih = infoHash(mi.raw_info);
     try std.testing.expectEqual(@as(usize, 20), ih.len);
+}
+
+test "buildTorrent: single file re-parses with trackers + matching info-hash" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{ .sub_path = "data.bin", .data = "0123456789" });
+    const path = try tmp.dir.realpathAlloc(allocator, "data.bin");
+    defer allocator.free(path);
+
+    const trackers = [_][]const u8{ "http://t.example/announce", "udp://t2.example:6969" };
+    const res = try buildTorrent(allocator, path, .{
+        .piece_length = 4,
+        .trackers = &trackers,
+        .comment = "hello",
+        .created_by = "carl",
+        .creation_date = 1000,
+    });
+    defer allocator.free(res.data);
+
+    try std.testing.expectEqual(@as(u64, 10), res.total_length);
+    try std.testing.expectEqual(@as(usize, 1), res.file_count);
+
+    // The bytes must re-parse (parse rejects unsorted dict keys, so this also
+    // proves canonical key ordering throughout).
+    const mi = try parse(allocator, res.data);
+    defer mi.deinit(allocator);
+    try std.testing.expectEqualStrings("data.bin", mi.name);
+    try std.testing.expectEqualStrings("http://t.example/announce", mi.announce);
+    try std.testing.expectEqual(@as(usize, 1), mi.files.len);
+    try std.testing.expectEqual(@as(u64, 10), mi.files[0].length);
+    try std.testing.expectEqual(@as(usize, 60), mi.pieces.len); // 3 pieces × 20
+    try std.testing.expectEqualStrings("hello", mi.comment.?);
+    try std.testing.expectEqual(@as(i64, 1000), mi.creation_date.?);
+    try std.testing.expectEqualStrings("carl", mi.created_by.?);
+
+    // info-hash reported by buildTorrent matches the parsed info dict's hash.
+    const ih = infoHash(mi.raw_info);
+    try std.testing.expectEqualSlices(u8, &res.info_hash, &ih);
+}
+
+test "buildTorrent: directory hashes pieces continuously across files" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("d/sub");
+    try tmp.dir.writeFile(.{ .sub_path = "d/a.txt", .data = "AAAA" }); // 4 bytes
+    try tmp.dir.writeFile(.{ .sub_path = "d/sub/b.txt", .data = "BBBBBB" }); // 6 bytes
+    const path = try tmp.dir.realpathAlloc(allocator, "d");
+    defer allocator.free(path);
+
+    // 10 bytes total, piece_length 4 → 3 pieces; the 2nd piece spans a.txt→b.txt.
+    const res = try buildTorrent(allocator, path, .{ .piece_length = 4, .created_by = null });
+    defer allocator.free(res.data);
+
+    try std.testing.expectEqual(@as(u64, 10), res.total_length);
+    try std.testing.expectEqual(@as(usize, 2), res.file_count);
+
+    const mi = try parse(allocator, res.data);
+    defer mi.deinit(allocator);
+    try std.testing.expectEqualStrings("d", mi.name);
+    try std.testing.expectEqual(@as(usize, 60), mi.pieces.len); // 3 pieces × 20
+    try std.testing.expectEqual(@as(usize, 2), mi.files.len);
+    // Files sorted by path: "a.txt" before "sub/b.txt".
+    try std.testing.expectEqual(@as(usize, 1), mi.files[0].path.len);
+    try std.testing.expectEqualStrings("a.txt", mi.files[0].path[0]);
+    try std.testing.expectEqual(@as(u64, 4), mi.files[0].length);
+    try std.testing.expectEqual(@as(usize, 2), mi.files[1].path.len);
+    try std.testing.expectEqualStrings("sub", mi.files[1].path[0]);
+    try std.testing.expectEqualStrings("b.txt", mi.files[1].path[1]);
+    try std.testing.expectEqual(@as(u64, 6), mi.files[1].length);
+    try std.testing.expect(mi.created_by == null);
+}
+
+test "buildTorrent: trackerless single file omits announce" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "x.bin", .data = "abcd" });
+    const path = try tmp.dir.realpathAlloc(allocator, "x.bin");
+    defer allocator.free(path);
+
+    const res = try buildTorrent(allocator, path, .{ .piece_length = 4 });
+    defer allocator.free(res.data);
+    const mi = try parse(allocator, res.data);
+    defer mi.deinit(allocator);
+    try std.testing.expectEqualStrings("", mi.announce); // no tracker
+    try std.testing.expect(mi.announce_list == null);
+}
+
+test "buildTorrent: empty directory rejects" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("empty");
+    const path = try tmp.dir.realpathAlloc(allocator, "empty");
+    defer allocator.free(path);
+    try std.testing.expectError(error.InvalidTorrent, buildTorrent(allocator, path, .{}));
 }
 
 test "parse single-file torrent" {

@@ -41,8 +41,170 @@ fn daemon_config(state: tauri::State<DaemonState>) -> Result<DaemonConfig, Strin
         .ok_or_else(|| "daemon not ready".to_string())
 }
 
+/// Resolve the `carl` daemon binary, in priority order:
+///   1. `CARL_BIN` env var — the dev workflow points this at `zig-out/bin/carl`.
+///   2. The bundled sidecar next to the app executable (Contents/MacOS/carl) —
+///      so a Finder-launched app ships its own daemon and never depends on
+///      `$PATH` (GUI apps get a minimal PATH without ~/.local/bin or
+///      /usr/local/bin, which otherwise yields "daemon offline").
+///   3. `carl` on `$PATH` — the bare fallback for a dev shell.
 fn resolve_carl_bin() -> String {
-    std::env::var("CARL_BIN").unwrap_or_else(|_| "carl".to_string())
+    if let Ok(p) = std::env::var("CARL_BIN") {
+        return p;
+    }
+    if let Some(sidecar) = bundled_sidecar() {
+        return sidecar.to_string_lossy().into_owned();
+    }
+    "carl".to_string()
+}
+
+/// The bundled sidecar `carl` next to the app executable, if present (only in a
+/// packaged app — not a `CARL_BIN` dev run).
+fn bundled_sidecar() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let sidecar = exe.parent()?.join("carl");
+    sidecar.exists().then_some(sidecar)
+}
+
+/// The system CLI symlink location — on the default terminal PATH, root-owned
+/// (so installing here needs a one-time admin authorization, like Docker).
+const SYSTEM_CLI_PATH: &str = "/usr/local/bin/carl";
+
+/// The per-user CLI location — no password needed, but only useful if the user
+/// has `~/.local/bin` on their PATH.
+fn user_cli_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(
+        std::path::Path::new(&home)
+            .join(".local")
+            .join("bin")
+            .join("carl"),
+    )
+}
+
+/// Reported to the UI so it can mirror Docker's "CLI installed / not installed"
+/// state and offer install/remove.
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CliStatus {
+    /// The packaged app has a bundled `carl` to link to (false in a dev run).
+    available: bool,
+    /// A `carl` is present at one of the known install locations.
+    installed: bool,
+    /// Where it's installed, if any.
+    path: Option<String>,
+    /// True when the installed entry is a symlink into THIS app bundle (so it
+    /// tracks app updates — the Docker model). A plain file or a link elsewhere
+    /// reports false.
+    linked_to_bundle: bool,
+}
+
+/// Run a shell command with one-time admin authorization via the native macOS
+/// dialog (the Homebrew-cask approach). `script` must be a self-contained
+/// `/bin/sh` snippet using single-quoted paths.
+#[cfg(target_os = "macos")]
+fn run_admin(script: &str) -> Result<(), String> {
+    // Embed into an AppleScript string: escape backslashes and double quotes.
+    let escaped = script.replace('\\', "\\\\").replace('"', "\\\"");
+    let osa = format!("do shell script \"{escaped}\" with administrator privileges");
+    let out = Command::new("osascript")
+        .arg("-e")
+        .arg(osa)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        // Cancelling the password dialog yields "User canceled. (-128)".
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// Report whether the bundled CLI is available and where (if anywhere) it's
+/// installed — so Settings can show the right install/remove affordance.
+#[tauri::command]
+fn cli_status() -> CliStatus {
+    let bundle = bundled_sidecar();
+    let mut candidates: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from(SYSTEM_CLI_PATH)];
+    if let Some(u) = user_cli_path() {
+        candidates.push(u);
+    }
+    for p in candidates {
+        // symlink_metadata so a symlink doesn't get followed/hidden.
+        if std::fs::symlink_metadata(&p).is_ok() {
+            let linked_to_bundle = match (std::fs::read_link(&p).ok(), bundle.as_ref()) {
+                (Some(t), Some(b)) => &t == b,
+                _ => false,
+            };
+            return CliStatus {
+                available: bundle.is_some(),
+                installed: true,
+                path: Some(p.to_string_lossy().into_owned()),
+                linked_to_bundle,
+            };
+        }
+    }
+    CliStatus {
+        available: bundle.is_some(),
+        installed: false,
+        path: None,
+        linked_to_bundle: false,
+    }
+}
+
+/// Install the CLI by symlinking a PATH location to the bundled `carl` — so the
+/// CLI always tracks this app's version (no stale copies, no signature kill).
+/// `system` targets `/usr/local/bin` (one admin prompt); otherwise `~/.local/bin`
+/// (no prompt). Returns the installed path.
+#[tauri::command]
+fn install_cli(system: bool) -> Result<String, String> {
+    let sidecar = bundled_sidecar().ok_or("the command-line tool isn't available in this build")?;
+    let src = sidecar.to_string_lossy();
+    if system {
+        // mkdir + symlink, replacing any existing entry, with one auth prompt.
+        let script = format!(
+            "mkdir -p /usr/local/bin && ln -sf '{src}' '{SYSTEM_CLI_PATH}'",
+            src = src,
+        );
+        #[cfg(target_os = "macos")]
+        {
+            run_admin(&script)?;
+            Ok(SYSTEM_CLI_PATH.to_string())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = script;
+            Err("system install is only implemented on macOS".to_string())
+        }
+    } else {
+        let dest = user_cli_path().ok_or("no HOME directory")?;
+        if let Some(dir) = dest.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        let _ = std::fs::remove_file(&dest); // replace any existing entry
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&sidecar, &dest).map_err(|e| e.to_string())?;
+        Ok(dest.to_string_lossy().into_owned())
+    }
+}
+
+/// Remove a CLI symlink we installed. `system` targets `/usr/local/bin` (admin
+/// prompt); otherwise `~/.local/bin`.
+#[tauri::command]
+fn uninstall_cli(system: bool) -> Result<(), String> {
+    if system {
+        #[cfg(target_os = "macos")]
+        {
+            run_admin(&format!("rm -f '{SYSTEM_CLI_PATH}'"))?;
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
+        Err("system uninstall is only implemented on macOS".to_string())
+    } else {
+        let dest = user_cli_path().ok_or("no HOME directory")?;
+        let _ = std::fs::remove_file(&dest);
+        Ok(())
+    }
 }
 
 /// Spawn `carl daemon` and block (with a timeout) until it reports its token.
@@ -103,8 +265,14 @@ fn spawn_daemon(port: u16) -> Result<(Child, DaemonConfig), String> {
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(DaemonState::default())
-        .invoke_handler(tauri::generate_handler![daemon_config])
+        .invoke_handler(tauri::generate_handler![
+            daemon_config,
+            cli_status,
+            install_cli,
+            uninstall_cli
+        ])
         .setup(|app| {
             match spawn_daemon(DAEMON_PORT) {
                 Ok((child, cfg)) => {

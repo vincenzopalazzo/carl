@@ -63,6 +63,17 @@ export interface Settings {
   publishNip35: boolean;
 }
 
+export interface CreateTorrentResult {
+  /** Absolute path of the .torrent written on disk. */
+  path: string;
+  /** info-hash, lowercase hex (40 chars). */
+  infoHash: string;
+  /** Total size of the source content, bytes. */
+  size: number;
+  /** Number of files included. */
+  files: number;
+}
+
 export interface DiscoverResult {
   id: string;
   title: string;

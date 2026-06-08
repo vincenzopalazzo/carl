@@ -7,7 +7,12 @@ import React, {
   useState,
 } from "react";
 import { DaemonClient, resolveConfig } from "./client";
-import { type AppState, emptyState, type Route } from "./types";
+import {
+  type AppState,
+  type CreateTorrentResult,
+  emptyState,
+  type Route,
+} from "./types";
 
 interface CarlContextValue {
   state: AppState;
@@ -25,6 +30,11 @@ interface CarlContextValue {
     relays?: string[];
   }) => Promise<void>;
   createSeed: (file: File, route: Route, nostr: boolean) => Promise<void>;
+  createTorrent: (
+    path: string,
+    trackers: string[],
+    comment?: string,
+  ) => Promise<CreateTorrentResult>;
   refresh: () => Promise<void>;
 }
 
@@ -161,6 +171,17 @@ export function CarlProvider({ children }: { children: React.ReactNode }) {
     [refresh],
   );
 
+  // Creating a .torrent writes a file but doesn't change daemon state, so no
+  // refresh is needed — the caller just gets the written path back.
+  const createTorrent = useCallback(
+    async (path: string, trackers: string[], comment?: string) => {
+      const c = clientRef.current;
+      if (!c) throw new Error("daemon not connected");
+      return c.createTorrent(path, trackers, comment);
+    },
+    [],
+  );
+
   const value: CarlContextValue = {
     state,
     connected,
@@ -171,6 +192,7 @@ export function CarlProvider({ children }: { children: React.ReactNode }) {
     setRoute,
     updateSettings,
     createSeed,
+    createTorrent,
     refresh,
   };
   return <CarlContext.Provider value={value}>{children}</CarlContext.Provider>;

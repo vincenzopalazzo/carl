@@ -7,7 +7,7 @@
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5180",
     "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build"
+    "beforeBuildCommand": "sh scripts/stage-sidecar.sh && npm run build"
   },
   "app": {
     "windows": [
@@ -27,6 +27,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "externalBin": ["binaries/carl"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
