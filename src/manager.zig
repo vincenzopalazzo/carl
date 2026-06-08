@@ -484,7 +484,10 @@ pub const Manager = struct {
 
         self.mutex.lock();
         self.cfg.route = st.route;
-        if (st.download_dir.len > 0) {
+        // Treat "." (the bare placeholder default) as "unset" so a stale
+        // persisted "." doesn't clobber an explicit --download-dir passed on
+        // startup (e.g. the desktop shell's ~/Downloads/carl-download).
+        if (st.download_dir.len > 0 and !std.mem.eql(u8, st.download_dir, ".")) {
             if (self.allocator.dupe(u8, st.download_dir)) |d| {
                 self.allocator.free(self.cfg.download_dir);
                 self.cfg.download_dir = d;

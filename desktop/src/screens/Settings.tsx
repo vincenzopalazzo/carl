@@ -4,6 +4,147 @@ import { CopyField } from "../components/atoms";
 import { trunc } from "../components/format";
 import { useCarl } from "../api/store";
 import type { Route } from "../api/types";
+import {
+  cliStatus,
+  installCli,
+  uninstallCli,
+  type CliStatus,
+} from "../api/cli";
+
+/** Command-line tools, Docker-style: symlink a PATH location to the bundled
+ *  `carl` so the CLI tracks the app. System install (/usr/local/bin) needs a
+ *  one-time password; user install (~/.local/bin) doesn't. */
+function CliToolsSection() {
+  const [status, setStatus] = useState<CliStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function reload() {
+    try {
+      setStatus(await cliStatus());
+    } catch (e) {
+      setErr(String(e));
+    }
+  }
+  useEffect(() => {
+    reload();
+  }, []);
+
+  async function run(fn: () => Promise<unknown>) {
+    setBusy(true);
+    setErr(null);
+    try {
+      await fn();
+      await reload();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="sset">
+      <div className="sset-head">
+        <h2 className="sset-title">Command-line tools</h2>
+        <p className="sset-sub">
+          Install the <span className="mono">carl</span> CLI so it's available in
+          your terminal. It's symlinked to this app, so it always matches the
+          installed version.
+        </p>
+      </div>
+      <div className="sset-body">
+        {!status ? (
+          <div className="field-hint">Checking…</div>
+        ) : !status.available ? (
+          <div className="callout-note">
+            <Icon name="shield" size={15} stroke={1.8} />
+            <span>
+              The bundled CLI is only available in the packaged desktop app
+              (this looks like a dev/browser session).
+            </span>
+          </div>
+        ) : status.installed ? (
+          <>
+            <div className="leak-check lc-safe">
+              <span className="lc-dot" />
+              <div className="lc-body">
+                <div className="lc-title">
+                  CLI installed
+                  {status.linkedToBundle
+                    ? " · linked to this app"
+                    : " · not linked to this app"}
+                </div>
+                <div className="lc-detail mono">{status.path}</div>
+              </div>
+            </div>
+            {!status.linkedToBundle && (
+              <div className="callout-note">
+                <Icon name="shield" size={15} stroke={1.8} />
+                <span>
+                  This <span className="mono">carl</span> isn't a symlink to the
+                  app — reinstall below to have it track app updates.
+                </span>
+              </div>
+            )}
+            <div className="id-actions">
+              <button
+                className="btn btn-sm"
+                disabled={busy}
+                onClick={() => run(() => installCli(status.system))}
+              >
+                <Icon name="check" size={13} stroke={2.2} />
+                {busy ? "Working…" : "Reinstall"}
+              </button>
+              <button
+                className="btn btn-sm"
+                disabled={busy}
+                onClick={() => run(() => uninstallCli(status.system))}
+              >
+                Remove
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="field-hint">
+              Not installed. Choose where to put the{" "}
+              <span className="mono">carl</span> command:
+            </div>
+            <div className="id-actions">
+              <button
+                className="btn btn-sm btn-primary"
+                disabled={busy}
+                onClick={() => run(() => installCli(true))}
+              >
+                <Icon name="plus" size={13} stroke={2.2} />
+                {busy ? "Working…" : "Install (system · /usr/local/bin)"}
+              </button>
+              <button
+                className="btn btn-sm"
+                disabled={busy}
+                onClick={() => run(() => installCli(false))}
+              >
+                Install (user · ~/.local/bin)
+              </button>
+            </div>
+            <span className="field-hint">
+              System install asks for your password once. User install needs no
+              password but only works if <span className="mono">~/.local/bin</span>{" "}
+              is on your PATH.
+            </span>
+          </>
+        )}
+        {err && (
+          <div className="callout-note" style={{ color: "var(--danger)" }}>
+            <Icon name="close" size={15} stroke={1.8} />
+            <span>{err}</span>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
 
 function LeakCheck({ route, socks }: { route: Route; socks: string }) {
   const safe = route !== "direct";
@@ -306,6 +447,9 @@ export function SettingsScreen() {
             )}
           </div>
         </section>
+
+        {/* Command-line tools */}
+        <CliToolsSection />
       </div>
     </div>
   );

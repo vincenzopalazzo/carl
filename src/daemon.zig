@@ -16,6 +16,7 @@ const http = @import("http.zig");
 const ws_server = @import("ws_server.zig");
 const manager_mod = @import("manager.zig");
 const session_mod = @import("session.zig");
+const metainfo = @import("metainfo.zig");
 const api = @import("api.zig");
 const nostr_config = @import("nostr_config.zig");
 const proxy_mod = @import("proxy.zig");
@@ -281,6 +282,7 @@ const Conn = struct {
         if (std.mem.eql(u8, req.method, "POST")) {
             if (std.mem.eql(u8, path, "/api/transfers")) return self.addTransfer(body);
             if (std.mem.eql(u8, path, "/api/seeds")) return self.createSeed(req, body);
+            if (std.mem.eql(u8, path, "/api/torrents")) return self.createTorrent(body);
             if (std.mem.eql(u8, path, "/api/search")) return self.search(req, body);
             if (std.mem.eql(u8, path, "/api/settings")) return self.updateSettings(body);
             return self.sendStatus(.not_found);
@@ -447,6 +449,110 @@ const Conn = struct {
         try self.sendJson(.ok, j.buf.items);
     }
 
+    /// Outcome of building a .torrent on disk, in arena memory.
+    const TorrentBuilt = struct {
+        out_path: []const u8,
+        info_hash_hex: [40]u8,
+        size: u64,
+        files: usize,
+    };
+
+    /// Shared by the HTTP route and the WebSocket command: build a .torrent from
+    /// a server-side `src_path` (file OR directory), write it next to the source
+    /// as `<src>.torrent`, and return a summary. The output path is derived from
+    /// the source (never client-supplied) so a request can't make the daemon
+    /// overwrite an arbitrary file. Creation is path-based (folders can't be
+    /// uploaded as bytes); the daemon binds loopback and is token-guarded, and
+    /// the desktop supplies the path from a native picker.
+    fn doCreateTorrent(
+        self: *Conn,
+        aa: Allocator,
+        src_path: []const u8,
+        trackers: []const []const u8,
+        comment: ?[]const u8,
+    ) !TorrentBuilt {
+        const res = metainfo.buildTorrent(self.daemon.allocator, src_path, .{
+            .trackers = trackers,
+            .comment = comment,
+            .created_by = "carl",
+            .creation_date = std.time.timestamp(),
+        }) catch return error.CreateFailed;
+        defer self.daemon.allocator.free(res.data);
+
+        // Derive `<src>.torrent`, trimming a trailing slash so a directory path
+        // "/a/b/" yields "/a/b.torrent" (beside it), not "/a/b/.torrent" (inside).
+        const sep = [_]u8{std.fs.path.sep};
+        const trimmed = std.mem.trimRight(u8, src_path, &sep);
+        const base_path = if (trimmed.len == 0) src_path else trimmed;
+        const out_path = try std.fmt.allocPrint(aa, "{s}.torrent", .{base_path});
+        {
+            var f = std.fs.cwd().createFile(out_path, .{ .truncate = true }) catch return error.WriteFailed;
+            defer f.close();
+            f.writeAll(res.data) catch return error.WriteFailed;
+        }
+
+        var hex: [40]u8 = undefined;
+        secp.toHex(&res.info_hash, &hex);
+        return .{
+            .out_path = out_path,
+            .info_hash_hex = hex,
+            .size = res.total_length,
+            .files = res.file_count,
+        };
+    }
+
+    /// Pull the optional tracker list and comment out of a parsed create-torrent
+    /// request object. Trackers default to empty (trackerless).
+    fn parseCreateBody(aa: Allocator, obj: std.json.ObjectMap) !struct {
+        trackers: []const []const u8,
+        comment: ?[]const u8,
+    } {
+        var trackers: std.ArrayList([]const u8) = .empty;
+        if (obj.get("trackers")) |v| {
+            if (v == .array) {
+                for (v.array.items) |it| {
+                    if (it == .string and it.string.len > 0) try trackers.append(aa, it.string);
+                }
+            }
+        }
+        return .{
+            .trackers = try trackers.toOwnedSlice(aa),
+            .comment = strField(obj, "comment"),
+        };
+    }
+
+    /// POST /api/torrents — body is JSON {path, trackers?, comment?}. `path` is a
+    /// server-side file or directory; creates `<path>.torrent` on disk and
+    /// returns { path, infoHash, size, files }.
+    fn createTorrent(self: *Conn, body: []const u8) !void {
+        const a = self.daemon.allocator;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        const parsed = std.json.parseFromSlice(std.json.Value, aa, body, .{}) catch
+            return self.sendStatus(.bad_request);
+        const obj = if (parsed.value == .object) parsed.value.object else return self.sendStatus(.bad_request);
+        const src_path = strField(obj, "path") orelse return self.sendStatus(.bad_request);
+        if (src_path.len == 0) return self.sendStatus(.bad_request);
+        const opts = parseCreateBody(aa, obj) catch return self.sendStatus(.internal_error);
+
+        const built = self.doCreateTorrent(aa, src_path, opts.trackers, opts.comment) catch |err| {
+            log.warn("createTorrent failed for '{s}': {}", .{ src_path, err });
+            // Bad input (unreadable/empty source) → 400; disk/write failure → 500.
+            return self.sendStatus(if (err == error.WriteFailed) .internal_error else .bad_request);
+        };
+
+        var j = api.Json.init(aa);
+        try j.beginObject();
+        try j.keyString("path", built.out_path);
+        try j.keyString("infoHash", &built.info_hash_hex);
+        try j.keyNumber("size", built.size);
+        try j.keyNumber("files", built.files);
+        try j.endObject();
+        try self.sendJson(.ok, j.buf.items);
+    }
+
     fn updateSettings(self: *Conn, body: []const u8) !void {
         const a = self.daemon.allocator;
         var arena = std.heap.ArenaAllocator.init(a);
@@ -536,6 +642,26 @@ const Conn = struct {
         // GUI only needs the push channel — so a closed socket is detected by
         // the next send failing.
         while (self.daemon.running.load(.acquire) and !session_mod.shutdown_requested.load(.acquire)) {
+            // Drain any pending client command frames (e.g. create_torrent)
+            // before the push, without stalling the cadence: poll with a 0ms
+            // timeout and handle only what's already buffered.
+            while (socketReadable(self.stream.handle)) {
+                const frame = ws_server.readFrame(a, self.stream) catch {
+                    ws_server.sendClose(a, self.stream);
+                    return;
+                };
+                defer frame.deinit(a);
+                switch (frame.opcode) {
+                    .text => self.handleWsCommand(frame.payload) catch {},
+                    .ping => ws_server.sendPong(a, self.stream, frame.payload) catch {},
+                    .close => {
+                        ws_server.sendClose(a, self.stream);
+                        return;
+                    },
+                    else => {},
+                }
+            }
+
             // Cheap when nothing changed; captures a resolved magnet's .torrent
             // within ~1s so a restart resumes it as a complete torrent.
             self.daemon.manager.checkpoint();
@@ -562,6 +688,55 @@ const Conn = struct {
             }
         }
         ws_server.sendClose(a, self.stream);
+    }
+
+    /// Handle one client text frame as a JSON command. Currently the only
+    /// command is `create_torrent` — mirroring POST /api/torrents over the
+    /// socket so the desktop can request creation and get a `torrent_created`
+    /// result frame back. Unknown commands are ignored.
+    fn handleWsCommand(self: *Conn, payload: []const u8) !void {
+        const a = self.daemon.allocator;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        const parsed = std.json.parseFromSlice(std.json.Value, aa, payload, .{}) catch return;
+        if (parsed.value != .object) return;
+        const obj = parsed.value.object;
+        const cmd = strField(obj, "cmd") orelse return;
+        if (!std.mem.eql(u8, cmd, "create_torrent")) return;
+
+        const req_id = strField(obj, "reqId") orelse "";
+        const src_path = strField(obj, "path") orelse return self.wsCreateError(aa, req_id, "missing path");
+        if (src_path.len == 0) return self.wsCreateError(aa, req_id, "missing path");
+        const opts = parseCreateBody(aa, obj) catch return self.wsCreateError(aa, req_id, "bad request");
+
+        const built = self.doCreateTorrent(aa, src_path, opts.trackers, opts.comment) catch
+            return self.wsCreateError(aa, req_id, "create failed");
+
+        var j = api.Json.init(aa);
+        try j.beginObject();
+        try j.keyString("type", "torrent_created");
+        try j.keyString("reqId", req_id);
+        try j.keyBool("ok", true);
+        try j.keyString("path", built.out_path);
+        try j.keyString("infoHash", &built.info_hash_hex);
+        try j.keyNumber("size", built.size);
+        try j.keyNumber("files", built.files);
+        try j.endObject();
+        ws_server.sendText(a, self.stream, j.buf.items) catch {};
+    }
+
+    /// Send a `torrent_created` failure frame for a WebSocket create command.
+    fn wsCreateError(self: *Conn, aa: Allocator, req_id: []const u8, msg: []const u8) void {
+        var j = api.Json.init(aa);
+        j.beginObject() catch return;
+        j.keyString("type", "torrent_created") catch return;
+        j.keyString("reqId", req_id) catch return;
+        j.keyBool("ok", false) catch return;
+        j.keyString("error", msg) catch return;
+        j.endObject() catch return;
+        ws_server.sendText(self.daemon.allocator, self.stream, j.buf.items) catch {};
     }
 
     // ----- response writers -----
@@ -647,6 +822,16 @@ fn readNpub(arena: Allocator) ![]const u8 {
 fn strField(obj: std.json.ObjectMap, name: []const u8) ?[]const u8 {
     const v = obj.get(name) orelse return null;
     return if (v == .string) v.string else null;
+}
+
+/// Non-blocking readability probe (poll with a 0ms timeout) so the WebSocket
+/// push loop can opportunistically drain client command frames without stalling.
+/// A half-closed socket also polls readable; the subsequent read then fails and
+/// the caller closes the connection.
+fn socketReadable(fd: posix.socket_t) bool {
+    var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+    const ready = posix.poll(&pfd, 0) catch return false;
+    return ready > 0;
 }
 
 /// Set a recv timeout on an accepted socket so a stalled client can't wedge its

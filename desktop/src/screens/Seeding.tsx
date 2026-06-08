@@ -3,6 +3,7 @@ import { Icon, OnionIcon } from "../components/icons";
 import { RouteBadge, CopyField } from "../components/atoms";
 import { fmtBytes, fmtSpeed, trunc } from "../components/format";
 import { useCarl } from "../api/store";
+import { CreateTorrentModal } from "../modals/CreateTorrentModal";
 import type { Route, Seed } from "../api/types";
 
 const VIS_LABEL: Record<Route, string> = {
@@ -240,6 +241,7 @@ export function SeedingScreen() {
   const { state } = useCarl();
   const seeds = state.seeds;
   const [flow, setFlow] = useState(false);
+  const [createFlow, setCreateFlow] = useState(false);
   const upTotal = seeds.reduce((a, s) => a + s.up, 0);
   const torSeed = seeds.find((s) => s.visibility === "tor" && s.onion);
 
@@ -256,6 +258,9 @@ export function SeedingScreen() {
           </div>
         </div>
         <div className="topbar-r">
+          <button className="btn" onClick={() => setCreateFlow(true)}>
+            <Icon name="file" size={15} stroke={2} /> Create .torrent
+          </button>
           <button className="btn btn-primary" onClick={() => setFlow(true)}>
             <Icon name="plus" size={15} stroke={2} /> Seed a file
           </button>
@@ -299,6 +304,9 @@ export function SeedingScreen() {
       </div>
 
       {flow && <SeedFlow onClose={() => setFlow(false)} />}
+      {createFlow && (
+        <CreateTorrentModal onClose={() => setCreateFlow(false)} />
+      )}
     </div>
   );
 }

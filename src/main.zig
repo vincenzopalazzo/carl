@@ -89,6 +89,12 @@ pub fn main() !void {
             .onion_port = tor_onion_port,
             .socks_url = tor_socks_url,
         });
+    } else if (std.mem.eql(u8, command, "create")) {
+        if (args.len < 3) {
+            log.err("usage: carl create <file-or-dir> [-o out.torrent] [-t tracker]... [--comment \"...\"] [--piece-length bytes]", .{});
+            std.process.exit(1);
+        }
+        try cmdCreate(allocator, stdout, args[2], args[3..]);
     } else if (std.mem.eql(u8, command, "search")) {
         if (args.len < 3) {
             log.err("usage: carl search <query> [--limit <n>] [--relay <url>]", .{});
@@ -126,6 +132,10 @@ fn printUsage() void {
         \\           --nostr: publish NIP-35 torrent event + peer-announce
         \\           --external-ip: public IPv4 for peer-announce (classic seeding)
         \\           --tor-seed: hidden service via Tor ControlPort; requires --nostr
+        \\  create <file-or-dir> [-o out.torrent] [-t tracker]... [--comment "..."] [--piece-length bytes]
+        \\           build a .torrent from a file or directory (multi-file).
+        \\           -t may repeat; trackers are optional (Nostr/DHT discovery).
+        \\           -o defaults to <name>.torrent in the current directory.
         \\  search <query> [--limit n] [--relay <wss://...>]
         \\           search nostr relays for kind-2003 torrent events
         \\  nostr-keygen                                     generate a fresh nostr key
@@ -544,6 +554,75 @@ fn parseTorSocksProxy(url: []const u8) carl.proxy.Proxy {
         log.err("invalid --tor-socks URL '{s}': {}", .{ url, err });
         std.process.exit(1);
     };
+}
+
+// -------------------------------------------------------------------------
+// `carl create` — build a .torrent from a file or directory
+// -------------------------------------------------------------------------
+
+fn cmdCreate(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    path: []const u8,
+    extra: []const [:0]u8,
+) !void {
+    // Collect repeated -t / --tracker flags (parseFlag only returns the first).
+    var trackers: std.ArrayList([]const u8) = .empty;
+    defer trackers.deinit(allocator);
+    {
+        var i: usize = 0;
+        while (i + 1 < extra.len) : (i += 1) {
+            if (std.mem.eql(u8, extra[i], "-t") or std.mem.eql(u8, extra[i], "--tracker")) {
+                if (extra[i + 1].len > 0) try trackers.append(allocator, extra[i + 1]);
+            }
+        }
+    }
+    const comment = parseFlag(extra, "--comment");
+    const piece_length: u32 = parseUnsignedFlag(extra, "--piece-length", carl.metainfo.default_piece_length);
+
+    const res = carl.metainfo.buildTorrent(allocator, path, .{
+        .piece_length = piece_length,
+        .trackers = trackers.items,
+        .comment = comment,
+        .created_by = "carl",
+        .creation_date = std.time.timestamp(),
+    }) catch |err| {
+        log.err("could not create torrent from '{s}': {}", .{ path, err });
+        std.process.exit(1);
+    };
+    defer allocator.free(res.data);
+
+    // Default output: <basename>.torrent in the current directory.
+    const base = std.fs.path.basename(path);
+    const default_out = try std.fmt.allocPrint(allocator, "{s}.torrent", .{base});
+    defer allocator.free(default_out);
+    const out_path = parseFlag(extra, "-o") orelse parseFlag(extra, "--output") orelse default_out;
+
+    {
+        var f = std.fs.cwd().createFile(out_path, .{ .truncate = true }) catch |err| {
+            log.err("could not write '{s}': {}", .{ out_path, err });
+            std.process.exit(1);
+        };
+        defer f.close();
+        f.writeAll(res.data) catch |err| {
+            log.err("could not write '{s}': {}", .{ out_path, err });
+            std.process.exit(1);
+        };
+    }
+
+    try stdout.print("created:      {s}\n", .{out_path});
+    try stdout.print("name:         {s}\n", .{base});
+    try stdout.print("files:        {d}\n", .{res.file_count});
+    try stdout.print("size:         {d} bytes\n", .{res.total_length});
+    try stdout.print("piece length: {d}\n", .{piece_length});
+    if (trackers.items.len > 0) {
+        try stdout.print("trackers:     {d}\n", .{trackers.items.len});
+    } else {
+        try stdout.print("trackers:     none (Nostr/DHT discovery)\n", .{});
+    }
+    try stdout.print("info hash:    ", .{});
+    for (res.info_hash) |byte| try stdout.print("{x:0>2}", .{byte});
+    try stdout.print("\n", .{});
 }
 
 // -------------------------------------------------------------------------
