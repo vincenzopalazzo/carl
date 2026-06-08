@@ -442,7 +442,12 @@ pub fn buildTorrent(allocator: Allocator, path: []const u8, opts: CreateOptions)
     defer arena.deinit();
     const aa = arena.allocator();
 
-    const base = std.fs.path.basename(path);
+    // Trim a trailing slash so a directory path "/a/b/" yields the name "b"
+    // (basename of "/a/b/" is otherwise empty).
+    const sep = [_]u8{std.fs.path.sep};
+    const trimmed_path = std.mem.trimRight(u8, path, &sep);
+    const eff_path = if (trimmed_path.len == 0) path else trimmed_path;
+    const base = std.fs.path.basename(eff_path);
     if (base.len == 0) return error.InvalidTorrent;
     const name = aa.dupe(u8, base) catch return error.OutOfMemory;
 
@@ -467,6 +472,7 @@ pub fn buildTorrent(allocator: Allocator, path: []const u8, opts: CreateOptions)
         // deterministic piece layout.
         var works: std.ArrayList(FileWork) = .empty;
         var walker = dir.walk(aa) catch return error.OutOfMemory;
+        defer walker.deinit(); // closes the dir handles the walker keeps open
         while (walker.next() catch return error.InvalidTorrent) |entry| {
             if (entry.kind != .file) continue;
             const rel = aa.dupe(u8, entry.path) catch return error.OutOfMemory;
@@ -504,11 +510,8 @@ pub fn buildTorrent(allocator: Allocator, path: []const u8, opts: CreateOptions)
         if (filled > 0) try hashPiece(aa, &pieces, chunk[0..filled]); // final partial piece
 
         const files_slice = files_list.toOwnedSlice(aa) catch return error.OutOfMemory;
-        // Info keys sorted: "files" < "name" < "piece length" < "pieces".
+        // Multi-file's unique key; "files" sorts before the shared "name" below.
         info_entries.append(aa, .{ .key = "files", .value = .{ .list = files_slice } }) catch return error.OutOfMemory;
-        info_entries.append(aa, .{ .key = "name", .value = .{ .string = name } }) catch return error.OutOfMemory;
-        info_entries.append(aa, .{ .key = "piece length", .value = .{ .integer = @intCast(piece_length) } }) catch return error.OutOfMemory;
-        info_entries.append(aa, .{ .key = "pieces", .value = .{ .string = pieces.items } }) catch return error.OutOfMemory;
     } else {
         var f = std.fs.cwd().openFile(path, .{}) catch return error.InvalidTorrent;
         defer f.close();
@@ -524,12 +527,15 @@ pub fn buildTorrent(allocator: Allocator, path: []const u8, opts: CreateOptions)
         }
         if (filled > 0) try hashPiece(aa, &pieces, chunk[0..filled]);
         file_count = 1;
-        // Info keys sorted: "length" < "name" < "piece length" < "pieces".
+        // Single-file's unique key; "length" sorts before the shared "name".
         info_entries.append(aa, .{ .key = "length", .value = .{ .integer = @intCast(total) } }) catch return error.OutOfMemory;
-        info_entries.append(aa, .{ .key = "name", .value = .{ .string = name } }) catch return error.OutOfMemory;
-        info_entries.append(aa, .{ .key = "piece length", .value = .{ .integer = @intCast(piece_length) } }) catch return error.OutOfMemory;
-        info_entries.append(aa, .{ .key = "pieces", .value = .{ .string = pieces.items } }) catch return error.OutOfMemory;
     }
+
+    // Shared, sorted after the per-mode key ("files"/"length" both precede "name"):
+    // "name" < "piece length" < "pieces".
+    info_entries.append(aa, .{ .key = "name", .value = .{ .string = name } }) catch return error.OutOfMemory;
+    info_entries.append(aa, .{ .key = "piece length", .value = .{ .integer = @intCast(piece_length) } }) catch return error.OutOfMemory;
+    info_entries.append(aa, .{ .key = "pieces", .value = .{ .string = pieces.items } }) catch return error.OutOfMemory;
 
     const info_val = bencode.Value{ .dict = info_entries.items };
 
@@ -663,6 +669,26 @@ test "buildTorrent: directory hashes pieces continuously across files" {
     try std.testing.expectEqualStrings("b.txt", mi.files[1].path[1]);
     try std.testing.expectEqual(@as(u64, 6), mi.files[1].length);
     try std.testing.expect(mi.created_by == null);
+}
+
+test "buildTorrent: trailing-slash directory path yields the right name" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("md");
+    try tmp.dir.writeFile(.{ .sub_path = "md/f.txt", .data = "abcd" });
+    const base = try tmp.dir.realpathAlloc(allocator, "md");
+    defer allocator.free(base);
+    const path = try std.fmt.allocPrint(allocator, "{s}/", .{base}); // trailing slash
+    defer allocator.free(path);
+
+    const res = try buildTorrent(allocator, path, .{ .piece_length = 4 });
+    defer allocator.free(res.data);
+    const mi = try parse(allocator, res.data);
+    defer mi.deinit(allocator);
+    try std.testing.expectEqualStrings("md", mi.name); // not "" from a dangling slash
+    try std.testing.expectEqual(@as(usize, 1), mi.files.len);
+    try std.testing.expectEqualStrings("f.txt", mi.files[0].path[0]);
 }
 
 test "buildTorrent: trackerless single file omits announce" {

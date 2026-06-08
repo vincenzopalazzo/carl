@@ -91,9 +91,7 @@ function CliToolsSection() {
               <button
                 className="btn btn-sm"
                 disabled={busy}
-                onClick={() =>
-                  run(() => installCli(status.path?.startsWith("/usr/") ?? true))
-                }
+                onClick={() => run(() => installCli(status.system))}
               >
                 <Icon name="check" size={13} stroke={2.2} />
                 {busy ? "Working…" : "Reinstall"}
@@ -101,11 +99,7 @@ function CliToolsSection() {
               <button
                 className="btn btn-sm"
                 disabled={busy}
-                onClick={() =>
-                  run(() =>
-                    uninstallCli(status.path?.startsWith("/usr/") ?? false),
-                  )
-                }
+                onClick={() => run(() => uninstallCli(status.system))}
               >
                 Remove
               </button>

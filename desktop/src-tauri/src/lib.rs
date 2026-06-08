@@ -93,15 +93,27 @@ struct CliStatus {
     installed: bool,
     /// Where it's installed, if any.
     path: Option<String>,
+    /// True when the install is the system location (/usr/local/bin); false for
+    /// the per-user one. Lets the UI drive reinstall/remove without re-deriving
+    /// the location from the path string.
+    system: bool,
     /// True when the installed entry is a symlink into THIS app bundle (so it
     /// tracks app updates — the Docker model). A plain file or a link elsewhere
     /// reports false.
     linked_to_bundle: bool,
 }
 
+/// Quote a string for a single-quoted `/bin/sh` argument: wrap in `'…'` and
+/// escape any embedded single quote as `'\''`. Prevents a path containing a
+/// quote (e.g. an app under "/Users/me/Vince's apps/…") from breaking — or
+/// injecting into — the admin shell command.
+fn sh_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// Run a shell command with one-time admin authorization via the native macOS
 /// dialog (the Homebrew-cask approach). `script` must be a self-contained
-/// `/bin/sh` snippet using single-quoted paths.
+/// `/bin/sh` snippet; embed any paths via `sh_single_quote`.
 #[cfg(target_os = "macos")]
 fn run_admin(script: &str) -> Result<(), String> {
     // Embed into an AppleScript string: escape backslashes and double quotes.
@@ -140,6 +152,7 @@ fn cli_status() -> CliStatus {
                 available: bundle.is_some(),
                 installed: true,
                 path: Some(p.to_string_lossy().into_owned()),
+                system: p == std::path::Path::new(SYSTEM_CLI_PATH),
                 linked_to_bundle,
             };
         }
@@ -148,6 +161,7 @@ fn cli_status() -> CliStatus {
         available: bundle.is_some(),
         installed: false,
         path: None,
+        system: false,
         linked_to_bundle: false,
     }
 }
@@ -162,9 +176,11 @@ fn install_cli(system: bool) -> Result<String, String> {
     let src = sidecar.to_string_lossy();
     if system {
         // mkdir + symlink, replacing any existing entry, with one auth prompt.
+        // Paths are shell-quoted so a quote/space in the bundle path is safe.
         let script = format!(
-            "mkdir -p /usr/local/bin && ln -sf '{src}' '{SYSTEM_CLI_PATH}'",
-            src = src,
+            "mkdir -p /usr/local/bin && ln -sf {} {}",
+            sh_single_quote(&src),
+            sh_single_quote(SYSTEM_CLI_PATH),
         );
         #[cfg(target_os = "macos")]
         {
@@ -195,7 +211,7 @@ fn uninstall_cli(system: bool) -> Result<(), String> {
     if system {
         #[cfg(target_os = "macos")]
         {
-            run_admin(&format!("rm -f '{SYSTEM_CLI_PATH}'"))?;
+            run_admin(&format!("rm -f {}", sh_single_quote(SYSTEM_CLI_PATH)))?;
             Ok(())
         }
         #[cfg(not(target_os = "macos"))]
@@ -329,4 +345,20 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sh_single_quote;
+
+    #[test]
+    fn sh_single_quote_wraps_and_escapes() {
+        assert_eq!(sh_single_quote("/usr/local/bin/carl"), "'/usr/local/bin/carl'");
+        // An embedded single quote must close, escape, and reopen the quoting
+        // so the shell can't be broken out of (e.g. an app under "Vince's apps").
+        assert_eq!(
+            sh_single_quote("/a/Vince's apps/carl"),
+            "'/a/Vince'\\''s apps/carl'"
+        );
+    }
 }

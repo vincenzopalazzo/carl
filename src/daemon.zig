@@ -458,18 +458,18 @@ const Conn = struct {
     };
 
     /// Shared by the HTTP route and the WebSocket command: build a .torrent from
-    /// a server-side `src_path` (file OR directory), write it to disk, and return
-    /// a summary. `out_path_opt` overrides the default `<src_path>.torrent`. The
-    /// path is taken verbatim — folders can't be uploaded as bytes, so creation
-    /// is path-based; the daemon binds loopback and is token-guarded, and the
-    /// desktop supplies the path from a native picker.
+    /// a server-side `src_path` (file OR directory), write it next to the source
+    /// as `<src>.torrent`, and return a summary. The output path is derived from
+    /// the source (never client-supplied) so a request can't make the daemon
+    /// overwrite an arbitrary file. Creation is path-based (folders can't be
+    /// uploaded as bytes); the daemon binds loopback and is token-guarded, and
+    /// the desktop supplies the path from a native picker.
     fn doCreateTorrent(
         self: *Conn,
         aa: Allocator,
         src_path: []const u8,
         trackers: []const []const u8,
         comment: ?[]const u8,
-        out_path_opt: ?[]const u8,
     ) !TorrentBuilt {
         const res = metainfo.buildTorrent(self.daemon.allocator, src_path, .{
             .trackers = trackers,
@@ -479,10 +479,12 @@ const Conn = struct {
         }) catch return error.CreateFailed;
         defer self.daemon.allocator.free(res.data);
 
-        const out_path = if (out_path_opt) |o|
-            o
-        else
-            try std.fmt.allocPrint(aa, "{s}.torrent", .{src_path});
+        // Derive `<src>.torrent`, trimming a trailing slash so a directory path
+        // "/a/b/" yields "/a/b.torrent" (beside it), not "/a/b/.torrent" (inside).
+        const sep = [_]u8{std.fs.path.sep};
+        const trimmed = std.mem.trimRight(u8, src_path, &sep);
+        const base_path = if (trimmed.len == 0) src_path else trimmed;
+        const out_path = try std.fmt.allocPrint(aa, "{s}.torrent", .{base_path});
         {
             var f = std.fs.cwd().createFile(out_path, .{ .truncate = true }) catch return error.WriteFailed;
             defer f.close();
@@ -492,19 +494,18 @@ const Conn = struct {
         var hex: [40]u8 = undefined;
         secp.toHex(&res.info_hash, &hex);
         return .{
-            .out_path = try aa.dupe(u8, out_path),
+            .out_path = out_path,
             .info_hash_hex = hex,
             .size = res.total_length,
             .files = res.file_count,
         };
     }
 
-    /// Pull the optional tracker list, comment, and out-path out of a parsed
-    /// create-torrent request object. Trackers default to empty (trackerless).
+    /// Pull the optional tracker list and comment out of a parsed create-torrent
+    /// request object. Trackers default to empty (trackerless).
     fn parseCreateBody(aa: Allocator, obj: std.json.ObjectMap) !struct {
         trackers: []const []const u8,
         comment: ?[]const u8,
-        out_path: ?[]const u8,
     } {
         var trackers: std.ArrayList([]const u8) = .empty;
         if (obj.get("trackers")) |v| {
@@ -517,12 +518,11 @@ const Conn = struct {
         return .{
             .trackers = try trackers.toOwnedSlice(aa),
             .comment = strField(obj, "comment"),
-            .out_path = strField(obj, "outPath"),
         };
     }
 
-    /// POST /api/torrents — body is JSON {path, trackers?, comment?, outPath?}.
-    /// `path` is a server-side file or directory; creates a .torrent on disk and
+    /// POST /api/torrents — body is JSON {path, trackers?, comment?}. `path` is a
+    /// server-side file or directory; creates `<path>.torrent` on disk and
     /// returns { path, infoHash, size, files }.
     fn createTorrent(self: *Conn, body: []const u8) !void {
         const a = self.daemon.allocator;
@@ -537,9 +537,10 @@ const Conn = struct {
         if (src_path.len == 0) return self.sendStatus(.bad_request);
         const opts = parseCreateBody(aa, obj) catch return self.sendStatus(.internal_error);
 
-        const built = self.doCreateTorrent(aa, src_path, opts.trackers, opts.comment, opts.out_path) catch |err| {
+        const built = self.doCreateTorrent(aa, src_path, opts.trackers, opts.comment) catch |err| {
             log.warn("createTorrent failed for '{s}': {}", .{ src_path, err });
-            return self.sendStatus(.bad_request);
+            // Bad input (unreadable/empty source) → 400; disk/write failure → 500.
+            return self.sendStatus(if (err == error.WriteFailed) .internal_error else .bad_request);
         };
 
         var j = api.Json.init(aa);
@@ -710,7 +711,7 @@ const Conn = struct {
         if (src_path.len == 0) return self.wsCreateError(aa, req_id, "missing path");
         const opts = parseCreateBody(aa, obj) catch return self.wsCreateError(aa, req_id, "bad request");
 
-        const built = self.doCreateTorrent(aa, src_path, opts.trackers, opts.comment, opts.out_path) catch
+        const built = self.doCreateTorrent(aa, src_path, opts.trackers, opts.comment) catch
             return self.wsCreateError(aa, req_id, "create failed");
 
         var j = api.Json.init(aa);

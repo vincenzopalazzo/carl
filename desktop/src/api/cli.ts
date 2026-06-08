@@ -10,6 +10,8 @@ export interface CliStatus {
   installed: boolean;
   /** Where it's installed, if any. */
   path: string | null;
+  /** True when installed in the system location (/usr/local/bin) vs per-user. */
+  system: boolean;
   /** True when the install is a symlink into this app bundle (tracks updates). */
   linkedToBundle: boolean;
 }
@@ -22,6 +24,7 @@ const UNAVAILABLE: CliStatus = {
   available: false,
   installed: false,
   path: null,
+  system: false,
   linkedToBundle: false,
 };
 
@@ -34,11 +37,13 @@ export async function cliStatus(): Promise<CliStatus> {
 /** Install the CLI. `system` → /usr/local/bin (one admin prompt); otherwise
  *  ~/.local/bin (no prompt). Returns the installed path. */
 export async function installCli(system: boolean): Promise<string> {
+  if (!isTauri()) throw new Error("the command-line tool is only available in the desktop app");
   const { invoke } = await import("@tauri-apps/api/core");
   return invoke<string>("install_cli", { system });
 }
 
 export async function uninstallCli(system: boolean): Promise<void> {
+  if (!isTauri()) throw new Error("the command-line tool is only available in the desktop app");
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("uninstall_cli", { system });
 }
