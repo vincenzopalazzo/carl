@@ -10,6 +10,7 @@ const piece_mod = @import("piece.zig");
 const storage_mod = @import("storage.zig");
 const session_mod = @import("session.zig");
 const extension = @import("extension.zig");
+const proxy_mod = @import("proxy.zig");
 
 /// Generate deterministic test data of a given size.
 fn generateTestData(allocator: std.mem.Allocator, size: usize) ![]u8 {
@@ -495,4 +496,52 @@ test "magnet metadata exchange then download over loopback" {
         const downloaded = dl.store.readPiece(da, idx, plen) catch continue;
         try std.testing.expectEqualSlices(u8, test_data[start .. start + plen], downloaded);
     }
+}
+
+// =============================================================================
+// Regression: a failed onion peer dial must not double-free the PeerConnection
+// =============================================================================
+
+// connectOnionPeer sets up a PeerConnection with `errdefer p.deinit()` and then
+// calls finishPeerConnect. finishPeerConnect used to *also* free `p` on a connect
+// failure, so when a Tor peer dial failed both freed it — a double free that
+// crashes the process (observed in the wild via collectNostrPeers). Here the
+// proxy points at a refused port so the dial fails fast; the test passes only if
+// the connect error surfaces cleanly with no double free (the GPA testing
+// allocator aborts on a double free, failing the test on the buggy code).
+test "connectOnionPeer cleans up exactly once when the dial fails" {
+    const allocator = std.testing.allocator;
+
+    const test_data = try generateTestData(allocator, 1024);
+    defer allocator.free(test_data);
+
+    var tm = try buildTestMetainfo(allocator, test_data, 1024, "onion_double_free.bin");
+    defer tm.deinit();
+
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    const dir_path = try dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+
+    // SOCKS proxy at a port that refuses immediately, so the dial fails fast
+    // without touching the network. The Proxy borrows `host` from this literal.
+    const proxy = try proxy_mod.parseUrl("socks5://127.0.0.1:1");
+
+    var sess = try session_mod.Session.init(
+        allocator,
+        tm.meta,
+        dir_path,
+        .download,
+        0,
+        proxy,
+        .any,
+        false,
+    );
+    defer sess.deinit();
+
+    // The dial must fail (proxy refused), and crucially must free the peer
+    // exactly once. On the pre-fix code this double-frees and the test aborts.
+    try std.testing.expectError(error.ConnectionFailed, sess.connectOnionPeer("examplepeer.onion", 6881));
+    // The failed peer must not have been adopted into the peer set.
+    try std.testing.expectEqual(@as(usize, 0), sess.peers.items.len);
 }

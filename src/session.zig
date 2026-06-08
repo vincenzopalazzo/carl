@@ -1419,7 +1419,9 @@ pub const Session = struct {
         if (self.peers.items.len >= max_peers) return;
 
         const p = self.allocator.create(peer_mod.PeerConnection) catch return error.OutOfMemory;
+        errdefer self.allocator.destroy(p);
         p.* = peer_mod.PeerConnection.init(self.allocator, addr);
+        errdefer p.deinit();
         p.proxy = self.proxy;
 
         try self.finishPeerConnect(p);
@@ -1438,24 +1440,16 @@ pub const Session = struct {
         try self.finishPeerConnect(p);
     }
 
+    /// Connect, handshake, and adopt `p` into the peer set. Single-owner
+    /// contract: on any error `p` is left untouched (NOT freed) so the caller's
+    /// errdefer frees it exactly once; on success ownership transfers to
+    /// `self.peers`. Previously this freed `p` on error *and* the caller's
+    /// errdefer (in connectOnionPeer) freed it too — a double free that aborted
+    /// the daemon when a Tor peer dial failed.
     fn finishPeerConnect(self: *Session, p: *peer_mod.PeerConnection) !void {
-        p.connect() catch {
-            p.deinit();
-            self.allocator.destroy(p);
-            return error.ConnectionFailed;
-        };
-
-        p.sendHandshake(self.info_hash, self.peer_id) catch {
-            p.deinit();
-            self.allocator.destroy(p);
-            return error.OutOfMemory;
-        };
-
-        self.peers.append(self.allocator, p) catch {
-            p.deinit();
-            self.allocator.destroy(p);
-            return error.OutOfMemory;
-        };
+        p.connect() catch return error.ConnectionFailed;
+        p.sendHandshake(self.info_hash, self.peer_id) catch return error.OutOfMemory;
+        try self.peers.append(self.allocator, p);
     }
 
     /// Run a single iteration of the event loop (for testing).
