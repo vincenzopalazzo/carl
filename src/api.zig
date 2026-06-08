@@ -35,6 +35,10 @@ pub const Status = enum {
     complete,
     metadata,
     stalled,
+    /// Anonymized/bootstrap window: no peers yet, but it's early — still trying.
+    connecting,
+    /// No peers found after the bootstrap window — the transfer can't progress.
+    no_peers,
 
     pub fn jsonName(self: Status) []const u8 {
         return @tagName(self);
@@ -75,6 +79,11 @@ pub const Transfer = struct {
     eta: []const u8,
     peers: u32,
     seeds: u32,
+    /// BEP 9 metadata pieces received / total during the magnet bootstrap phase.
+    /// Both 0 once the info dict is in, or for a non-magnet source. Lets the UI
+    /// show "fetching metadata · have/total" instead of an opaque spinner.
+    meta_have: u32 = 0,
+    meta_total: u32 = 0,
     /// Upload/download ratio; null while still downloading.
     ratio: ?f64 = null,
     /// .onion address when seeding as a hidden service; null otherwise.
@@ -348,6 +357,8 @@ pub fn writeTransfer(j: *Json, t: Transfer) Allocator.Error!void {
     try j.keyString("eta", t.eta);
     try j.keyNumber("peers", t.peers);
     try j.keyNumber("seeds", t.seeds);
+    try j.keyNumber("metaHave", t.meta_have);
+    try j.keyNumber("metaTotal", t.meta_total);
     try j.key("ratio");
     if (t.ratio) |r| try j.float(r) else try j.nullValue();
     try j.key("onion");

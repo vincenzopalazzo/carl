@@ -88,6 +88,26 @@ pub const Session = struct {
     have_pieces: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     peer_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
+    // Live transfer rate, bytes/sec, smoothed (EWMA) and resampled once a second
+    // by the session thread in `sampleRate` so the daemon's cross-thread snapshot
+    // reads a stable value no matter how often (or from how many clients) it
+    // polls — unlike the old per-snapshot delta, which corrupted with >1 reader.
+    // Read lock-free by `progressSnapshot`. Defaulted so `init` need not set them.
+    down_rate: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    up_rate: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    // Wall-clock second of the last byte of real download progress (piece OR
+    // metadata). The snapshot turns this into "downloading vs stalled" without a
+    // cadence-dependent delta. Seeded to start time in `init`.
+    last_progress_s: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    // Sampling bookkeeping — touched only by the session thread in `sampleRate`.
+    rate_last_s: i64 = 0,
+    rate_last_in: u64 = 0,
+    rate_last_out: u64 = 0,
+    // BEP 9 metadata bytes received this session. Counted toward the download
+    // rate (and progress timestamp) so the metadata-fetch phase shows real speed
+    // even though piece `downloaded` is still 0 then.
+    meta_bytes_in: u64 = 0,
+
     // Choking state
     last_unchoke_time: i64,
     last_optimistic_time: i64,
@@ -239,6 +259,10 @@ pub const Session = struct {
             .start_time = now,
             .last_progress_time = now,
             .last_progress_bytes = 0,
+            // Seed to "now" so a fresh transfer isn't instantly judged stalled
+            // before its first poll tick. `now` here is seconds (timestamp()).
+            .last_progress_s = std.atomic.Value(i64).init(now),
+            .rate_last_s = now,
         };
     }
 
@@ -282,6 +306,16 @@ pub const Session = struct {
         peers: u32,
         mode: Mode,
         metadata_only: bool,
+        /// Live download/upload rate (bytes/sec), session-smoothed.
+        down_rate: u64,
+        up_rate: u64,
+        /// BEP 9 metadata pieces received / total (total 0 until a peer reports
+        /// the metadata size). Both 0 once metadata is in or for a non-magnet.
+        meta_have: u32,
+        meta_total: u32,
+        /// Seconds since the last byte of real progress arrived. Lets the snapshot
+        /// distinguish active "downloading" from "stalled" without a delta.
+        idle_secs: i64,
     };
 
     /// A copy of the resolved `.torrent` bytes, or null if metadata isn't in
@@ -300,6 +334,15 @@ pub const Session = struct {
         // never touch `our_bitfield`/`peers` (mutated lockless on that thread).
         // `num_pieces`/`total_length` are still read under the mutex because the
         // metadata-complete transition reassigns them.
+        // Metadata progress comes from the (mutex-guarded) download tracker; it's
+        // torn down on completion, so a null tracker means "not fetching".
+        var meta_have: u32 = 0;
+        var meta_total: u32 = 0;
+        if (self.metadata_download) |md| {
+            meta_have = md.received_count;
+            meta_total = md.num_pieces;
+        }
+        const last_prog = self.last_progress_s.load(.monotonic);
         return .{
             .have = @intCast(self.have_pieces.load(.monotonic)),
             .num_pieces = self.num_pieces,
@@ -309,7 +352,44 @@ pub const Session = struct {
             .peers = @intCast(self.peer_count.load(.monotonic)),
             .mode = self.mode,
             .metadata_only = self.metadata_only,
+            .down_rate = self.down_rate.load(.monotonic),
+            .up_rate = self.up_rate.load(.monotonic),
+            .meta_have = meta_have,
+            .meta_total = meta_total,
+            .idle_secs = @max(0, std.time.timestamp() - last_prog),
         };
+    }
+
+    /// Resample the download/upload rate. Called once per second from the
+    /// session thread (`maintenance`). Counts piece bytes (`downloaded`) plus
+    /// received metadata bytes, applies an EWMA (alpha 1/4) for a stable display
+    /// value, and stamps `last_progress_s` whenever real bytes arrived so the
+    /// snapshot can tell "downloading" from "stalled".
+    fn sampleRate(self: *Session, now_s: i64) void {
+        const in_bytes = self.downloaded + self.meta_bytes_in;
+        const out_bytes = self.uploaded;
+        if (self.rate_last_s == 0) {
+            self.rate_last_s = now_s;
+            self.rate_last_in = in_bytes;
+            self.rate_last_out = out_bytes;
+            return;
+        }
+        const dt = now_s - self.rate_last_s;
+        if (dt <= 0) return; // sample at most once per (1s-granularity) clock tick
+
+        const din = in_bytes -| self.rate_last_in;
+        const dout = out_bytes -| self.rate_last_out;
+        const dt_u: u64 = @intCast(dt);
+        const inst_in = din / dt_u;
+        const inst_out = dout / dt_u;
+        // EWMA: rate = (3*prev + inst) / 4. Smooths bursty piece arrival.
+        self.down_rate.store((self.down_rate.load(.monotonic) * 3 + inst_in) / 4, .monotonic);
+        self.up_rate.store((self.up_rate.load(.monotonic) * 3 + inst_out) / 4, .monotonic);
+        if (din > 0) self.last_progress_s.store(now_s, .monotonic);
+
+        self.rate_last_s = now_s;
+        self.rate_last_in = in_bytes;
+        self.rate_last_out = out_bytes;
     }
 
     pub fn run(self: *Session) !void {
@@ -711,6 +791,10 @@ pub const Session = struct {
                     }
 
                     const complete = md.addPiece(msg.piece, data) catch return;
+                    // Count metadata bytes toward the download rate so the
+                    // metadata-fetch phase shows real speed (piece `downloaded`
+                    // is still 0 here).
+                    self.meta_bytes_in += data.len;
                     log.info("metadata piece {d}/{d}", .{ md.received_count, md.num_pieces });
 
                     if (!complete) {
@@ -726,7 +810,11 @@ pub const Session = struct {
                             self.onMetadataComplete(raw_info) catch {};
                         } else {
                             log.warn("metadata hash mismatch, retrying...", .{});
-                            // Reset and try again
+                            // Reset and try again. Under snapshot_mutex because
+                            // progressSnapshot reads `metadata_download` from the
+                            // daemon thread for meta-piece progress.
+                            self.snapshot_mutex.lock();
+                            defer self.snapshot_mutex.unlock();
                             md.deinit();
                             self.metadata_download = extension.MetadataDownload.init(self.allocator, self.info_hash);
                         }
@@ -930,10 +1018,17 @@ pub const Session = struct {
         self.store = storage_mod.Storage.init(self.allocator, self.meta, self.output_dir, true) catch
             return error.StorageInitFailed;
 
-        // Switch from metadata-only to download mode
-        self.metadata_only = false;
-        if (self.metadata_download) |*md| md.deinit();
-        self.metadata_download = null;
+        // Switch from metadata-only to download mode. Under snapshot_mutex
+        // because `progressSnapshot` reads `metadata_only` and dereferences
+        // `metadata_download` (for meta-piece progress) from another thread —
+        // tearing it down here unguarded would be a use-after-free.
+        {
+            self.snapshot_mutex.lock();
+            defer self.snapshot_mutex.unlock();
+            self.metadata_only = false;
+            if (self.metadata_download) |*md| md.deinit();
+            self.metadata_download = null;
+        }
 
         // Capture the now-resolved .torrent so the daemon can persist it and
         // resume this torrent fully on restart. Built here where `meta` is
@@ -1219,6 +1314,9 @@ pub const Session = struct {
 
     fn maintenance(self: *Session) !void {
         const now = std.time.timestamp();
+
+        // Resample the live transfer rate (≤ once a second; `now` is seconds).
+        self.sampleRate(now);
 
         // Publish the live peer count for the daemon's cross-thread snapshot.
         // Refreshed each tick here (and just below after pruning) so the daemon

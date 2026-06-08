@@ -10,9 +10,20 @@ import {
 } from "../components/atoms";
 import { fmtBytes, fmtSpeed } from "../components/format";
 import { useCarl } from "../api/store";
-import type { SourceKind, Transfer } from "../api/types";
+import type { SourceKind, Status, Transfer } from "../api/types";
 
 type Filter = "all" | "downloading" | "seeding" | "complete";
+
+// Statuses that count as an in-progress ("Active") download — everything that
+// isn't seeding or complete, including the metadata/connecting/no-peers phases.
+const ACTIVE_STATUSES: Status[] = [
+  "downloading",
+  "metadata",
+  "stalled",
+  "connecting",
+  "no_peers",
+];
+const isActive = (s: Status) => ACTIVE_STATUSES.includes(s);
 
 // The daemon serves transfer-level state; per-piece detail isn't exposed yet
 // (see docs/daemon-api.md). Derive a have/missing heatmap from the percentage
@@ -147,7 +158,23 @@ function TransferRow({
   expanded: boolean;
   onToggle: () => void;
 }) {
-  const meta = t.status === "metadata";
+  // Phase label shown next to the progress bar. The metadata phase reports
+  // BEP 9 piece progress when a peer has told us the size; connecting/no-peers
+  // explain a stall instead of a misleading "fetching metadata…".
+  const progressLabel = (() => {
+    switch (t.status) {
+      case "metadata":
+        return t.metaTotal > 0
+          ? `fetching metadata · ${t.metaHave}/${t.metaTotal}`
+          : "fetching metadata…";
+      case "connecting":
+        return "connecting…";
+      case "no_peers":
+        return "no peers found";
+      default:
+        return t.pct + "%";
+    }
+  })();
   return (
     <div className={"trow-wrap" + (expanded ? " expanded" : "")}>
       <div className="trow" onClick={onToggle}>
@@ -162,9 +189,7 @@ function TransferRow({
           </div>
           <div className="trow-prog">
             <ProgressBar pct={t.pct} status={t.status} />
-            <span className="trow-pct mono">
-              {meta ? "fetching metadata…" : t.pct + "%"}
-            </span>
+            <span className="trow-pct mono">{progressLabel}</span>
           </div>
         </div>
         <div className="trow-stat">
@@ -203,23 +228,13 @@ export function TransfersScreen({ openAdd }: { openAdd: () => void }) {
 
   const counts: Record<Filter, number> = {
     all: transfers.length,
-    downloading: transfers.filter(
-      (t) =>
-        t.status === "downloading" ||
-        t.status === "metadata" ||
-        t.status === "stalled",
-    ).length,
+    downloading: transfers.filter((t) => isActive(t.status)).length,
     seeding: transfers.filter((t) => t.status === "seeding").length,
     complete: transfers.filter((t) => t.status === "complete").length,
   };
   const rows = transfers.filter((t) => {
     if (filter === "all") return true;
-    if (filter === "downloading")
-      return (
-        t.status === "downloading" ||
-        t.status === "metadata" ||
-        t.status === "stalled"
-      );
+    if (filter === "downloading") return isActive(t.status);
     if (filter === "seeding") return t.status === "seeding";
     if (filter === "complete") return t.status === "complete";
     return true;

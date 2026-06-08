@@ -6,7 +6,9 @@ export type Status =
   | "seeding"
   | "complete"
   | "metadata"
-  | "stalled";
+  | "stalled"
+  | "connecting"
+  | "no_peers";
 export type SourceKind = "tracker" | "dht" | "nostr";
 
 export interface Transfer {
@@ -24,6 +26,10 @@ export interface Transfer {
   eta: string;
   peers: number;
   seeds: number;
+  /** BEP 9 metadata pieces received / total during magnet bootstrap; both 0
+   *  once metadata is in or for a non-magnet source. */
+  metaHave: number;
+  metaTotal: number;
   ratio: number | null;
   onion: string | null;
 }

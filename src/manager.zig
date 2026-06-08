@@ -85,12 +85,6 @@ const ManagedTransfer = struct {
     thread: ?std.Thread,
     added_ms: i64,
 
-    // Rate sampling (guarded by Manager.mutex).
-    last_down: u64 = 0,
-    last_up: u64 = 0,
-    last_ms: i64 = 0,
-    rate_down: u64 = 0,
-    rate_up: u64 = 0,
     /// True once a resolved magnet's .torrent has been written and `source`
     /// repointed at it, so the checkpoint doesn't redo it.
     resolved: bool = false,
@@ -384,7 +378,7 @@ pub const Manager = struct {
                 .onion = null,
                 .size = p.total_length,
                 .up_total = p.uploaded,
-                .up = mt.rate_up,
+                .up = p.up_rate,
                 .leechers = 0,
                 .ratio = ratio,
                 .relays = 0,
@@ -687,24 +681,22 @@ fn buildMagnetMetainfo(a: Allocator, ml: magnet_mod.MagnetLink) Allocator.Error!
 
 // Build one transfer's snapshot from race-safe session state. Called with
 // Manager.mutex held.
+/// Grace period (ms) before a peerless transfer is reported as `no_peers`
+/// rather than `connecting` — long enough to cover proxy/DHT/Nostr bootstrap.
+const peer_grace_ms: i64 = 20_000;
+/// Seconds without a byte of progress before an otherwise-active transfer is
+/// reported `stalled` instead of `downloading`.
+const idle_stall_secs: i64 = 5;
+
 fn snapshotTransfer(mt: *ManagedTransfer, arena: Allocator, now: i64) Allocator.Error!api.Transfer {
     const p = mt.session.progressSnapshot();
 
-    // Rate sampling: bytes since the last snapshot over elapsed milliseconds.
-    const dt = now - mt.last_ms;
-    if (mt.last_ms != 0 and dt > 0) {
-        const dd = p.downloaded -| mt.last_down;
-        const du = p.uploaded -| mt.last_up;
-        const dt_ms: u64 = @intCast(dt);
-        mt.rate_down = @intCast(@as(u128, dd) * 1000 / dt_ms);
-        mt.rate_up = @intCast(@as(u128, du) * 1000 / dt_ms);
-    }
-    mt.last_down = p.downloaded;
-    mt.last_up = p.uploaded;
-    mt.last_ms = now;
-
-    const made_progress = mt.rate_down > 0;
-    const status = deriveStatus(p.metadata_only, p.num_pieces, p.have, p.mode == .seed, made_progress);
+    // The session owns rate sampling now (see Session.sampleRate); the manager
+    // just reads the smoothed value, so multiple snapshot callers can't corrupt
+    // it the way the old per-snapshot delta did.
+    const grace_elapsed = (now - mt.added_ms) > peer_grace_ms;
+    const flowing = p.idle_secs <= idle_stall_secs;
+    const status = deriveStatus(p.metadata_only, p.num_pieces, p.have, p.mode == .seed, p.peers, flowing, grace_elapsed);
     const pct = pctFromCounts(p.have, p.num_pieces);
 
     var src_buf: [3]api.SourceKind = undefined;
@@ -716,7 +708,7 @@ fn snapshotTransfer(mt: *ManagedTransfer, arena: Allocator, now: i64) Allocator.
         p.total_length - (p.total_length * pct / 100)
     else
         0;
-    const eta = try arena.dupe(u8, formatEta(&eta_buf, status, remaining, mt.rate_down));
+    const eta = try arena.dupe(u8, formatEta(&eta_buf, status, remaining, p.down_rate));
 
     const ratio: ?f64 = if (p.downloaded > 0)
         @as(f64, @floatFromInt(p.uploaded)) / @as(f64, @floatFromInt(p.downloaded))
@@ -733,11 +725,17 @@ fn snapshotTransfer(mt: *ManagedTransfer, arena: Allocator, now: i64) Allocator.
         .sources = sources,
         .pct = pct,
         .size = if (p.total_length > 0) p.total_length else null,
-        .down = mt.rate_down,
-        .up = mt.rate_up,
+        // Show the live down rate only while bytes are actually flowing; once
+        // idle the EWMA still has a decaying tail that would contradict a
+        // "stalled"/"no peers" pill. Up rate keeps its own decay (seeds upload
+        // without download progress, so `flowing` doesn't apply to it).
+        .down = if (flowing) p.down_rate else 0,
+        .up = p.up_rate,
         .eta = eta,
         .peers = p.peers,
         .seeds = 0,
+        .meta_have = p.meta_have,
+        .meta_total = p.meta_total,
         .ratio = if (status == .seeding or status == .complete) ratio else null,
         .onion = null,
     };
@@ -753,13 +751,35 @@ pub fn pctFromCounts(have: u32, num_pieces: u32) u8 {
     return @intCast(@min(p, 100));
 }
 
-pub fn deriveStatus(metadata_only: bool, num_pieces: u32, have: u32, mode_is_seed: bool, made_progress: bool) api.Status {
-    if (metadata_only and num_pieces == 0) return .metadata;
-    const complete = num_pieces > 0 and have >= num_pieces;
+/// Derive the lifecycle/status pill for a transfer.
+///
+/// `flowing` is true when a byte of real progress (piece or metadata) arrived
+/// recently; `grace_elapsed` is true once enough time has passed that "0 peers"
+/// means "found none" rather than "still bootstrapping". The order matters:
+/// terminal states (seeding/complete) win, then the peerless states explain a
+/// stall (`connecting` early, `no_peers` after the grace window), then the
+/// active phases (`metadata` while fetching the info dict, else
+/// `downloading`/`stalled`).
+pub fn deriveStatus(
+    metadata_only: bool,
+    num_pieces: u32,
+    have: u32,
+    mode_is_seed: bool,
+    peers: u32,
+    flowing: bool,
+    grace_elapsed: bool,
+) api.Status {
     if (mode_is_seed) return .seeding;
-    if (complete) return .complete;
-    if (!made_progress) return .stalled;
-    return .downloading;
+    if (num_pieces > 0 and have >= num_pieces) return .complete;
+
+    // No peers: say why instead of a misleading "metadata"/"stalled".
+    if (peers == 0) return if (grace_elapsed) .no_peers else .connecting;
+
+    // Have peers but still fetching the info dict (magnet bootstrap).
+    if (metadata_only and num_pieces == 0) return .metadata;
+
+    // Have metadata and peers: downloading if bytes are flowing, else stalled.
+    return if (flowing) .downloading else .stalled;
 }
 
 /// Fill `out` with the sources for a route and return the used slice.
@@ -945,12 +965,20 @@ test "pctFromCounts" {
 }
 
 test "deriveStatus" {
-    try testing.expectEqual(api.Status.metadata, deriveStatus(true, 0, 0, false, false));
-    try testing.expectEqual(api.Status.complete, deriveStatus(false, 100, 100, false, false));
-    try testing.expectEqual(api.Status.seeding, deriveStatus(false, 100, 100, true, false));
-    try testing.expectEqual(api.Status.seeding, deriveStatus(false, 100, 40, true, false));
-    try testing.expectEqual(api.Status.downloading, deriveStatus(false, 100, 40, false, true));
-    try testing.expectEqual(api.Status.stalled, deriveStatus(false, 100, 40, false, false));
+    // deriveStatus(metadata_only, num_pieces, have, mode_is_seed, peers, flowing, grace_elapsed)
+    const S = api.Status;
+    // Terminal states win regardless of peers/flow.
+    try testing.expectEqual(S.seeding, deriveStatus(false, 100, 40, true, 0, false, true));
+    try testing.expectEqual(S.complete, deriveStatus(false, 100, 100, false, 0, false, true));
+    // Peerless: connecting before the grace window, no_peers after.
+    try testing.expectEqual(S.connecting, deriveStatus(true, 0, 0, false, 0, false, false));
+    try testing.expectEqual(S.no_peers, deriveStatus(true, 0, 0, false, 0, false, true));
+    try testing.expectEqual(S.no_peers, deriveStatus(false, 100, 40, false, 0, false, true));
+    // Fetching metadata with peers connected.
+    try testing.expectEqual(S.metadata, deriveStatus(true, 0, 0, false, 3, false, true));
+    // Have metadata + peers: flowing => downloading, idle => stalled.
+    try testing.expectEqual(S.downloading, deriveStatus(false, 100, 40, false, 3, true, true));
+    try testing.expectEqual(S.stalled, deriveStatus(false, 100, 40, false, 3, false, true));
 }
 
 test "deriveSources: direct uses tracker+dht+nostr" {
