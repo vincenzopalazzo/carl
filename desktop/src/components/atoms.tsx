@@ -38,6 +38,8 @@ const STATUS_META: Record<Status, { label: string; cls: string }> = {
   complete: { label: "complete", cls: "st-done" },
   metadata: { label: "metadata", cls: "st-meta" },
   stalled: { label: "stalled", cls: "st-stall" },
+  connecting: { label: "connecting", cls: "st-meta" },
+  no_peers: { label: "no peers", cls: "st-stall" },
 };
 
 export function StatusPill({ status }: { status: Status }) {
@@ -51,8 +53,12 @@ export function StatusPill({ status }: { status: Status }) {
 }
 
 export function ProgressBar({ pct, status }: { pct: number; status: Status }) {
-  const stalled = status === "stalled";
-  const meta = status === "metadata";
+  const stalled = status === "stalled" || status === "no_peers";
+  // No real piece progress yet: show the indeterminate "meta" bar.
+  const meta =
+    status === "metadata" ||
+    status === "connecting" ||
+    status === "no_peers";
   return (
     <div
       className={

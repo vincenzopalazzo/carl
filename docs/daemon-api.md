@@ -156,12 +156,15 @@ daemon does not read client frames; closing the socket ends the push.
 ```jsonc
 {
   "id": "t1", "name": "...", "hash": "<40-hex|''>", "magnet": "magnet:?...|''",
-  "status": "downloading|seeding|complete|metadata|stalled",
+  "status": "downloading|seeding|complete|metadata|stalled|connecting|no_peers",
   "route": "direct|proxy|tor",
   "sources": ["tracker"|"dht"|"nostr", ...],
   "pct": 0-100, "size": <bytes>|null,
   "down": <bytes/s>, "up": <bytes/s>, "eta": "1m 48s|—|stalled",
-  "peers": <n>, "seeds": <n>, "ratio": <float>|null, "onion": "<addr>"|null
+  "peers": <n>, "seeds": <n>,
+  // BEP 9 metadata bootstrap progress (magnet only); both 0 once metadata is in.
+  "metaHave": <n>, "metaTotal": <n>,
+  "ratio": <float>|null, "onion": "<addr>"|null
 }
 ```
 
