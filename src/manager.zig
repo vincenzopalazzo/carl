@@ -210,6 +210,20 @@ pub const Manager = struct {
     }
 
     /// Create a torrent from a local file (or archive) and start seeding it. The
+    /// Bind a throwaway loopback socket to discover a free port. Each `.tor`
+    /// seed needs its own listener port: every seed otherwise reuses
+    /// `cfg.listen_port`, but only one Session can bind a given port, so a second
+    /// concurrent tor seed would silently fail to listen and be unreachable
+    /// behind its onion. There's a tiny TOCTOU window before the Session
+    /// re-binds; on the rare loss the Session's listener is null and `addSeed`
+    /// warns. Returns null if even the probe bind fails (caller falls back).
+    fn pickLoopbackPort(self: *Manager) ?u16 {
+        _ = self;
+        var server = (std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0).listen(.{ .reuse_address = true })) catch return null;
+        defer server.deinit();
+        return server.listen_address.getPort();
+    }
+
     /// file is hashed in-process — carl needs no external torrent tool. With
     /// `want_nostr`, a NIP-35 torrent event is published so it's discoverable.
     pub fn addSeed(self: *Manager, path: []const u8, route: api.Route, want_nostr: bool) Error![]u8 {
@@ -245,11 +259,15 @@ pub const Manager = struct {
         var session_proxy = resolved_proxy;
         var listen_bind: session_mod.ListenBind = .any;
         var tor_hidden = false;
+        var seed_port = self.cfg.listen_port;
         if (route == .tor) {
+            // Give each tor seed its own loopback port so concurrent tor seeds
+            // don't collide on cfg.listen_port. The onion forwards to this port.
+            seed_port = self.pickLoopbackPort() orelse self.cfg.listen_port;
             hidden = tor_control.addOnion(self.allocator, .{
                 .control_addr = self.cfg.tor_control,
                 .cookie_path = if (self.cfg.tor_cookie.len > 0) self.cfg.tor_cookie else null,
-                .local_port = self.cfg.listen_port,
+                .local_port = seed_port,
                 .onion_port = self.cfg.tor_onion_port,
             }) catch {
                 if (socks_owned) |s| self.allocator.free(s);
@@ -267,13 +285,18 @@ pub const Manager = struct {
             mi.deinit(self.allocator);
             return error.OutOfMemory;
         };
-        session.* = session_mod.Session.init(self.allocator, mi, data_dir, .seed, self.cfg.listen_port, session_proxy, listen_bind, tor_hidden) catch {
+        session.* = session_mod.Session.init(self.allocator, mi, data_dir, .seed, seed_port, session_proxy, listen_bind, tor_hidden) catch {
             if (socks_owned) |s| self.allocator.free(s);
             if (hidden) |*h| h.deinit();
             self.allocator.destroy(session);
             mi.deinit(self.allocator);
             return error.SessionInitFailed;
         };
+        // A tor seed whose listener didn't bind is unreachable behind its onion
+        // (e.g. a port race). Surface it rather than silently half-seeding.
+        if (route == .tor and session.listener == null) {
+            log.warn("tor seed: listener failed to bind 127.0.0.1:{d}; the onion will be unreachable", .{seed_port});
+        }
         const built = Built{ .session = session, .meta = mi, .info_hash = session.info_hash, .name = mi.name };
 
         var hex: [40]u8 = undefined;
@@ -558,6 +581,7 @@ pub const Manager = struct {
 
         self.restoring = true;
         var restored: usize = 0;
+        var failed: usize = 0;
         for (st.transfers) |t| {
             const res = switch (t.kind) {
                 .download => self.addTransfer(t.source, t.route, t.nostr),
@@ -567,11 +591,21 @@ pub const Manager = struct {
                 self.allocator.free(id);
                 restored += 1;
             } else |e| {
-                log.warn("restore: could not re-add '{s}': {}", .{ t.source, e });
+                failed += 1;
+                log.warn("restore: could not re-add '{s}': {} (keeping it on disk)", .{ t.source, e });
             }
         }
         self.restoring = false;
-        self.persist();
+        // Only re-persist when every saved transfer came back. `persist` rewrites
+        // the DB purely from the live set, so persisting after a failure would
+        // permanently delete the dropped specs — e.g. a `tor` seed whose hidden
+        // service couldn't be created because Tor wasn't up yet at restart. Leave
+        // the on-disk state intact so the next restart retries them.
+        if (failed == 0) {
+            self.persist();
+        } else {
+            log.warn("restore: {d} transfer(s) didn't come back; leaving saved state intact for retry", .{failed});
+        }
         if (restored > 0) log.info("restored {d} transfer(s) from saved state", .{restored});
     }
 

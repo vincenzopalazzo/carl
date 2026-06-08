@@ -37,7 +37,8 @@ pub const Announce = union(enum) {
 /// Publish a torrent's NIP-35 discovery event (kind 2003) and, when `ann` names
 /// a reachable endpoint, a peer-announce (kind 30078) so leechers can dial the
 /// seeder. `proxy` routes the relay connections (e.g. Tor SOCKS) so publishing
-/// doesn't leak. Returns `error.NoNostrKey` if no identity is configured.
+/// doesn't leak. Propagates `readSecretKey`'s error (e.g. `error.NoKey` when no
+/// identity is configured) so callers can report the real reason.
 pub fn publish(
     allocator: Allocator,
     mi: metainfo.Metainfo,
@@ -46,7 +47,7 @@ pub fn publish(
     description: []const u8,
     proxy: ?proxy_mod.Proxy,
 ) !void {
-    const sk = nostr_config.readSecretKey(allocator) catch return error.NoNostrKey;
+    const sk = try nostr_config.readSecretKey(allocator);
     const pk = try secp.publicKeyFromSecret(sk);
 
     var torrent_ev = try nip35.buildFromMetainfo(allocator, sk, pk, mi, info_hash, description);

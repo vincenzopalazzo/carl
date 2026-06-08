@@ -10,6 +10,10 @@ const posix = std.posix;
 
 const log = std.log.scoped(.tor);
 
+/// Bound on control-connection reads/writes so a port that accepts but never
+/// replies (something other than Tor) can't wedge the caller indefinitely.
+const control_timeout_secs: i64 = 10;
+
 pub const Error = error{
     ConnectFailed,
     AuthFailed,
@@ -120,7 +124,15 @@ fn connectControl(allocator: Allocator, addr_str: []const u8) !std.net.Stream {
     defer list.deinit();
 
     for (list.addrs) |a| {
-        if (std.net.tcpConnectToAddress(a)) |s| return s else |_| {}
+        if (std.net.tcpConnectToAddress(a)) |s| {
+            // Bound control reads/writes: `authenticate`/`readReply` do blocking
+            // reads with no timeout, so without this a port that accepts but
+            // never replies (not Tor) would wedge the caller forever.
+            const tv = posix.timeval{ .sec = control_timeout_secs, .usec = 0 };
+            posix.setsockopt(s.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+            posix.setsockopt(s.handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
+            return s;
+        } else |_| {}
     }
     return error.ConnectFailed;
 }
