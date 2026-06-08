@@ -141,7 +141,10 @@ fn printUsage() void {
         \\  nostr-keygen                                     generate a fresh nostr key
         \\  daemon [--port p] [--bt-port p] [--route direct|proxy|tor] [--socks url]
         \\         [--download-dir d] [--token tok] [--parent-pid pid]
+        \\         [--tor-control host:port] [--tor-cookie path] [--tor-onion-port p]
         \\           run a localhost HTTP+WebSocket API for the desktop GUI.
+        \\           --tor-* configure the ControlPort used to create hidden
+        \\           services for tor-route seeds (default 127.0.0.1:9051).
         \\           binds 127.0.0.1 only; every request needs the printed token
         \\           (X-Carl-Token header, or ?token= for the /ws upgrade).
         \\
@@ -515,7 +518,9 @@ fn cmdSeed(
                 log.err("tor hidden service setup failed: {}", .{err});
                 std.process.exit(1);
             };
-            publishNostrOnion(allocator, mi, hidden.?.onion_host, hidden.?.onion_port, description, nostr_proxy) catch |err| {
+            carl.seeding.publish(allocator, mi, carl.metainfo.infoHash(mi.raw_info), .{
+                .onion = .{ .host = hidden.?.onion_host, .port = hidden.?.onion_port },
+            }, description, nostr_proxy) catch |err| {
                 log.warn("nostr publish failed: {} (continuing seed)", .{err});
             };
         } else {
@@ -530,7 +535,9 @@ fn cmdSeed(
                 );
                 std.process.exit(1);
             }
-            publishNostrIpv4(allocator, mi, ip, port, description, null) catch |err| {
+            carl.seeding.publish(allocator, mi, carl.metainfo.infoHash(mi.raw_info), .{
+                .ipv4 = .{ .ip = ip, .port = port },
+            }, description, null) catch |err| {
                 log.warn("nostr publish failed: {} (continuing seed)", .{err});
             };
         }
@@ -838,6 +845,12 @@ fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u
     };
     const socks = parseFlag(extra, "--socks") orelse "";
     const download_dir = parseFlag(extra, "--download-dir") orelse "";
+    // Tor ControlPort config for reachable `.tor` seeds (hidden services). The
+    // empty defaults let Manager.init fall back to 127.0.0.1:9051 + the default
+    // cookie path, matching the CLI `carl seed --tor-seed` defaults.
+    const tor_control = parseFlag(extra, "--tor-control") orelse "";
+    const tor_cookie = parseFlag(extra, "--tor-cookie") orelse "";
+    const tor_onion_port: u16 = parsePortFlag(extra, "--tor-onion-port", 80);
 
     // Token: use --token if given, else generate a random 32-hex secret. The
     // Tauri sidecar reads it off stdout and presents it on every request.
@@ -858,6 +871,9 @@ fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u
         .socks = socks,
         .download_dir = download_dir,
         .listen_port = bt_port,
+        .tor_control = tor_control,
+        .tor_cookie = tor_cookie,
+        .tor_onion_port = tor_onion_port,
     }) catch |err| {
         log.err("failed to init manager: {}", .{err});
         std.process.exit(1);
@@ -910,90 +926,6 @@ fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u
 // -------------------------------------------------------------------------
 // Nostr helpers for seed/download
 // -------------------------------------------------------------------------
-
-fn publishNostrIpv4(
-    allocator: std.mem.Allocator,
-    mi: carl.metainfo.Metainfo,
-    external_ip: [4]u8,
-    port: u16,
-    description: []const u8,
-    proxy: ?carl.proxy.Proxy,
-) !void {
-    const sk = try readNostrSecretKey(allocator);
-    const pk = try carl.secp.publicKeyFromSecret(sk);
-    const info_hash = carl.metainfo.infoHash(mi.raw_info);
-
-    var torrent_ev = try carl.nip35.buildFromMetainfo(allocator, sk, pk, mi, info_hash, description);
-    defer torrent_ev.deinit(allocator);
-    var announce_ev = try carl.peer_announce.build(allocator, sk, pk, info_hash, external_ip, port);
-    defer announce_ev.deinit(allocator);
-
-    try publishNostrEvents(allocator, torrent_ev, announce_ev, proxy);
-}
-
-fn publishNostrOnion(
-    allocator: std.mem.Allocator,
-    mi: carl.metainfo.Metainfo,
-    onion_host: []const u8,
-    onion_port: u16,
-    description: []const u8,
-    proxy: ?carl.proxy.Proxy,
-) !void {
-    const sk = try readNostrSecretKey(allocator);
-    const pk = try carl.secp.publicKeyFromSecret(sk);
-    const info_hash = carl.metainfo.infoHash(mi.raw_info);
-
-    var torrent_ev = try carl.nip35.buildFromMetainfo(allocator, sk, pk, mi, info_hash, description);
-    defer torrent_ev.deinit(allocator);
-    var announce_ev = try carl.peer_announce.buildOnion(allocator, sk, pk, info_hash, onion_host, onion_port);
-    defer announce_ev.deinit(allocator);
-
-    try publishNostrEvents(allocator, torrent_ev, announce_ev, proxy);
-}
-
-fn readNostrSecretKey(allocator: std.mem.Allocator) !carl.secp.SecretKey {
-    return carl.nostr_config.readSecretKey(allocator) catch |err| {
-        switch (err) {
-            error.NoKey => {
-                log.err("no nostr key configured. run `carl nostr-keygen` first", .{});
-                return error.NoKey;
-            },
-            else => return err,
-        }
-    };
-}
-
-fn publishNostrEvents(
-    allocator: std.mem.Allocator,
-    torrent_ev: carl.nostr.Event,
-    announce_ev: carl.nostr.Event,
-    proxy: ?carl.proxy.Proxy,
-) !void {
-    const relay_urls = try carl.nostr_config.readRelays(allocator);
-    defer carl.nostr_config.freeRelays(allocator, relay_urls);
-
-    var torrent_acks: usize = 0;
-    var announce_acks: usize = 0;
-    for (relay_urls) |url| {
-        var r = carl.relay.Relay.connect(allocator, url, proxy) catch |err| {
-            log.warn("nostr publish: {s}: {}", .{ url, err });
-            continue;
-        };
-        defer r.deinit();
-        if (carl.relay.publishAndWait(allocator, &r, torrent_ev, 5_000)) {
-            log.info("published kind-2003 to {s}", .{url});
-            torrent_acks += 1;
-        }
-        if (carl.relay.publishAndWait(allocator, &r, announce_ev, 5_000)) {
-            log.info("published kind-30078 peer-announce to {s}", .{url});
-            announce_acks += 1;
-        }
-    }
-    log.info(
-        "nostr publish: kind-2003 {d}/{d} relays, kind-30078 {d}/{d} relays",
-        .{ torrent_acks, relay_urls.len, announce_acks, relay_urls.len },
-    );
-}
 
 /// Fetch the most recent kind-2003 (NIP-35) torrent event for `info_hash`,
 /// returning its parsed entry (title, trackers, files). Caller owns the result
