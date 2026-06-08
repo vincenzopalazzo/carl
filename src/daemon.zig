@@ -180,7 +180,13 @@ pub const Daemon = struct {
     /// Never opens an upstream connection (greeting only) — see classifySocks5.
     fn probeProxy(self: *Daemon) void {
         if (self.manager.cfg.route == .direct) {
-            self.publishProxy(.ok, null); // unused for direct; snapshot maps to "disabled"
+            // Don't fabricate an "ok": mark unprobed so that if the route later
+            // switches to proxy/tor, the snapshot shows an honest "checking"
+            // until a real probe lands (rather than a stale/false "ok"). The
+            // direct route is reported as "disabled" by the snapshot regardless.
+            self.health_mutex.lock();
+            self.proxy_probed = false;
+            self.health_mutex.unlock();
             return;
         }
         const proxy = proxy_mod.parseUrl(self.manager.cfg.socks) catch {

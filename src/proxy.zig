@@ -140,21 +140,24 @@ pub fn parseUrl(url: []const u8) ProxyError!Proxy {
 }
 
 /// Mask any `user:pass@` userinfo in a proxy URL so it is safe to log or show
-/// in the API/UI — SOCKS5 auth credentials must never leak. Writes the masked
-/// form into `out` and returns that slice; if there's no userinfo (or `out` is
-/// too small) returns the input `url` unchanged. `out` should be at least
-/// `url.len + 4` bytes to always fit the `***@` mask.
+/// in the API/UI — SOCKS5 auth credentials must never leak. Returns a slice that
+/// is guaranteed credential-free on every path:
+///   - no `://` or no userinfo → the input unchanged (already credential-free);
+///   - userinfo + room in `out` → the masked `scheme://***@host:port`;
+///   - userinfo but `out` too small → the bare `host:port` (still no creds).
+/// `out` should be `url.len + 4` bytes to fit the `***@` mask.
 pub fn redactUrl(url: []const u8, out: []u8) []const u8 {
     const sep = std.mem.indexOf(u8, url, "://") orelse return url;
     const after = sep + 3;
-    // Match parseUrl's delimiter choice (last '@', so a '@' inside a password
-    // doesn't truncate early). Search only the authority portion.
+    // Last '@' matches parseUrl's delimiter choice, so a '@' inside the password
+    // doesn't truncate early. (A stray '@' in a credential-free path would only
+    // cause harmless over-redaction, never a leak.)
     const rest = url[after..];
     const at_rel = std.mem.lastIndexOfScalar(u8, rest, '@') orelse return url;
     const prefix = url[0..after]; // "scheme://"
     const suffix = rest[at_rel + 1 ..]; // "host:port[/...]"
     const mask = "***@";
-    if (out.len < prefix.len + mask.len + suffix.len) return url;
+    if (out.len < prefix.len + mask.len + suffix.len) return suffix; // credential-free fallback
     @memcpy(out[0..prefix.len], prefix);
     @memcpy(out[prefix.len..][0..mask.len], mask);
     @memcpy(out[prefix.len + mask.len ..][0..suffix.len], suffix);
@@ -379,13 +382,18 @@ fn resolveIp4(allocator: Allocator, host: []const u8, port: u16) ProxyError!std.
 
 /// Health-check a SOCKS5 proxy using only the method-negotiation greeting — we
 /// never send a CONNECT, so the proxy is not asked to open any upstream
-/// connection and this probe leaks no traffic from the privacy tool. Bounded by
-/// `timeout_secs` end to end. Pure classification: never returns an error, it
-/// maps every failure into a `ProxyState`. (Full CONNECT reply codes only arise
-/// on real peer dials — surfacing those per-transfer is a documented follow-up.)
+/// connection and this probe leaks no traffic from the privacy tool. The connect
+/// and greeting phases are bounded by `timeout_secs`; the initial DNS resolve is
+/// not (typical SOCKS hosts are IP literals like 127.0.0.1, so no DNS happens).
+/// Pure classification: never returns an error, it maps every failure into a
+/// `ProxyState`. (Full CONNECT reply codes only arise on real peer dials —
+/// surfacing those per-transfer is a documented follow-up.)
 pub fn classifySocks5(allocator: Allocator, proxy: Proxy, timeout_secs: u32) ProxyProbe {
     const addr = resolveIp4(allocator, proxy.host, proxy.port) catch
         return .{ .state = .not_running }; // can't resolve → treat as unreachable
+    // poll() takes an i32 millisecond timeout; clamp so a pathological
+    // `timeout_secs` can't overflow the cast (callers pass small values).
+    const timeout_ms: i32 = if (timeout_secs > 600) 600_000 else @intCast(timeout_secs * 1000);
 
     const sock = std.posix.socket(
         std.posix.AF.INET,
@@ -405,7 +413,7 @@ pub fn classifySocks5(allocator: Allocator, proxy: Proxy, timeout_secs: u32) Pro
     std.posix.connect(sock, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
         error.WouldBlock => {
             var pfd = [_]std.posix.pollfd{.{ .fd = sock, .events = std.posix.POLL.OUT, .revents = 0 }};
-            const ready = std.posix.poll(&pfd, @intCast(@as(u64, timeout_secs) * 1000)) catch
+            const ready = std.posix.poll(&pfd, timeout_ms) catch
                 return .{ .state = .timeout };
             if (ready == 0) return .{ .state = .timeout };
             // Surface the async connect result: refused => not running, else timeout.
@@ -1012,5 +1020,12 @@ test "redactUrl masks SOCKS credentials" {
     try std.testing.expectEqualStrings(
         "socks5://***@host:1080",
         redactUrl("socks5://u:p@ss@host:1080", &buf),
+    );
+    // Buffer too small for the masked form falls back to the bare host:port —
+    // still credential-free (never the raw user:pass).
+    var tiny: [4]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "host:1080",
+        redactUrl("socks5://user:pass@host:1080", &tiny),
     );
 }

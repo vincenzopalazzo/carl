@@ -896,7 +896,9 @@ fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u
     // On a proxy/tor route, check the SOCKS proxy up front and say clearly why
     // it's unreachable (the daemon keeps running and the GUI shows live health).
     if (route != .direct) {
-        // Mask any user:pass@ credentials before logging the proxy URL.
+        // Mask any user:pass@ credentials before logging the proxy URL. redactUrl
+        // is credential-safe even if this buffer is too small (it then returns
+        // the bare host:port), so a fixed buffer can't leak the password.
         var rbuf: [512]u8 = undefined;
         const safe_socks = carl.proxy.redactUrl(socks, &rbuf);
         if (carl.proxy.parseUrl(socks)) |px| {
