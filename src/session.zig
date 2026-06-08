@@ -789,6 +789,11 @@ pub const Session = struct {
                 if (msg.data) |data| {
                     if (msg.total_size) |ts| {
                         md.setSize(ts) catch return;
+                        // Publish the total here too: a peer can send `.data`
+                        // before any extended handshake set the size, and we must
+                        // never expose have>0 with total==0 (a "5/0" display and
+                        // a divide-by-zero for any percentage the UI computes).
+                        self.meta_total.store(md.num_pieces, .monotonic);
                     }
 
                     const complete = md.addPiece(msg.piece, data) catch return;
@@ -1021,6 +1026,12 @@ pub const Session = struct {
         self.store = storage_mod.Storage.init(self.allocator, self.meta, self.output_dir, true) catch
             return error.StorageInitFailed;
 
+        // Metadata is in; clear the fetch-progress atomics BEFORE flipping to
+        // download mode, so a snapshot that observes `metadata_only == false`
+        // never also sees a stale near-complete have/total.
+        self.meta_have.store(0, .monotonic);
+        self.meta_total.store(0, .monotonic);
+
         // Switch from metadata-only to download mode. `metadata_only` is read by
         // `progressSnapshot` from the daemon thread, so flip it under
         // snapshot_mutex; the tracker itself is session-private (the snapshot
@@ -1032,10 +1043,6 @@ pub const Session = struct {
         }
         if (self.metadata_download) |*md| md.deinit();
         self.metadata_download = null;
-        // Metadata is in; clear the fetch-progress atomics so the snapshot
-        // doesn't report a phantom "have/total" once we're downloading pieces.
-        self.meta_have.store(0, .monotonic);
-        self.meta_total.store(0, .monotonic);
 
         // Capture the now-resolved .torrent so the daemon can persist it and
         // resume this torrent fully on restart. Built here where `meta` is

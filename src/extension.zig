@@ -472,6 +472,32 @@ test "build metadata request" {
     try std.testing.expectEqual(@as(u8, 2), payload[0]); // peer's ut_metadata id
 }
 
+test "metadata download progress counters" {
+    const allocator = std.testing.allocator;
+    var dl = MetadataDownload.init(allocator, [_]u8{0} ** 20);
+    defer dl.deinit();
+
+    // Fresh tracker: no size known yet.
+    try std.testing.expectEqual(@as(u32, 0), dl.num_pieces);
+    try std.testing.expectEqual(@as(u32, 0), dl.received_count);
+
+    // 3 pieces' worth of metadata (just over 2 * 16384).
+    try dl.setSize(metadata_piece_size * 2 + 1);
+    try std.testing.expectEqual(@as(u32, 3), dl.num_pieces);
+    try std.testing.expect(!try dl.addPiece(0, "a"));
+    try std.testing.expectEqual(@as(u32, 1), dl.received_count);
+    // Duplicate piece must not double-count.
+    try std.testing.expect(!try dl.addPiece(0, "a"));
+    try std.testing.expectEqual(@as(u32, 1), dl.received_count);
+    // Out-of-range index is ignored.
+    try std.testing.expect(!try dl.addPiece(99, "a"));
+    try std.testing.expectEqual(@as(u32, 1), dl.received_count);
+    // Final piece flips completion.
+    _ = try dl.addPiece(1, "b");
+    try std.testing.expect(try dl.addPiece(2, "c"));
+    try std.testing.expectEqual(@as(u32, 3), dl.received_count);
+}
+
 test "metadata download assembly and verification" {
     const allocator = std.testing.allocator;
 
