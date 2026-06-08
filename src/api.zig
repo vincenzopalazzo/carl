@@ -137,6 +137,19 @@ pub const Relay = struct {
     events: u64 = 0,
 };
 
+/// Health of the configured SOCKS proxy on the proxy/tor route, so the UI and
+/// logs can say *why* the route isn't working (Tor down / timeout / rejected)
+/// instead of silently failing. Probed by the daemon's background prober.
+pub const ProxyHealth = struct {
+    /// "disabled" (direct route) | "checking" (before first probe) |
+    /// "ok" | "not_running" | "timeout" | "rejected"
+    state: []const u8,
+    /// The SOCKS endpoint being probed (e.g. "socks5h://127.0.0.1:9050").
+    endpoint: []const u8,
+    /// Human-readable detail, e.g. the SOCKS5 reply byte for "rejected"; "" otherwise.
+    detail: []const u8 = "",
+};
+
 /// A file being seeded.
 pub const Seed = struct {
     id: []const u8,
@@ -410,6 +423,14 @@ pub fn writeRelay(j: *Json, r: Relay) Allocator.Error!void {
     try j.keyString("state", r.state);
     try j.keyString("net", r.net);
     try j.keyNumber("events", r.events);
+    try j.endObject();
+}
+
+pub fn writeProxyHealth(j: *Json, h: ProxyHealth) Allocator.Error!void {
+    try j.beginObject();
+    try j.keyString("state", h.state);
+    try j.keyString("endpoint", h.endpoint);
+    try j.keyString("detail", h.detail);
     try j.endObject();
 }
 

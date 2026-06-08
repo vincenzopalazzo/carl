@@ -57,6 +57,11 @@ pub const Daemon = struct {
     /// Last relay-health probe result (owned). Guarded by `health_mutex`.
     health_mutex: std.Thread.Mutex = .{},
     health: []api.Relay = &.{},
+    /// Last SOCKS-proxy-health probe (proxy/tor route), guarded by `health_mutex`.
+    /// `proxy_probed` is false until the first probe lands (UI shows "checking").
+    proxy_state: proxy_mod.ProxyState = .ok,
+    proxy_reply: ?u8 = null,
+    proxy_probed: bool = false,
 
     /// Bind to 127.0.0.1:`port` and serve until `running` is cleared. Blocking.
     pub fn serve(self: *Daemon, port: u16) !void {
@@ -143,9 +148,63 @@ pub const Daemon = struct {
         return out;
     }
 
+    /// Snapshot proxy health for the API. `endpoint` is duped into `arena`.
+    /// Maps the direct route to "disabled" and the pre-first-probe window to
+    /// "checking"; otherwise reflects the last `classifySocks5` result.
+    fn proxyHealthSnapshot(self: *Daemon, arena: Allocator) !api.ProxyHealth {
+        // Mask any SOCKS auth credentials before exposing the endpoint.
+        const raw = self.manager.cfg.socks;
+        const rbuf = try arena.alloc(u8, raw.len + 4);
+        const endpoint = try arena.dupe(u8, proxy_mod.redactUrl(raw, rbuf));
+        if (self.manager.cfg.route == .direct)
+            return .{ .state = "disabled", .endpoint = endpoint };
+
+        self.health_mutex.lock();
+        const probed = self.proxy_probed;
+        const st = self.proxy_state;
+        const reply = self.proxy_reply;
+        self.health_mutex.unlock();
+
+        if (!probed) return .{ .state = "checking", .endpoint = endpoint };
+
+        var detail: []const u8 = "";
+        if (st == .rejected) {
+            if (reply) |b| {
+                detail = std.fmt.allocPrint(arena, "SOCKS5 replied 0x{x:0>2}", .{b}) catch "";
+            }
+        }
+        return .{ .state = st.jsonName(), .endpoint = endpoint, .detail = detail };
+    }
+
+    /// Probe the SOCKS proxy once (proxy/tor route only) and cache the result.
+    /// Never opens an upstream connection (greeting only) — see classifySocks5.
+    fn probeProxy(self: *Daemon) void {
+        if (self.manager.cfg.route == .direct) {
+            self.publishProxy(.ok, null); // unused for direct; snapshot maps to "disabled"
+            return;
+        }
+        const proxy = proxy_mod.parseUrl(self.manager.cfg.socks) catch {
+            // Malformed proxy URL is a config error the user must fix; surface it
+            // as "rejected" so the route doesn't silently look healthy.
+            self.publishProxy(.rejected, null);
+            return;
+        };
+        const probe = proxy_mod.classifySocks5(self.allocator, proxy, 5);
+        self.publishProxy(probe.state, probe.reply);
+    }
+
+    fn publishProxy(self: *Daemon, state: proxy_mod.ProxyState, reply: ?u8) void {
+        self.health_mutex.lock();
+        self.proxy_state = state;
+        self.proxy_reply = reply;
+        self.proxy_probed = true;
+        self.health_mutex.unlock();
+    }
+
     fn relayHealthLoop(self: *Daemon) void {
         while (self.running.load(.acquire) and !session_mod.shutdown_requested.load(.acquire)) {
             self.probeRelays();
+            self.probeProxy();
             // Persist any newly-resolved magnet torrents (headless coverage; the
             // WS push also does this ~1/s when the GUI is connected).
             self.manager.checkpoint();
@@ -794,6 +853,8 @@ fn buildStateJson(arena: Allocator, daemon: *Daemon, relays: []const api.Relay, 
     try j.beginArray();
     for (relays) |r| try api.writeRelay(&j, r);
     try j.endArray();
+    try j.key("proxy");
+    try api.writeProxyHealth(&j, try daemon.proxyHealthSnapshot(arena));
     try j.key("identity");
     try api.writeIdentity(&j, .{ .npub = npub });
     try j.key("settings");

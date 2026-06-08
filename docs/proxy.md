@@ -144,6 +144,25 @@ carl download debian-12.iso.torrent --output-dir ~/Downloads \
 > block BitTorrent peer ports, so a full download may stall. Use `ssh -D` or
 > `microsocks` for a complete download.
 
+## Is the proxy actually reachable? (health detection)
+
+On a proxy/tor route, carl tells you *why* the route isn't working instead of
+silently failing:
+
+- **At startup**, `carl daemon --route tor` (or `proxy`) probes the SOCKS port
+  and logs one of: `reachable`, `unreachable (connection refused) -- is Tor
+  running?`, `timed out`, or `rejected the SOCKS5 handshake`.
+- **Continuously**, the daemon re-probes every ~30s and publishes the result as
+  `proxy` in `GET /api/state` + the WebSocket push (see `docs/daemon-api.md`).
+  The desktop **Settings → Anonymity** panel shows it live: reachable / not
+  running / timed out / rejected.
+
+The probe only performs the SOCKS5 **method-negotiation greeting** — it never
+issues a `CONNECT`, so it opens no upstream connection and leaks no traffic. It
+distinguishes "nothing listening" (Tor down) from "timed out" from "rejected"
+(not a SOCKS5 proxy, or auth required). Full SOCKS5 `CONNECT` reply codes only
+arise on real peer dials; surfacing those per-transfer is a follow-up.
+
 ## Verifying there are no leaks
 
 This is the test that matters for a privacy feature -- prove that **nothing**
