@@ -99,6 +99,12 @@ pub const Session = struct {
     // metadata). The snapshot turns this into "downloading vs stalled" without a
     // cadence-dependent delta. Seeded to start time in `init`.
     last_progress_s: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    // BEP 9 metadata-fetch progress, published as atomics by the session thread
+    // (restated whenever the `metadata_download` tracker advances). The snapshot
+    // reads these instead of reaching into the tracker, so it never races the
+    // tracker's realloc/teardown. Both 0 once metadata is in or for a non-magnet.
+    meta_have: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    meta_total: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     // Sampling bookkeeping — touched only by the session thread in `sampleRate`.
     rate_last_s: i64 = 0,
     rate_last_in: u64 = 0,
@@ -333,15 +339,9 @@ pub const Session = struct {
         // `have`/`peers` come from atomics the session thread keeps exact, so we
         // never touch `our_bitfield`/`peers` (mutated lockless on that thread).
         // `num_pieces`/`total_length` are still read under the mutex because the
-        // metadata-complete transition reassigns them.
-        // Metadata progress comes from the (mutex-guarded) download tracker; it's
-        // torn down on completion, so a null tracker means "not fetching".
-        var meta_have: u32 = 0;
-        var meta_total: u32 = 0;
-        if (self.metadata_download) |md| {
-            meta_have = md.received_count;
-            meta_total = md.num_pieces;
-        }
+        // metadata-complete transition reassigns them. Metadata-fetch progress is
+        // read from session atomics (not the tracker struct), so it never races
+        // the tracker's realloc/teardown on the session thread.
         const last_prog = self.last_progress_s.load(.monotonic);
         return .{
             .have = @intCast(self.have_pieces.load(.monotonic)),
@@ -354,8 +354,8 @@ pub const Session = struct {
             .metadata_only = self.metadata_only,
             .down_rate = self.down_rate.load(.monotonic),
             .up_rate = self.up_rate.load(.monotonic),
-            .meta_have = meta_have,
-            .meta_total = meta_total,
+            .meta_have = self.meta_have.load(.monotonic),
+            .meta_total = self.meta_total.load(.monotonic),
             .idle_secs = @max(0, std.time.timestamp() - last_prog),
         };
     }
@@ -763,6 +763,7 @@ pub const Session = struct {
             if (self.metadata_download) |*md| {
                 if (hs.metadata_size) |ms| {
                     md.setSize(ms) catch return;
+                    self.meta_total.store(md.num_pieces, .monotonic);
                     log.info("metadata size: {d} bytes ({d} pieces)", .{ ms, md.num_pieces });
                     self.requestMetadataPieces(p) catch {};
                 }
@@ -793,8 +794,9 @@ pub const Session = struct {
                     const complete = md.addPiece(msg.piece, data) catch return;
                     // Count metadata bytes toward the download rate so the
                     // metadata-fetch phase shows real speed (piece `downloaded`
-                    // is still 0 here).
+                    // is still 0 here), and publish progress for the snapshot.
                     self.meta_bytes_in += data.len;
+                    self.meta_have.store(md.received_count, .monotonic);
                     log.info("metadata piece {d}/{d}", .{ md.received_count, md.num_pieces });
 
                     if (!complete) {
@@ -810,13 +812,14 @@ pub const Session = struct {
                             self.onMetadataComplete(raw_info) catch {};
                         } else {
                             log.warn("metadata hash mismatch, retrying...", .{});
-                            // Reset and try again. Under snapshot_mutex because
-                            // progressSnapshot reads `metadata_download` from the
-                            // daemon thread for meta-piece progress.
-                            self.snapshot_mutex.lock();
-                            defer self.snapshot_mutex.unlock();
+                            // Reset and try again. `metadata_download` is private
+                            // to the session thread (the snapshot reads the
+                            // `meta_have`/`meta_total` atomics, not the tracker),
+                            // so no lock is needed — just restate progress as 0.
                             md.deinit();
                             self.metadata_download = extension.MetadataDownload.init(self.allocator, self.info_hash);
+                            self.meta_have.store(0, .monotonic);
+                            self.meta_total.store(0, .monotonic);
                         }
                     }
                 }
@@ -1018,17 +1021,21 @@ pub const Session = struct {
         self.store = storage_mod.Storage.init(self.allocator, self.meta, self.output_dir, true) catch
             return error.StorageInitFailed;
 
-        // Switch from metadata-only to download mode. Under snapshot_mutex
-        // because `progressSnapshot` reads `metadata_only` and dereferences
-        // `metadata_download` (for meta-piece progress) from another thread —
-        // tearing it down here unguarded would be a use-after-free.
+        // Switch from metadata-only to download mode. `metadata_only` is read by
+        // `progressSnapshot` from the daemon thread, so flip it under
+        // snapshot_mutex; the tracker itself is session-private (the snapshot
+        // reads the meta atomics, not the tracker).
         {
             self.snapshot_mutex.lock();
             defer self.snapshot_mutex.unlock();
             self.metadata_only = false;
-            if (self.metadata_download) |*md| md.deinit();
-            self.metadata_download = null;
         }
+        if (self.metadata_download) |*md| md.deinit();
+        self.metadata_download = null;
+        // Metadata is in; clear the fetch-progress atomics so the snapshot
+        // doesn't report a phantom "have/total" once we're downloading pieces.
+        self.meta_have.store(0, .monotonic);
+        self.meta_total.store(0, .monotonic);
 
         // Capture the now-resolved .torrent so the daemon can persist it and
         // resume this torrent fully on restart. Built here where `meta` is
