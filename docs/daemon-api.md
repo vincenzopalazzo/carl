@@ -80,8 +80,25 @@ The combined initial-load payload (and the per-tick WebSocket push). Object:
   "transfers": [Transfer],
   "seeds":     [Seed],
   "relays":    [Relay],
+  "proxy":     ProxyHealth,
   "identity":  Identity,
   "settings":  Settings
+}
+```
+
+`ProxyHealth` reports the SOCKS proxy's reachability on the proxy/tor route:
+
+```jsonc
+{
+  // "disabled"  — direct route, no proxy configured
+  // "checking"  — before the first probe lands
+  // "ok"        — reachable and speaks SOCKS5
+  // "not_running" — connection refused (e.g. Tor isn't running)
+  // "timeout"   — connect/greeting timed out
+  // "rejected"  — reachable but not SOCKS5 / no acceptable auth method
+  "state": "ok",
+  "endpoint": "socks5h://127.0.0.1:9050",
+  "detail": ""   // e.g. "SOCKS5 replied 0xff" when state == "rejected"
 }
 ```
 
@@ -92,7 +109,9 @@ The combined initial-load payload (and the per-tick WebSocket push). Object:
 A background prober refreshes relay reachability every ~30s (open + close a
 connection per relay, through the configured route), so `state` reflects real
 `connected` / `unreachable` status rather than just `configured`. The same
-status rides in `GET /api/state` and the WebSocket push.
+prober classifies the SOCKS proxy each cycle (a SOCKS5 method-negotiation
+greeting only — no CONNECT, so it opens no upstream connection) and publishes
+`proxy`. All of this rides in `GET /api/state` and the WebSocket push.
 ### `GET /api/identity` → `Identity`
 ### `GET /api/settings` → `Settings`
 

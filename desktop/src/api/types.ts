@@ -58,6 +58,19 @@ export interface Identity {
   npub: string;
 }
 
+/** Health of the configured SOCKS proxy on the proxy/tor route. */
+export interface ProxyHealth {
+  state:
+    | "disabled"
+    | "checking"
+    | "ok"
+    | "not_running"
+    | "timeout"
+    | "rejected";
+  endpoint: string;
+  detail: string;
+}
+
 export interface Settings {
   route: Route;
   socks: string;
@@ -98,6 +111,7 @@ export interface AppState {
   transfers: Transfer[];
   seeds: Seed[];
   relays: Relay[];
+  proxy: ProxyHealth;
   identity: Identity;
   settings: Settings;
 }
@@ -106,6 +120,7 @@ export const emptyState: AppState = {
   transfers: [],
   seeds: [],
   relays: [],
+  proxy: { state: "disabled", endpoint: "", detail: "" },
   identity: { npub: "" },
   settings: {
     route: "direct",

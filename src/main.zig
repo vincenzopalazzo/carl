@@ -893,6 +893,27 @@ fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u
     try stdout.print("token: {s}\n", .{token});
     try stdout.print("route: {s}\n", .{route_str});
 
+    // On a proxy/tor route, check the SOCKS proxy up front and say clearly why
+    // it's unreachable (the daemon keeps running and the GUI shows live health).
+    if (route != .direct) {
+        // Mask any user:pass@ credentials before logging the proxy URL. redactUrl
+        // is credential-safe even if this buffer is too small (it then returns
+        // the bare host:port), so a fixed buffer can't leak the password.
+        var rbuf: [512]u8 = undefined;
+        const safe_socks = carl.proxy.redactUrl(socks, &rbuf);
+        if (carl.proxy.parseUrl(socks)) |px| {
+            const probe = carl.proxy.classifySocks5(allocator, px, 5);
+            switch (probe.state) {
+                .ok => log.info("SOCKS proxy {s} reachable", .{safe_socks}),
+                .not_running => log.warn("SOCKS proxy {s} unreachable (connection refused) -- is Tor/your proxy running?", .{safe_socks}),
+                .timeout => log.warn("SOCKS proxy {s} timed out -- check the address/port and that the proxy is up", .{safe_socks}),
+                .rejected => log.warn("SOCKS proxy {s} rejected the SOCKS5 handshake -- check it's a SOCKS5 proxy (auth may be required)", .{safe_socks}),
+            }
+        } else |_| {
+            log.warn("invalid --socks URL '{s}' for the {s} route", .{ safe_socks, route_str });
+        }
+    }
+
     daemon.serve(port) catch |err| {
         log.err("daemon error: {}", .{err});
         std.process.exit(1);

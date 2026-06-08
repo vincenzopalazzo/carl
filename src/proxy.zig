@@ -40,6 +40,33 @@ pub const ProxyError = error{
 
 pub const Scheme = enum { socks5, socks5h, http };
 
+/// Health classification of a SOCKS proxy, for the daemon's proxy-health probe.
+/// Distinguishes the failure modes a misconfigured Tor setup actually hits so
+/// the UI/log can say *why* the route isn't working instead of a generic fail.
+pub const ProxyState = enum {
+    /// Reachable and speaks SOCKS5 (accepted the no-auth method).
+    ok,
+    /// Nothing is listening on the SOCKS port (connection refused) — e.g. Tor
+    /// isn't running.
+    not_running,
+    /// The connect or the SOCKS5 greeting timed out.
+    timeout,
+    /// Reachable but rejected us: not SOCKS5, or no acceptable auth method
+    /// (`reply` carries the offending byte, e.g. 0xFF = auth required).
+    rejected,
+
+    pub fn jsonName(self: ProxyState) []const u8 {
+        return @tagName(self);
+    }
+};
+
+/// Result of `classifySocks5`. `reply` is the SOCKS5 method-selection / version
+/// byte when `state == .rejected` and the server spoke at all; null otherwise.
+pub const ProxyProbe = struct {
+    state: ProxyState,
+    reply: ?u8 = null,
+};
+
 /// A parsed proxy specification. String fields borrow from the URL passed to
 /// `parseUrl` -- that buffer (typically argv) must outlive the Proxy.
 pub const Proxy = struct {
@@ -110,6 +137,31 @@ pub fn parseUrl(url: []const u8) ProxyError!Proxy {
         .username = username,
         .password = password,
     };
+}
+
+/// Mask any `user:pass@` userinfo in a proxy URL so it is safe to log or show
+/// in the API/UI — SOCKS5 auth credentials must never leak. Returns a slice that
+/// is guaranteed credential-free on every path:
+///   - no `://` or no userinfo → the input unchanged (already credential-free);
+///   - userinfo + room in `out` → the masked `scheme://***@host:port`;
+///   - userinfo but `out` too small → the bare `host:port` (still no creds).
+/// `out` should be `url.len + 4` bytes to fit the `***@` mask.
+pub fn redactUrl(url: []const u8, out: []u8) []const u8 {
+    const sep = std.mem.indexOf(u8, url, "://") orelse return url;
+    const after = sep + 3;
+    // Last '@' matches parseUrl's delimiter choice, so a '@' inside the password
+    // doesn't truncate early. (A stray '@' in a credential-free path would only
+    // cause harmless over-redaction, never a leak.)
+    const rest = url[after..];
+    const at_rel = std.mem.lastIndexOfScalar(u8, rest, '@') orelse return url;
+    const prefix = url[0..after]; // "scheme://"
+    const suffix = rest[at_rel + 1 ..]; // "host:port[/...]"
+    const mask = "***@";
+    if (out.len < prefix.len + mask.len + suffix.len) return suffix; // credential-free fallback
+    @memcpy(out[0..prefix.len], prefix);
+    @memcpy(out[prefix.len..][0..mask.len], mask);
+    @memcpy(out[prefix.len + mask.len ..][0..suffix.len], suffix);
+    return out[0 .. prefix.len + mask.len + suffix.len];
 }
 
 // --- Public connect entry points ---
@@ -326,6 +378,69 @@ fn resolveIp4(allocator: Allocator, host: []const u8, port: u16) ProxyError!std.
         if (a.any.family == std.posix.AF.INET) return a;
     }
     return error.DnsResolveFailed;
+}
+
+/// Health-check a SOCKS5 proxy using only the method-negotiation greeting — we
+/// never send a CONNECT, so the proxy is not asked to open any upstream
+/// connection and this probe leaks no traffic from the privacy tool. The connect
+/// and greeting phases are bounded by `timeout_secs`; the initial DNS resolve is
+/// not (typical SOCKS hosts are IP literals like 127.0.0.1, so no DNS happens).
+/// Pure classification: never returns an error, it maps every failure into a
+/// `ProxyState`. (Full CONNECT reply codes only arise on real peer dials —
+/// surfacing those per-transfer is a documented follow-up.)
+pub fn classifySocks5(allocator: Allocator, proxy: Proxy, timeout_secs: u32) ProxyProbe {
+    const addr = resolveIp4(allocator, proxy.host, proxy.port) catch
+        return .{ .state = .not_running }; // can't resolve → treat as unreachable
+    // poll() takes an i32 millisecond timeout; clamp so a pathological
+    // `timeout_secs` can't overflow the cast (callers pass small values).
+    const timeout_ms: i32 = if (timeout_secs > 600) 600_000 else @intCast(timeout_secs * 1000);
+
+    const sock = std.posix.socket(
+        std.posix.AF.INET,
+        std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
+        std.posix.IPPROTO.TCP,
+    ) catch return .{ .state = .timeout };
+    defer std.posix.close(sock);
+
+    // Non-blocking connect + poll so a filtered/dead host yields a real timeout
+    // (SO_SNDTIMEO does not bound connect() on macOS), and so we can tell
+    // "connection refused" (proxy not running) from "timed out".
+    const flags = std.posix.fcntl(sock, std.posix.F.GETFL, 0) catch return .{ .state = .timeout };
+    var o: std.posix.O = @bitCast(@as(u32, @truncate(flags)));
+    o.NONBLOCK = true;
+    _ = std.posix.fcntl(sock, std.posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
+
+    std.posix.connect(sock, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
+        error.WouldBlock => {
+            var pfd = [_]std.posix.pollfd{.{ .fd = sock, .events = std.posix.POLL.OUT, .revents = 0 }};
+            const ready = std.posix.poll(&pfd, timeout_ms) catch
+                return .{ .state = .timeout };
+            if (ready == 0) return .{ .state = .timeout };
+            // Surface the async connect result: refused => not running, else timeout.
+            std.posix.getsockoptError(sock) catch |e| return .{
+                .state = if (e == error.ConnectionRefused) .not_running else .timeout,
+            };
+        },
+        error.ConnectionRefused => return .{ .state = .not_running },
+        else => return .{ .state = .timeout },
+    };
+
+    // Connected. Back to blocking with bounded reads/writes for the greeting.
+    o.NONBLOCK = false;
+    _ = std.posix.fcntl(sock, std.posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
+    const tv = std.posix.timeval{ .sec = @intCast(timeout_secs), .usec = 0 };
+    std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
+    std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+
+    const stream = std.net.Stream{ .handle = sock };
+    // SOCKS5 greeting: VER=5, NMETHODS=1, METHOD=0x00 (no auth).
+    writeAll(stream, &[_]u8{ 0x05, 0x01, 0x00 }) catch return .{ .state = .timeout };
+    var reply: [2]u8 = undefined;
+    readN(stream, &reply) catch return .{ .state = .timeout };
+
+    if (reply[0] != 0x05) return .{ .state = .rejected, .reply = reply[0] }; // not SOCKS5
+    if (reply[1] == 0x00) return .{ .state = .ok }; // no-auth accepted
+    return .{ .state = .rejected, .reply = reply[1] }; // 0xFF = auth required / no method
 }
 
 // --- Blocking stream I/O helpers ---
@@ -781,4 +896,136 @@ test "responseComplete stops on full Content-Length body" {
     try std.testing.expect(!responseComplete("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n")); // no header terminator
     // chunked is read to EOF, not treated as complete by this check
     try std.testing.expect(!responseComplete("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"));
+}
+
+// --- classifySocks5 against a mock SOCKS5 endpoint ---
+
+const MockSocks = struct {
+    server: *std.net.Server,
+    stop: std.atomic.Value(bool),
+    reply: [2]u8,
+};
+
+fn mockSocksRun(ctx: *MockSocks) void {
+    // Poll-with-timeout accept so the thread can observe `stop` and exit (a bare
+    // accept() would park forever); mirrors the i2p_sam mock-bridge test.
+    var pfd = [_]std.posix.pollfd{.{ .fd = ctx.server.stream.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    while (!ctx.stop.load(.acquire)) {
+        const ready = std.posix.poll(&pfd, 200) catch 0;
+        if (ready == 0) continue;
+        const conn = ctx.server.accept() catch continue;
+        defer conn.stream.close();
+        var greeting: [3]u8 = undefined; // VER, NMETHODS, METHOD
+        var got: usize = 0;
+        while (got < greeting.len) {
+            const n = conn.stream.read(greeting[got..]) catch break;
+            if (n == 0) break;
+            got += n;
+        }
+        var sent: usize = 0;
+        while (sent < ctx.reply.len) {
+            const n = conn.stream.write(ctx.reply[sent..]) catch break;
+            if (n == 0) break;
+            sent += n;
+        }
+    }
+}
+
+fn startMockSocks(server: *std.net.Server, reply: [2]u8) !struct { ctx: *MockSocks, thread: std.Thread } {
+    const ctx = try std.testing.allocator.create(MockSocks);
+    ctx.* = .{ .server = server, .stop = std.atomic.Value(bool).init(false), .reply = reply };
+    const thread = try std.Thread.spawn(.{}, mockSocksRun, .{ctx});
+    return .{ .ctx = ctx, .thread = thread };
+}
+
+test "classifySocks5: connection refused => not_running" {
+    const a = std.testing.allocator;
+    // Bind to grab a free port, then close it so connects are refused.
+    var server = try std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0).listen(.{ .reuse_address = true });
+    const port = server.listen_address.getPort();
+    server.deinit();
+
+    const probe = classifySocks5(a, .{ .scheme = .socks5, .host = "127.0.0.1", .port = port }, 2);
+    try std.testing.expectEqual(ProxyState.not_running, probe.state);
+}
+
+test "classifySocks5: no-auth accepted => ok" {
+    const a = std.testing.allocator;
+    var server = try std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0).listen(.{ .reuse_address = true });
+    const port = server.listen_address.getPort();
+    const mock = try startMockSocks(&server, .{ 0x05, 0x00 });
+    defer {
+        mock.ctx.stop.store(true, .release);
+        mock.thread.join();
+        server.deinit();
+        a.destroy(mock.ctx);
+    }
+
+    const probe = classifySocks5(a, .{ .scheme = .socks5, .host = "127.0.0.1", .port = port }, 2);
+    try std.testing.expectEqual(ProxyState.ok, probe.state);
+}
+
+test "classifySocks5: no acceptable method => rejected with reply byte" {
+    const a = std.testing.allocator;
+    var server = try std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0).listen(.{ .reuse_address = true });
+    const port = server.listen_address.getPort();
+    const mock = try startMockSocks(&server, .{ 0x05, 0xFF });
+    defer {
+        mock.ctx.stop.store(true, .release);
+        mock.thread.join();
+        server.deinit();
+        a.destroy(mock.ctx);
+    }
+
+    const probe = classifySocks5(a, .{ .scheme = .socks5, .host = "127.0.0.1", .port = port }, 2);
+    try std.testing.expectEqual(ProxyState.rejected, probe.state);
+    try std.testing.expectEqual(@as(?u8, 0xFF), probe.reply);
+}
+
+test "classifySocks5: non-SOCKS5 version => rejected" {
+    const a = std.testing.allocator;
+    var server = try std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0).listen(.{ .reuse_address = true });
+    const port = server.listen_address.getPort();
+    const mock = try startMockSocks(&server, .{ 0x04, 0x00 }); // SOCKS4-ish version byte
+    defer {
+        mock.ctx.stop.store(true, .release);
+        mock.thread.join();
+        server.deinit();
+        a.destroy(mock.ctx);
+    }
+
+    const probe = classifySocks5(a, .{ .scheme = .socks5, .host = "127.0.0.1", .port = port }, 2);
+    try std.testing.expectEqual(ProxyState.rejected, probe.state);
+    try std.testing.expectEqual(@as(?u8, 0x04), probe.reply);
+}
+
+test "redactUrl masks SOCKS credentials" {
+    var buf: [128]u8 = undefined;
+    // With userinfo: password is masked.
+    try std.testing.expectEqualStrings(
+        "socks5h://***@127.0.0.1:9050",
+        redactUrl("socks5h://user:pass@127.0.0.1:9050", &buf),
+    );
+    // user-only (no password) is still masked.
+    try std.testing.expectEqualStrings(
+        "socks5://***@host:1080",
+        redactUrl("socks5://bob@host:1080", &buf),
+    );
+    // No userinfo: returned unchanged (no copy needed).
+    try std.testing.expectEqualStrings(
+        "socks5h://127.0.0.1:9050",
+        redactUrl("socks5h://127.0.0.1:9050", &buf),
+    );
+    // '@' inside the password doesn't truncate early (last '@' is the delimiter).
+    try std.testing.expectEqualStrings(
+        "socks5://***@host:1080",
+        redactUrl("socks5://u:p@ss@host:1080", &buf),
+    );
+    // Buffer too small for the masked form falls back to the bare host:port —
+    // still credential-free (never the raw user:pass).
+    var tiny: [4]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "host:1080",
+        redactUrl("socks5://user:pass@host:1080", &tiny),
+    );
 }

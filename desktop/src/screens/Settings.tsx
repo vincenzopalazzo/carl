@@ -3,7 +3,7 @@ import { Icon, OnionIcon } from "../components/icons";
 import { CopyField } from "../components/atoms";
 import { trunc } from "../components/format";
 import { useCarl } from "../api/store";
-import type { Route } from "../api/types";
+import type { Route, ProxyHealth } from "../api/types";
 import {
   cliStatus,
   installCli,
@@ -146,20 +146,48 @@ function CliToolsSection() {
   );
 }
 
-function LeakCheck({ route, socks }: { route: Route; socks: string }) {
-  const safe = route !== "direct";
+// Live proxy/Tor health driven by the daemon's background probe (state.proxy),
+// so the panel says whether the SOCKS proxy is actually reachable instead of
+// assuming "any non-direct route is safe".
+function LeakCheck({ route, proxy }: { route: Route; proxy: ProxyHealth }) {
+  if (route === "direct") {
+    return (
+      <div className="leak-check lc-warn">
+        <span className="lc-dot" />
+        <div className="lc-body">
+          <div className="lc-title">Direct connection — IP exposed</div>
+          <div className="lc-detail mono">
+            your IP is visible to trackers, DHT &amp; peers
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const ep = proxy.endpoint || "the proxy";
+  const TITLE: Record<ProxyHealth["state"], string> = {
+    ok: "Proxy reachable — leak check passed",
+    checking: "Checking proxy…",
+    not_running: "Proxy not running",
+    timeout: "Proxy connection timed out",
+    rejected: "Proxy rejected the connection",
+    disabled: "",
+  };
+  const DETAIL: Record<ProxyHealth["state"], string> = {
+    ok: `routed via ${ep} · DNS over the proxy`,
+    checking: `probing ${ep}…`,
+    not_running: `${ep} refused the connection — is Tor / your proxy running?`,
+    timeout: `${ep} timed out — check the address and port`,
+    rejected: `${ep} rejected SOCKS5${proxy.detail ? ` · ${proxy.detail}` : ""} — check it's a SOCKS5 proxy (auth may be required)`,
+    disabled: "",
+  };
+  const safe = proxy.state === "ok";
   return (
     <div className={"leak-check " + (safe ? "lc-safe" : "lc-warn")}>
       <span className="lc-dot" />
       <div className="lc-body">
-        <div className="lc-title">
-          {safe ? "Leak check passed" : "Direct connection — IP exposed"}
-        </div>
-        <div className="lc-detail mono">
-          {route === "tor" && `routed via ${socks} · DNS over the proxy`}
-          {route === "proxy" && `all traffic via ${socks} · DNS proxied`}
-          {route === "direct" && "your IP is visible to trackers, DHT & peers"}
-        </div>
+        <div className="lc-title">{TITLE[proxy.state]}</div>
+        <div className="lc-detail mono">{DETAIL[proxy.state]}</div>
       </div>
     </div>
   );
@@ -274,7 +302,7 @@ export function SettingsScreen() {
               </div>
             )}
 
-            <LeakCheck route={s.route} socks={s.socks} />
+            <LeakCheck route={s.route} proxy={state.proxy} />
 
             <div className="callout-note">
               <Icon name="shield" size={15} stroke={1.8} />
