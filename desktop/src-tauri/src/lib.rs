@@ -207,19 +207,41 @@ fn uninstall_cli(system: bool) -> Result<(), String> {
     }
 }
 
+/// The default download folder for the desktop app — its own directory under
+/// the user's Downloads (like Telegram's "Telegram Desktop" folder), so
+/// downloads never land in the daemon's CWD (which is `/` for a Finder launch).
+/// The user can still change it in Settings.
+fn default_download_dir() -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(
+        std::path::Path::new(&home)
+            .join("Downloads")
+            .join("carl-download"),
+    )
+}
+
 /// Spawn `carl daemon` and block (with a timeout) until it reports its token.
 fn spawn_daemon(port: u16) -> Result<(Child, DaemonConfig), String> {
     let bin = resolve_carl_bin();
+    let port_s = port.to_string();
+    let pid_s = std::process::id().to_string();
+
+    // Give the daemon a real download dir up front. The daemon defaults to `.`,
+    // which for a Finder-launched app is `/` (unwritable) — so without this,
+    // downloads fail to write. Created best-effort; the user can change it later.
+    let download_dir = default_download_dir();
+    if let Some(d) = &download_dir {
+        let _ = std::fs::create_dir_all(d);
+    }
+
     // Pass our PID so the daemon's watchdog shuts it down if this shell dies
     // without a clean exit (crash / force-quit), instead of orphaning it.
-    let mut child = Command::new(&bin)
-        .args([
-            "daemon",
-            "--port",
-            &port.to_string(),
-            "--parent-pid",
-            &std::process::id().to_string(),
-        ])
+    let mut cmd = Command::new(&bin);
+    cmd.args(["daemon", "--port", &port_s, "--parent-pid", &pid_s]);
+    if let Some(d) = &download_dir {
+        cmd.args(["--download-dir", &d.to_string_lossy()]);
+    }
+    let mut child = cmd
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|e| format!("failed to spawn '{bin}': {e}"))?;
