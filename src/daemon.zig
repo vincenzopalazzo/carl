@@ -503,6 +503,9 @@ const Conn = struct {
 
         const id = self.daemon.manager.addSeed(full, route_val, want_nostr) catch |err| {
             log.warn("addSeed failed: {}", .{err});
+            if (err == error.TorControlFailed) {
+                return self.sendError(.bad_request, "Tor hidden service setup failed: carl couldn't reach Tor's ControlPort. Enable it in your torrc (ControlPort 9051 + CookieAuthentication 1) and restart Tor, then retry the Tor seed.");
+            }
             return self.sendStatus(.bad_request);
         };
         defer a.free(id);
@@ -815,6 +818,18 @@ const Conn = struct {
     fn sendStatus(self: *Conn, status: http.Status) !void {
         // A tiny JSON body keeps clients that always parse JSON happy.
         try self.sendJson(status, "{}");
+    }
+
+    /// Like `sendStatus` but with an `{ "error": "<message>" }` body so the GUI
+    /// can show a specific, actionable reason instead of a bare status code.
+    fn sendError(self: *Conn, status: http.Status, message: []const u8) !void {
+        var arena = std.heap.ArenaAllocator.init(self.daemon.allocator);
+        defer arena.deinit();
+        var j = api.Json.init(arena.allocator());
+        j.beginObject() catch return self.sendStatus(status);
+        j.keyString("error", message) catch return self.sendStatus(status);
+        j.endObject() catch return self.sendStatus(status);
+        try self.sendJson(status, j.buf.items);
     }
 
     fn sendAll(self: *Conn, buf: []const u8) !void {

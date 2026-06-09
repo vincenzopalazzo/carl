@@ -25,8 +25,9 @@ const magnet_mod = @import("magnet.zig");
 const proxy_mod = @import("proxy.zig");
 const extension = @import("extension.zig");
 const relay_mod = @import("relay.zig");
-const nip35 = @import("nip35.zig");
 const peer_announce = @import("peer_announce.zig");
+const seeding = @import("seeding.zig");
+const tor_control = @import("tor_control.zig");
 const state_mod = @import("state.zig");
 const nostr_config = @import("nostr_config.zig");
 const nostr_mod = @import("nostr.zig");
@@ -41,6 +42,10 @@ pub const Error = error{
     HttpFailed,
     BadProxy,
     SessionInitFailed,
+    /// Failed to stand up the Tor hidden service for a `.tor` seed (Tor
+    /// ControlPort unreachable, cookie auth failed, etc.). Fails closed rather
+    /// than creating a seed nobody can reach.
+    TorControlFailed,
     NotFound,
 } || Allocator.Error;
 
@@ -54,6 +59,13 @@ pub const Config = struct {
     max_active: u32 = 8,
     peer_limit: u32 = 60,
     publish_nip35: bool = true,
+    /// Tor ControlPort `host:port` for creating hidden services when seeding on
+    /// the `tor` route (so a UI-created Tor seed is reachable). Default 9051.
+    tor_control: []const u8 = "",
+    /// Path to the Tor control cookie; empty = default (`~/.tor/control_auth_cookie`).
+    tor_cookie: []const u8 = "",
+    /// Virtual port exposed on the seed's `.onion`.
+    tor_onion_port: u16 = 80,
 };
 
 /// One running transfer: its session, the thread driving it, and the metadata
@@ -80,6 +92,9 @@ const ManagedTransfer = struct {
     /// Owned copy of the socks URL the proxy slices borrow from.
     socks_owned: ?[]u8,
     proxy: ?proxy_mod.Proxy,
+    /// Tor hidden service backing a `.tor` seed (the onion leechers dial).
+    /// Owned; torn down (DEL_ONION) in `destroy` after the session stops.
+    hidden: ?tor_control.HiddenService,
     session: *session_mod.Session,
     meta: metainfo.Metainfo,
     thread: ?std.Thread,
@@ -106,6 +121,9 @@ const ManagedTransfer = struct {
         self.stop();
         self.session.deinit();
         self.allocator.destroy(self.session);
+        // Tear down the onion after the session (and its loopback listener) is
+        // gone, so we DEL_ONION only once nothing is forwarding to it.
+        if (self.hidden) |*h| h.deinit();
         self.meta.deinit(self.allocator);
         if (self.socks_owned) |s| self.allocator.free(s);
         self.allocator.free(self.id);
@@ -137,6 +155,9 @@ pub const Manager = struct {
                 .max_active = cfg.max_active,
                 .peer_limit = cfg.peer_limit,
                 .publish_nip35 = cfg.publish_nip35,
+                .tor_control = try allocator.dupe(u8, if (cfg.tor_control.len > 0) cfg.tor_control else "127.0.0.1:9051"),
+                .tor_cookie = try allocator.dupe(u8, cfg.tor_cookie),
+                .tor_onion_port = if (cfg.tor_onion_port > 0) cfg.tor_onion_port else 80,
             },
         };
     }
@@ -147,6 +168,8 @@ pub const Manager = struct {
         self.transfers.deinit(self.allocator);
         self.allocator.free(self.cfg.socks);
         self.allocator.free(self.cfg.download_dir);
+        self.allocator.free(self.cfg.tor_control);
+        self.allocator.free(self.cfg.tor_cookie);
     }
 
     // -----------------------------------------------------------------------
@@ -177,10 +200,24 @@ pub const Manager = struct {
             return err;
         };
         const magnet = if (std.mem.startsWith(u8, source, "magnet:")) source else "";
-        return self.register(built, route, resolved_proxy, socks_owned, want_nostr, false, magnet, source);
+        return self.register(built, route, resolved_proxy, socks_owned, null, want_nostr, false, magnet, source);
     }
 
     /// Create a torrent from a local file (or archive) and start seeding it. The
+    /// Bind a throwaway loopback socket to discover a free port. Each `.tor`
+    /// seed needs its own listener port: every seed otherwise reuses
+    /// `cfg.listen_port`, but only one Session can bind a given port, so a second
+    /// concurrent tor seed would silently fail to listen and be unreachable
+    /// behind its onion. There's a tiny TOCTOU window before the Session
+    /// re-binds; on the rare loss the Session's listener is null and `addSeed`
+    /// warns. Returns null if even the probe bind fails (caller falls back).
+    fn pickLoopbackPort(self: *Manager) ?u16 {
+        _ = self;
+        var server = (std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0).listen(.{ .reuse_address = true })) catch return null;
+        defer server.deinit();
+        return server.listen_address.getPort();
+    }
+
     /// file is hashed in-process — carl needs no external torrent tool. With
     /// `want_nostr`, a NIP-35 torrent event is published so it's discoverable.
     pub fn addSeed(self: *Manager, path: []const u8, route: api.Route, want_nostr: bool) Error![]u8 {
@@ -204,23 +241,63 @@ pub const Manager = struct {
         };
         // Seed from the file's own directory so storage resolves it by name.
         const data_dir = std.fs.path.dirname(path) orelse ".";
+
+        // Tor route: stand up a v3 hidden service so leechers can actually reach
+        // this seed, and run the session as a loopback hidden-service seed (no
+        // outbound proxy, tracker/DHT suppressed) — the same wiring as the CLI's
+        // `carl seed --tor-seed`. The resolved SOCKS proxy stays as the
+        // transfer's `proxy` so `publishSeedNostr` publishes the onion announce
+        // over Tor; the session itself takes no proxy (inbound-only via the onion).
+        // Fails closed (`TorControlFailed`) rather than creating an unreachable seed.
+        var hidden: ?tor_control.HiddenService = null;
+        var session_proxy = resolved_proxy;
+        var listen_bind: session_mod.ListenBind = .any;
+        var tor_hidden = false;
+        var seed_port = self.cfg.listen_port;
+        if (route == .tor) {
+            // Give each tor seed its own loopback port so concurrent tor seeds
+            // don't collide on cfg.listen_port. The onion forwards to this port.
+            seed_port = self.pickLoopbackPort() orelse self.cfg.listen_port;
+            hidden = tor_control.addOnion(self.allocator, .{
+                .control_addr = self.cfg.tor_control,
+                .cookie_path = if (self.cfg.tor_cookie.len > 0) self.cfg.tor_cookie else null,
+                .local_port = seed_port,
+                .onion_port = self.cfg.tor_onion_port,
+            }) catch {
+                if (socks_owned) |s| self.allocator.free(s);
+                mi.deinit(self.allocator);
+                return error.TorControlFailed;
+            };
+            session_proxy = null;
+            listen_bind = .loopback;
+            tor_hidden = true;
+        }
+
         const session = self.allocator.create(session_mod.Session) catch {
             if (socks_owned) |s| self.allocator.free(s);
+            if (hidden) |*h| h.deinit();
             mi.deinit(self.allocator);
             return error.OutOfMemory;
         };
-        session.* = session_mod.Session.init(self.allocator, mi, data_dir, .seed, self.cfg.listen_port, resolved_proxy, .any, false) catch {
+        session.* = session_mod.Session.init(self.allocator, mi, data_dir, .seed, seed_port, session_proxy, listen_bind, tor_hidden) catch {
             if (socks_owned) |s| self.allocator.free(s);
+            if (hidden) |*h| h.deinit();
             self.allocator.destroy(session);
             mi.deinit(self.allocator);
             return error.SessionInitFailed;
         };
+        // A tor seed whose listener didn't bind is unreachable behind its onion
+        // (e.g. a port race). Surface it rather than silently half-seeding.
+        if (route == .tor and session.listener == null) {
+            log.warn("tor seed: listener failed to bind 127.0.0.1:{d}; the onion will be unreachable", .{seed_port});
+        }
         const built = Built{ .session = session, .meta = mi, .info_hash = session.info_hash, .name = mi.name };
 
         var hex: [40]u8 = undefined;
         secp.toHex(&session.info_hash, &hex);
         const magnet = std.fmt.allocPrint(self.allocator, "magnet:?xt=urn:btih:{s}&dn={s}", .{ hex, mi.name }) catch {
             if (socks_owned) |s| self.allocator.free(s);
+            if (hidden) |*h| h.deinit();
             session.deinit();
             self.allocator.destroy(session);
             mi.deinit(self.allocator);
@@ -228,7 +305,7 @@ pub const Manager = struct {
         };
         defer self.allocator.free(magnet);
 
-        return self.register(built, route, resolved_proxy, socks_owned, want_nostr, true, magnet, path);
+        return self.register(built, route, resolved_proxy, socks_owned, hidden, want_nostr, true, magnet, path);
     }
 
     /// Register a built session as a managed transfer and spawn its thread.
@@ -242,6 +319,7 @@ pub const Manager = struct {
         route: api.Route,
         resolved_proxy: ?proxy_mod.Proxy,
         socks_owned: ?[]u8,
+        hidden: ?tor_control.HiddenService,
         want_nostr: bool,
         is_seed: bool,
         magnet_src: []const u8,
@@ -251,6 +329,10 @@ pub const Manager = struct {
         errdefer if (!mt_owned) {
             built.session.deinit();
             self.allocator.destroy(built.session);
+            if (hidden) |h| {
+                var hh = h;
+                hh.deinit();
+            }
             built.meta.deinit(self.allocator);
             if (socks_owned) |s| self.allocator.free(s);
         };
@@ -287,6 +369,7 @@ pub const Manager = struct {
             .has_http_tracker = std.mem.startsWith(u8, built.meta.announce, "http"),
             .socks_owned = socks_owned,
             .proxy = resolved_proxy,
+            .hidden = hidden,
             .session = built.session,
             .meta = built.meta,
             .thread = null,
@@ -375,7 +458,7 @@ pub const Manager = struct {
                 .id = mt.id,
                 .name = mt.name,
                 .visibility = mt.route,
-                .onion = null,
+                .onion = if (mt.hidden) |h| try arena.dupe(u8, h.onion_host) else null,
                 .size = p.total_length,
                 .up_total = p.uploaded,
                 .up = p.up_rate,
@@ -492,6 +575,7 @@ pub const Manager = struct {
 
         self.restoring = true;
         var restored: usize = 0;
+        var failed: usize = 0;
         for (st.transfers) |t| {
             const res = switch (t.kind) {
                 .download => self.addTransfer(t.source, t.route, t.nostr),
@@ -501,11 +585,21 @@ pub const Manager = struct {
                 self.allocator.free(id);
                 restored += 1;
             } else |e| {
-                log.warn("restore: could not re-add '{s}': {}", .{ t.source, e });
+                failed += 1;
+                log.warn("restore: could not re-add '{s}': {} (keeping it on disk)", .{ t.source, e });
             }
         }
         self.restoring = false;
-        self.persist();
+        // Only re-persist when every saved transfer came back. `persist` rewrites
+        // the DB purely from the live set, so persisting after a failure would
+        // permanently delete the dropped specs — e.g. a `tor` seed whose hidden
+        // service couldn't be created because Tor wasn't up yet at restart. Leave
+        // the on-disk state intact so the next restart retries them.
+        if (failed == 0) {
+            self.persist();
+        } else {
+            log.warn("restore: {d} transfer(s) didn't come back; leaving saved state intact for retry", .{failed});
+        }
         if (restored > 0) log.info("restored {d} transfer(s) from saved state", .{restored});
     }
 
@@ -848,28 +942,19 @@ fn runThread(mt: *ManagedTransfer) void {
     };
 }
 
-/// Publish a NIP-35 (kind-2003) torrent event for a seed so it's discoverable
-/// in Discover. Best-effort. The peer-announce (which needs a routable endpoint
-/// or an onion) is left to the CLI's `carl seed` for now; the torrent metadata
-/// event needs no reachable address and is enough to surface the torrent.
+/// Publish a seed's Nostr events via the shared `seeding.publish` (the same path
+/// the CLI `carl seed` uses). A `.tor` seed has a hidden service, so it also
+/// publishes a kind-30078 onion peer-announce — what a Tor leecher needs to dial
+/// it — over Tor (via `mt.proxy`). Other seeds publish only NIP-35 discovery
+/// metadata (no routable endpoint to announce). Best-effort.
 fn publishSeedNostr(mt: *ManagedTransfer) void {
-    const a = mt.allocator;
-    const sk = nostr_config.readSecretKey(a) catch return; // no key → skip
-    const pk = secp.publicKeyFromSecret(sk) catch return;
-    var ev = nip35.buildFromMetainfo(a, sk, pk, mt.meta, mt.info_hash, "") catch return;
-    defer ev.deinit(a);
-
-    const relay_urls = nostr_config.readRelays(a) catch return;
-    defer nostr_config.freeRelays(a, relay_urls);
-
-    var acks: usize = 0;
-    for (relay_urls) |url| {
-        if (!mt.session.running) return;
-        var r = relay_mod.Relay.connect(a, url, mt.proxy) catch continue;
-        defer r.deinit();
-        if (relay_mod.publishAndWait(a, &r, ev, 5_000)) acks += 1;
-    }
-    if (acks > 0) log.info("seed {s}: published NIP-35 torrent event to {d} relay(s)", .{ mt.id, acks });
+    const ann: seeding.Announce = if (mt.hidden) |h|
+        .{ .onion = .{ .host = h.onion_host, .port = h.onion_port } }
+    else
+        .none;
+    seeding.publish(mt.allocator, mt.meta, mt.info_hash, ann, "", mt.proxy) catch |err| {
+        log.warn("seed {s}: nostr publish failed: {}", .{ mt.id, err });
+    };
 }
 
 /// Pull peer-announce (kind-30078) endpoints for this info-hash off the

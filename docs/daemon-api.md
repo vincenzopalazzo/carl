@@ -14,8 +14,15 @@ identity/relays/settings read the real config. See **Not yet wired** at the end.
 
 ```sh
 carl daemon [--port p] [--bt-port p] [--route direct|proxy|tor] [--socks url] \
-            [--download-dir d] [--token tok] [--parent-pid pid]
+            [--download-dir d] [--token tok] [--parent-pid pid] \
+            [--tor-control host:port] [--tor-cookie path] [--tor-onion-port p]
 ```
+
+- `--tor-control` (default `127.0.0.1:9051`) / `--tor-cookie` (default
+  `~/.tor/control_auth_cookie`) / `--tor-onion-port` (default `80`): Tor
+  ControlPort settings used to create the hidden service for a `tor`-route seed
+  (`POST /api/seeds` with `X-Carl-Route: tor`). Tor must have its ControlPort
+  enabled with cookie auth.
 
 - `--parent-pid`: when set (the desktop shell passes its own PID), a watchdog
   shuts the daemon down if that process dies — so a hard-killed app never leaves
@@ -138,8 +145,16 @@ directly); metadata rides in headers:
 
 The daemon writes the file into the download dir, hashes it into a torrent
 in-process (no external tool), and seeds it. Returns `{ "id": "t<N>" }`. Bodies
-are capped at 256 MiB. (The peer-announce for a clearnet/onion endpoint is still
-the CLI's `carl seed` job; this publishes the discoverable torrent metadata.)
+are capped at 256 MiB.
+
+On the **`tor` route** the daemon stands up a v3 Tor hidden service for the seed
+(via Tor's ControlPort, same as `carl seed --tor-seed`) and publishes a
+kind-30078 **onion peer-announce** alongside the NIP-35 metadata — so a Tor
+downloader can actually discover *and* dial the seeder. The seed's `.onion` is
+returned in the `Seed.onion` field. This requires Tor's ControlPort to be
+reachable; if it isn't, the request fails `400` with
+`{ "error": "Tor hidden service setup failed: …" }`. `direct`/`proxy` seeds
+publish only the discoverable NIP-35 metadata (no routable endpoint to announce).
 
 ### `POST /api/search`
 

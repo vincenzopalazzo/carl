@@ -55,7 +55,17 @@ export class DaemonClient {
 
   private async json<T>(res: Response): Promise<T> {
     if (!res.ok) {
-      throw new Error(`${res.status} ${res.statusText}`);
+      // Surface the daemon's `{ "error": "..." }` body when present, so the UI
+      // shows an actionable reason (e.g. Tor ControlPort not enabled) instead
+      // of a bare status code.
+      let detail = "";
+      try {
+        const body = (await res.json()) as { error?: unknown };
+        if (body && typeof body.error === "string") detail = `: ${body.error}`;
+      } catch {
+        /* non-JSON or empty body — fall back to the status line */
+      }
+      throw new Error(`${res.status} ${res.statusText}${detail}`);
     }
     return (await res.json()) as T;
   }
