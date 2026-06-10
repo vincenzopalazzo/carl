@@ -1237,7 +1237,12 @@ fn collectNostrPeers(mt: *ManagedTransfer) void {
             a.free(events);
         }
         for (events) |ev| {
-            const ann = peer_announce.parse(ev) catch continue;
+            // Other clients' announces may not parse (different schema); that's
+            // not an error, just skip them (debug-only so it can't spam).
+            const ann = peer_announce.parse(ev) catch |e| {
+                log.debug("nostr discovery {s}: skipping unparsable announce: {}", .{ url, e });
+                continue;
+            };
             if (!std.mem.eql(u8, &ann.info_hash, &mt.info_hash)) continue;
             if (added >= 50) break;
             switch (ann.endpoint) {

@@ -153,12 +153,17 @@ pub fn parse(event: nostr.Event) Error!PeerAnnounce {
 
     const port_str = event.firstTagValue("port") orelse return error.BadPort;
     const port = std.fmt.parseUnsigned(u16, port_str, 10) catch return error.BadPort;
-    if (port == 0) return error.BadPort;
+    // Port 0 is rejected for IPv4 and onion (no service listens on port 0), but
+    // it is VALID for I2P, where 0 means the destination's default I2CP port —
+    // which is exactly what carl publishes for an i2p seed (the inbound
+    // STREAM FORWARD serves the whole destination, not a specific port). So the
+    // zero-check is applied per-endpoint below, not up front.
 
     // Prefer a valid `host` (.onion) over `ip` when both are present so a signed
     // event cannot smuggle a clearnet endpoint alongside an onion hostname.
     if (event.firstTagValue("host")) |host| {
         if (isValidV3OnionHost(host)) {
+            if (port == 0) return error.BadPort;
             return .{
                 .info_hash = info_hash,
                 .endpoint = .{ .onion = .{ .host = host, .port = port } },
@@ -179,6 +184,7 @@ pub fn parse(event: nostr.Event) Error!PeerAnnounce {
 
     const ip_str = event.firstTagValue("ip") orelse return error.BadIp;
     const ip = parseIpv4(ip_str) orelse return error.BadIp;
+    if (port == 0) return error.BadPort;
     if (!isRoutable(ip)) return error.UnsafeIp;
     return .{
         .info_hash = info_hash,
@@ -375,6 +381,53 @@ test "build + parse i2p round trip" {
     try std.testing.expect(ann.endpoint == .i2p);
     try std.testing.expectEqualStrings(dest, ann.endpoint.i2p.host);
     try std.testing.expectEqual(@as(u16, 6881), ann.endpoint.i2p.port);
+}
+
+test "i2p announce with port 0 (default I2CP port) parses" {
+    // carl publishes i2p seeds with port 0 (the destination's default port; the
+    // inbound STREAM FORWARD serves the whole destination). Port 0 must NOT be
+    // rejected for i2p, or i2p seeds become undiscoverable. Regression for a
+    // bug where the up-front `port == 0 -> BadPort` check dropped every i2p
+    // announce carl itself published.
+    const allocator = std.testing.allocator;
+    var label: [52]u8 = undefined;
+    @memset(&label, 'a');
+    var host_buf: [b32_i2p_host_len]u8 = undefined;
+    const dest = std.fmt.bufPrint(&host_buf, "{s}.b32.i2p", .{&label}) catch unreachable;
+
+    var sk: secp.SecretKey = undefined;
+    try secp.fromHex("0000000000000000000000000000000000000000000000000000000000000003", &sk);
+    const pk = try secp.publicKeyFromSecret(sk);
+
+    const info_hash: [20]u8 = .{0xCD} ** 20;
+    var ev = try buildI2p(allocator, sk, pk, info_hash, dest, 0);
+    defer ev.deinit(allocator);
+
+    const ann = try parse(ev);
+    try std.testing.expect(ann.endpoint == .i2p);
+    try std.testing.expectEqual(@as(u16, 0), ann.endpoint.i2p.port);
+}
+
+test "port 0 still rejected for onion and ipv4" {
+    const allocator = std.testing.allocator;
+    var sk: secp.SecretKey = undefined;
+    try secp.fromHex("0000000000000000000000000000000000000000000000000000000000000003", &sk);
+    const pk = try secp.publicKeyFromSecret(sk);
+    const info_hash: [20]u8 = .{0xAB} ** 20;
+
+    // onion with port 0 -> BadPort
+    var olabel: [56]u8 = undefined;
+    @memset(&olabel, 'a');
+    var ohost: [v3_onion_host_len]u8 = undefined;
+    const onion = std.fmt.bufPrint(&ohost, "{s}.onion", .{&olabel}) catch unreachable;
+    var oev = try buildOnion(allocator, sk, pk, info_hash, onion, 0);
+    defer oev.deinit(allocator);
+    try std.testing.expectError(error.BadPort, parse(oev));
+
+    // ipv4 with port 0 -> BadPort
+    var iev = try build(allocator, sk, pk, info_hash, .{ 8, 8, 8, 8 }, 0);
+    defer iev.deinit(allocator);
+    try std.testing.expectError(error.BadPort, parse(iev));
 }
 
 test "isValidI2pB32Host" {
