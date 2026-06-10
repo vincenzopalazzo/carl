@@ -395,7 +395,7 @@ fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []c
         defer mi.deinit(allocator);
 
         std.fs.cwd().makePath(output_dir) catch {};
-        var session = carl.session.Session.init(allocator, mi, output_dir, .download, port, proxy, .any, false, null) catch |err| {
+        var session = carl.session.Session.init(allocator, mi, output_dir, .download, port, proxy, .any, false, null, false) catch |err| {
             log.err("failed to initialize session: {}", .{err});
             std.process.exit(1);
         };
@@ -436,7 +436,7 @@ fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []c
 
 fn startDownload(allocator: std.mem.Allocator, mi: carl.metainfo.Metainfo, output_dir: []const u8, port: u16, proxy: ?carl.proxy.Proxy, want_nostr: bool, want_seed: bool) void {
     std.fs.cwd().makePath(output_dir) catch {};
-    var session = carl.session.Session.init(allocator, mi, output_dir, .download, port, proxy, .any, false, null) catch |err| {
+    var session = carl.session.Session.init(allocator, mi, output_dir, .download, port, proxy, .any, false, null, false) catch |err| {
         log.err("failed to initialize session: {}", .{err});
         std.process.exit(1);
     };
@@ -572,7 +572,7 @@ fn cmdSeed(
     }
 
     const listen_bind: carl.session.ListenBind = if (tor_seed) .loopback else .any;
-    var session = carl.session.Session.init(allocator, mi, data_dir, .seed, port, null, listen_bind, tor_seed, null) catch |err| {
+    var session = carl.session.Session.init(allocator, mi, data_dir, .seed, port, null, listen_bind, tor_seed, null, false) catch |err| {
         log.err("failed to initialize session: {}", .{err});
         std.process.exit(1);
     };

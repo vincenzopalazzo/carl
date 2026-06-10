@@ -13,25 +13,42 @@ const VIS_LABEL: Record<Route, string> = {
   i2p: "I2P destination",
 };
 
-function OnionCallout({ onion, relays }: { onion: string; relays: number }) {
+// Surfaces the reachable hidden address of an anonymized seed — a `.onion` for
+// a Tor hidden service, a `.b32.i2p` destination for an I2P seed. Both expose
+// no clearnet IP and are published over Nostr for discovery.
+function HiddenAddrCallout({
+  kind,
+  addr,
+  relays,
+}: {
+  kind: "tor" | "i2p";
+  addr: string;
+  relays: number;
+}) {
+  const isI2p = kind === "i2p";
   return (
     <div className="onion-callout">
       <div className="oc-head">
         <span className="oc-icon">
-          <OnionIcon size={18} />
+          {isI2p ? <Icon name="shield" size={18} /> : <OnionIcon size={18} />}
         </span>
         <div>
-          <div className="oc-title">Seeding as a Tor hidden service</div>
+          <div className="oc-title">
+            {isI2p
+              ? "Seeding as an I2P destination"
+              : "Seeding as a Tor hidden service"}
+          </div>
           <div className="oc-sub">
-            Peers reach you over this .onion address. Share it via Discover or
-            directly.
+            {isI2p
+              ? "Peers reach you over this .b32.i2p destination (native SAM v3). Share it via Discover or directly."
+              : "Peers reach you over this .onion address. Share it via Discover or directly."}
           </div>
         </div>
         <span className="oc-live">
           <span className="oc-live-dot" /> online
         </span>
       </div>
-      <CopyField value={onion} full />
+      <CopyField value={addr} full />
       <div className="oc-foot">
         <span className="oc-published">
           <span className="oc-pub-dot" /> published to{" "}
@@ -178,7 +195,7 @@ function SeedFlow({ onClose }: { onClose: () => void }) {
 
               <div className="field-label">Visibility</div>
               <div className="vis-options">
-                {(["direct", "proxy", "tor"] as const).map((id) => (
+                {(["direct", "proxy", "tor", "i2p"] as const).map((id) => (
                   <button
                     key={id}
                     className={"vis-opt" + (vis === id ? " active" : "")}
@@ -245,7 +262,11 @@ export function SeedingScreen() {
   const [flow, setFlow] = useState(false);
   const [createFlow, setCreateFlow] = useState(false);
   const upTotal = seeds.reduce((a, s) => a + s.up, 0);
-  const torSeed = seeds.find((s) => s.visibility === "tor" && s.onion);
+  // The first anonymized seed with a published address gets the hero callout
+  // (tor `.onion` or i2p `.b32.i2p`); both carry their address in `onion`.
+  const hiddenSeed = seeds.find(
+    (s) => (s.visibility === "tor" || s.visibility === "i2p") && s.onion,
+  );
 
   return (
     <div className="screen">
@@ -270,8 +291,12 @@ export function SeedingScreen() {
       </div>
 
       <div className="content">
-        {torSeed && torSeed.onion && (
-          <OnionCallout onion={torSeed.onion} relays={torSeed.relays} />
+        {hiddenSeed && hiddenSeed.onion && (
+          <HiddenAddrCallout
+            kind={hiddenSeed.visibility === "i2p" ? "i2p" : "tor"}
+            addr={hiddenSeed.onion}
+            relays={hiddenSeed.relays}
+          />
         )}
         {seeds.length === 0 ? (
           <div className="empty">

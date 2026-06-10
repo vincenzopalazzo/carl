@@ -481,7 +481,7 @@ const Conn = struct {
 
     /// POST /api/seeds — body is the raw file content (so a browser drag-drop or
     /// the Tauri shell can upload directly). Headers: X-Carl-Filename (required),
-    /// X-Carl-Route (direct|proxy|tor, default tor), X-Carl-Nostr (true|false).
+    /// X-Carl-Route (direct|proxy|tor|i2p, default tor), X-Carl-Nostr (true|false).
     /// Writes the file into the download dir, creates a torrent in-process, and
     /// starts seeding it; returns { id }.
     fn createSeed(self: *Conn, req: *const http.Request, body: []const u8) !void {

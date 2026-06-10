@@ -30,6 +30,9 @@ pub const Announce = union(enum) {
     none,
     /// Tor hidden service: advertise the v3 `.onion` host + virtual port.
     onion: struct { host: []const u8, port: u16 },
+    /// I2P inbound seed: advertise the `.b32.i2p` destination. The port is the
+    /// I2CP destination port leechers dial (0 = the destination default).
+    i2p: struct { host: []const u8, port: u16 },
     /// Classic public seed: advertise a routable IPv4 + port.
     ipv4: struct { ip: [4]u8, port: u16 },
 };
@@ -56,6 +59,7 @@ pub fn publish(
     const announce_ev: ?nostr.Event = switch (ann) {
         .none => null,
         .onion => |o| try peer_announce.buildOnion(allocator, sk, pk, info_hash, o.host, o.port),
+        .i2p => |i| try peer_announce.buildI2p(allocator, sk, pk, info_hash, i.host, i.port),
         .ipv4 => |v| try peer_announce.build(allocator, sk, pk, info_hash, v.ip, v.port),
     };
     defer if (announce_ev) |ev| ev.deinit(allocator);
