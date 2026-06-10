@@ -446,6 +446,11 @@ pub const Session = struct {
                 // when proxied, can't even accept incoming peers). Opt back into
                 // seed-after-download with `--seed`.
                 if (!self.seed_after_complete) {
+                    // Release the files right away: the Session object can
+                    // outlive completion (the daemon keeps it registered until
+                    // removal), and a finished download must not hold its
+                    // files open — that blocks other programs from using them.
+                    self.store.closeFiles();
                     self.running = false;
                     break;
                 }
@@ -460,6 +465,9 @@ pub const Session = struct {
                     self.listener = addr.listen(.{ .reuse_address = true }) catch null;
                 }
                 self.mode = .seed;
+                // Seeding only reads — swap the write handles for read-only
+                // ones so the completed files are usable by other programs.
+                self.store.downgradeToReadOnly();
                 if (self.proxy == null) {
                     stdout.print("now seeding on port {d}...\n", .{self.listen_port}) catch {};
                 } else {

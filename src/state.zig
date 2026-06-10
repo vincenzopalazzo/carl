@@ -194,6 +194,29 @@ fn loadFrom(a: Allocator, path: [:0]const u8) Error!State {
     return .{ .route = route, .download_dir = download_dir, .transfers = try list.toOwnedSlice(a) };
 }
 
+/// Read just the persisted `downloadDir` setting, or null when there is no
+/// database / no value / an empty value. Best-effort: any failure reads as
+/// "unset" so callers (workdir resolution) fall back to the built-in default.
+pub fn loadDownloadDir(a: Allocator) ?[]u8 {
+    const path = dbPath(a) catch return null;
+    defer a.free(path);
+    std.fs.cwd().access(path, .{}) catch return null; // no DB yet
+    const path_z = a.dupeZ(u8, path) catch return null;
+    defer a.free(path_z);
+    return loadDownloadDirFrom(a, path_z);
+}
+
+fn loadDownloadDirFrom(a: Allocator, path: [:0]const u8) ?[]u8 {
+    const db = open(path) catch return null;
+    defer _ = sqlite3_close(db);
+    const value = (getSetting(a, db, "downloadDir") catch return null) orelse return null;
+    if (value.len == 0) {
+        a.free(value);
+        return null;
+    }
+    return value;
+}
+
 fn upsertSetting(db: *Sqlite, key: []const u8, value: []const u8) Error!void {
     var stmt: ?*Stmt = null;
     const sql = "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value";
@@ -277,4 +300,25 @@ test "sqlite save replaces prior transfers (no accumulation)" {
     try testing.expectEqual(@as(usize, 1), st.transfers.len);
     try testing.expectEqual(api.Route.tor, st.route);
     try testing.expectEqualStrings("/y", st.download_dir);
+}
+
+test "loadDownloadDirFrom reads the setting; empty/missing read as unset" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/carl.db", .{dir}, 0);
+    defer a.free(path);
+
+    // Fresh DB (schema only): no setting yet.
+    try testing.expect(loadDownloadDirFrom(a, path) == null);
+
+    try saveTo(path, .direct, "/home/u/dl", &.{});
+    const got = loadDownloadDirFrom(a, path) orelse return error.TestUnexpectedResult;
+    defer a.free(got);
+    try testing.expectEqualStrings("/home/u/dl", got);
+
+    try saveTo(path, .direct, "", &.{});
+    try testing.expect(loadDownloadDirFrom(a, path) == null);
 }

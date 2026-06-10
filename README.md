@@ -72,6 +72,13 @@ carl download https://archlinux.org/releng/releases/2026.04.01/torrent/
 carl download file.torrent --output-dir ~/Downloads --port 6882
 ```
 
+Without `--output-dir`, downloads land in carl's **work dir** — the single
+download + seed directory shared by the CLI, the daemon, and the desktop app:
+`$CARL_DIR` if set, else the download folder picked in the app's Settings,
+else `~/Downloads/carl`. Anything in that directory can be reseeded directly:
+`carl seed <file.torrent>` (no data-dir needed) and the desktop app both read
+from it, and finished downloads keep seeding from it.
+
 ### Inspect a torrent file
 
 ```sh
@@ -102,6 +109,10 @@ carl announce file.torrent
 
 ```sh
 carl seed file.torrent /path/to/data --port 6881
+
+# data-dir omitted: seeds from the shared carl work dir (~/Downloads/carl),
+# where downloads land — drop a file there to reseed it
+carl seed file.torrent
 ```
 
 ### Anonymous mode (proxy)
