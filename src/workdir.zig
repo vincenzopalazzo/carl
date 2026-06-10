@@ -39,13 +39,22 @@ pub fn defaultDir(a: Allocator) Allocator.Error![]u8 {
     return std.fmt.allocPrint(a, "{s}/Downloads/carl", .{home});
 }
 
-/// Resolve the working directory (override > persisted setting > default).
-/// Caller owns the returned slice.
-pub fn resolve(a: Allocator) Allocator.Error![]u8 {
+/// The `$CARL_DIR` override, or null when unset/empty. Callers that need to
+/// know whether the override is active (and not just the resolved result) use
+/// this directly — e.g. the daemon, which must keep the override outranking
+/// the persisted setting across `Manager.restore`. Caller owns the slice.
+pub fn envOverride(a: Allocator) Allocator.Error!?[]u8 {
     if (std.process.getEnvVarOwned(a, "CARL_DIR")) |env| {
         if (env.len > 0) return env;
         a.free(env);
     } else |_| {}
+    return null;
+}
+
+/// Resolve the working directory (override > persisted setting > default).
+/// Caller owns the returned slice.
+pub fn resolve(a: Allocator) Allocator.Error![]u8 {
+    if (try envOverride(a)) |dir| return dir;
     if (state.loadDownloadDir(a)) |dir| {
         if (!isPlaceholder(a, dir)) return dir;
         a.free(dir);

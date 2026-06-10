@@ -872,10 +872,19 @@ fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u
     const socks = parseFlag(extra, "--socks") orelse "";
     // Default to the unified carl work dir (CARL_DIR > persisted Settings
     // value > ~/Downloads/carl) so the daemon/GUI and the CLI share one
-    // download + seed directory.
+    // download + seed directory. An explicit flag or $CARL_DIR outranks the
+    // persisted setting, and `download_dir_pinned` tells the manager so its
+    // restore() doesn't clobber the dir with the stale DB value.
+    const download_dir_flag = parseFlag(extra, "--download-dir");
+    var download_dir_pinned = download_dir_flag != null;
     var download_dir_owned: ?[]u8 = null;
     defer if (download_dir_owned) |d| allocator.free(d);
-    const download_dir = parseFlag(extra, "--download-dir") orelse blk: {
+    const download_dir = download_dir_flag orelse blk: {
+        if (try carl.workdir.envOverride(allocator)) |d| {
+            download_dir_owned = d;
+            download_dir_pinned = true;
+            break :blk @as([]const u8, d);
+        }
         download_dir_owned = try carl.workdir.resolve(allocator);
         break :blk @as([]const u8, download_dir_owned.?);
     };
@@ -904,6 +913,7 @@ fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u
         .route = route,
         .socks = socks,
         .download_dir = download_dir,
+        .download_dir_pinned = download_dir_pinned,
         .listen_port = bt_port,
         .tor_control = tor_control,
         .tor_cookie = tor_cookie,

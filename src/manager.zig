@@ -56,6 +56,11 @@ pub const Config = struct {
     route: api.Route = .direct,
     socks: []const u8 = "",
     download_dir: []const u8 = "",
+    /// True when `download_dir` came from a source that outranks the persisted
+    /// setting (an explicit --download-dir flag or $CARL_DIR), so `restore`
+    /// must not replace it with the stale DB value — otherwise the daemon and
+    /// the CLI (which honors $CARL_DIR first) would diverge on the work dir.
+    download_dir_pinned: bool = false,
     listen_port: u16 = 6881,
     max_active: u32 = 8,
     peer_limit: u32 = 60,
@@ -144,6 +149,11 @@ pub const Manager = struct {
     /// While replaying persisted state on startup, suppress per-add persistence
     /// (we write once at the end of `restore`).
     restoring: bool = false,
+    /// The user's persisted downloadDir, kept aside while a pinned override
+    /// ($CARL_DIR / --download-dir) is active: `persist` re-saves this instead
+    /// of the override, so an ephemeral override never clobbers the setting on
+    /// disk. Cleared when the user picks a new dir via `setDownloadDir`. Owned.
+    saved_download_dir: ?[]u8 = null,
 
     pub fn init(allocator: Allocator, cfg: Config) Allocator.Error!Manager {
         return .{
@@ -152,6 +162,7 @@ pub const Manager = struct {
                 .route = cfg.route,
                 .socks = try allocator.dupe(u8, if (cfg.socks.len > 0) cfg.socks else "socks5h://127.0.0.1:9050"),
                 .download_dir = try allocator.dupe(u8, if (cfg.download_dir.len > 0) cfg.download_dir else "."),
+                .download_dir_pinned = cfg.download_dir_pinned,
                 .listen_port = cfg.listen_port,
                 .max_active = cfg.max_active,
                 .peer_limit = cfg.peer_limit,
@@ -169,6 +180,7 @@ pub const Manager = struct {
         self.transfers.deinit(self.allocator);
         self.allocator.free(self.cfg.socks);
         self.allocator.free(self.cfg.download_dir);
+        if (self.saved_download_dir) |d| self.allocator.free(d);
         self.allocator.free(self.cfg.tor_control);
         self.allocator.free(self.cfg.tor_cookie);
     }
@@ -508,6 +520,12 @@ pub const Manager = struct {
         self.mutex.lock();
         self.allocator.free(self.cfg.download_dir);
         self.cfg.download_dir = dup;
+        // An explicit user choice replaces any kept-aside persisted value:
+        // from here on `persist` saves the live dir again.
+        if (self.saved_download_dir) |old| {
+            self.allocator.free(old);
+            self.saved_download_dir = null;
+        }
         self.mutex.unlock();
         std.fs.cwd().makePath(dup) catch {};
         self.persist();
@@ -529,7 +547,7 @@ pub const Manager = struct {
 
         self.mutex.lock();
         const route = self.cfg.route;
-        const dir = aa.dupe(u8, self.cfg.download_dir) catch {
+        const dir = aa.dupe(u8, self.saved_download_dir orelse self.cfg.download_dir) catch {
             self.mutex.unlock();
             return;
         };
@@ -562,14 +580,22 @@ pub const Manager = struct {
 
         self.mutex.lock();
         self.cfg.route = st.route;
-        // Treat placeholder values ("", ".", and the retired desktop default
-        // ~/Downloads/carl-download) as "unset" so stale persisted state from
-        // before the unified work dir doesn't clobber the directory resolved
-        // at startup (--download-dir, or workdir's CARL_DIR/setting/default).
+        // Apply the persisted downloadDir only when it doesn't get outranked:
+        // a pinned dir (explicit --download-dir or $CARL_DIR) wins over the DB
+        // value so the daemon matches the CLI's `$CARL_DIR > setting > default`
+        // order, and placeholder values ("", ".", the retired desktop default
+        // ~/Downloads/carl-download) are stale pre-unification state, not a
+        // user choice. When pinned, keep the DB value aside so `persist`
+        // re-saves it — the override is ephemeral and must not clobber it.
         if (!workdir.isPlaceholder(self.allocator, st.download_dir)) {
             if (self.allocator.dupe(u8, st.download_dir)) |d| {
-                self.allocator.free(self.cfg.download_dir);
-                self.cfg.download_dir = d;
+                if (self.cfg.download_dir_pinned) {
+                    if (self.saved_download_dir) |old| self.allocator.free(old);
+                    self.saved_download_dir = d;
+                } else {
+                    self.allocator.free(self.cfg.download_dir);
+                    self.cfg.download_dir = d;
+                }
             } else |_| {}
         }
         self.mutex.unlock();
