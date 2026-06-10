@@ -3,7 +3,7 @@
   --border:#262b36; --border-soft:#1c212b;
   --fg:#e8eaf0; --fg-dim:#9aa1b1; --fg-faint:#666e7e;
   --accent:#8b7cf6; --accent-soft:rgba(139,124,246,0.14); --accent-border:rgba(139,124,246,0.4); --accent-dim:#a99ff8;
-  --clearnet:#d6a44e; --proxy:#5aa6db; --tor:#46c08a;
+  --clearnet:#d6a44e; --proxy:#5aa6db; --tor:#46c08a; --i2p:#b08ff0;
   --ok:#46c08a; --info:#5aa6db; --warn:#d6a44e; --danger:#d9726b;
   --dl:#5aa6db; --ul:#46c08a;
   --serif:"Newsreader",Georgia,serif;
@@ -111,6 +111,7 @@ input,textarea{ font-family:inherit; }
 .rt-clearnet{ color:var(--clearnet); background:rgba(214,164,78,0.1); border-color:rgba(214,164,78,0.25); }
 .rt-proxy{ color:var(--proxy); background:rgba(90,166,219,0.1); border-color:rgba(90,166,219,0.25); }
 .rt-tor{ color:var(--tor); background:rgba(70,192,138,0.1); border-color:rgba(70,192,138,0.28); }
+.rt-i2p{ color:var(--i2p); background:rgba(176,143,240,0.1); border-color:rgba(176,143,240,0.28); }
 html[data-show-routes="0"] .trow-line1 .route-badge span:last-child{ display:none; }
 html[data-show-routes="0"] .trow-line1 .route-badge{ padding:3px; }
 
@@ -239,6 +240,7 @@ html[data-density="compact"] .trow-stat{ width:74px; flex-basis:74px; }
 .rsl-btn:hover{ color:var(--fg); }
 .rsl-btn.active{ background:var(--bg-3); color:var(--fg); }
 .rsl-btn.active.rt-tor{ color:var(--tor); }
+.rsl-btn.active.rt-i2p{ color:var(--i2p); }
 .rsl-btn.active.rt-proxy{ color:var(--proxy); }
 .rsl-btn.active.rt-direct{ color:var(--clearnet); }
 .route-select-lg .rsl-btn{ padding:7px 14px; font-size:12.5px; }
@@ -412,6 +414,9 @@ html[data-density="compact"] .trow-stat{ width:74px; flex-basis:74px; }
 .route-radio.active.rt-tor .rr-ic{ color:var(--tor); }
 .route-radio.active.rt-tor .rr-radio{ border-color:var(--tor); }
 .route-radio.active.rt-tor .rr-radio::after{ background:var(--tor); }
+.route-radio.active.rt-i2p .rr-ic{ color:var(--i2p); }
+.route-radio.active.rt-i2p .rr-radio{ border-color:var(--i2p); }
+.route-radio.active.rt-i2p .rr-radio::after{ background:var(--i2p); }
 .rr-txt{ display:flex; flex-direction:column; gap:1px; }
 .rr-label{ font-size:13px; font-weight:500; }
 .rr-desc{ font-size:11.5px; color:var(--fg-dim); }
