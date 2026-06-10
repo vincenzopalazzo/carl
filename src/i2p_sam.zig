@@ -15,8 +15,9 @@
 //!      for the BitTorrent handshake — the same "connected stream" contract as
 //!      `proxy.zig`.
 //!
-//! Inbound (`STREAM ACCEPT`/`FORWARD` for seeding), I2P trackers, and I2P DHT
-//! are follow-up phases; this module covers session setup + outbound dial.
+//! This module covers session setup, outbound dial (`STREAM CONNECT`), inbound
+//! seeding (`STREAM FORWARD`), bridge health probing, and `.b32.i2p` address
+//! derivation. I2P trackers and the I2P DHT are follow-up phases.
 //!
 //! Requires a running I2P router (i2pd or Java I2P) with the SAM bridge enabled.
 //! See docs/i2p.md. The handshake is synchronous and blocking (bounded by
