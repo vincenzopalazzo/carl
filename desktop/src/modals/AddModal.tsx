@@ -18,17 +18,28 @@ const HINT: Record<Tab, string> = {
   url: "carl fetches the .torrent over your selected route.",
 };
 
+// Hints per anonymized download route. Downloads never run clearnet — the
+// choice is which anonymity network dials the peers.
+const ROUTE_HINT: Record<"tor" | "i2p", string> = {
+  tor: "Downloads are routed over Tor — your IP is never exposed. Trackers & DHT off · peers via Nostr. Requires a running Tor SOCKS proxy (127.0.0.1:9050).",
+  i2p: "Peers are dialed as .b32.i2p destinations over native I2P (SAM v3) — your IP is never exposed. Trackers & DHT off · peers via Nostr. Requires a running I2P router with SAM (127.0.0.1:7656).",
+};
+
 export function AddModal({ onClose }: { onClose: () => void }) {
   const { addTransfer } = useCarl();
   const [tab, setTab] = useState<Tab>("magnet");
   const [val, setVal] = useState("");
   const [nostr, setNostr] = useState(true);
-  // Downloads are Tor-only — privacy by default; the IP is never exposed.
-  const route: Route = "tor";
+  // Downloads are anonymized-only — Tor by default, native I2P as the
+  // alternative. Direct/proxy are deliberately not offered for downloads.
+  const [route, setRoute] = useState<Route>("tor");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const canAdd = val.trim().length > 0 && !busy;
+  // The daemon has no I2P-tunneled HTTP fetch yet (P3, #35): an HTTP .torrent
+  // source on the i2p route is rejected (fail-closed), so block it up front.
+  const urlUnsupported = tab === "url" && route === "i2p";
+  const canAdd = val.trim().length > 0 && !busy && !urlUnsupported;
 
   async function submit() {
     if (!canAdd) return;
@@ -90,16 +101,31 @@ export function AddModal({ onClose }: { onClose: () => void }) {
             <div className="field">
               <label className="field-label">Route</label>
               <div className="route-select route-select-lg">
-                <button className="rsl-btn active rt-tor" disabled>
+                <button
+                  className={"rsl-btn" + (route === "tor" ? " active rt-tor" : "")}
+                  onClick={() => setRoute("tor")}
+                >
                   <OnionIcon size={12} />
                   Tor
                 </button>
+                <button
+                  className={"rsl-btn" + (route === "i2p" ? " active rt-i2p" : "")}
+                  onClick={() => setRoute("i2p")}
+                >
+                  <Icon name="shield" size={12} />
+                  I2P
+                </button>
               </div>
               <span className="field-hint">
-                Downloads are routed over Tor only — your IP is never exposed.
-                Trackers &amp; DHT off · peers via Nostr. Requires a running Tor
-                SOCKS proxy (127.0.0.1:9050).
+                {ROUTE_HINT[route as "tor" | "i2p"]}
               </span>
+              {urlUnsupported && (
+                <span className="field-hint" style={{ color: "var(--warn)" }}>
+                  HTTP .torrent sources aren't supported on I2P yet (no
+                  I2P-tunneled fetch — it would leak). Use a magnet/file, or
+                  Tor for URL sources.
+                </span>
+              )}
             </div>
 
             <label

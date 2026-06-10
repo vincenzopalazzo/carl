@@ -120,7 +120,7 @@ function DiscoverCard({
 }
 
 export function DiscoverScreen() {
-  const { search, addTransfer } = useCarl();
+  const { search, addTransfer, state } = useCarl();
   const [q, setQ] = useState("");
   const [added, setAdded] = useState<Record<string, boolean>>({});
   const [all, setAll] = useState<DiscoverResult[]>([]);
@@ -163,11 +163,13 @@ export function DiscoverScreen() {
 
   async function download(d: DiscoverResult) {
     try {
-      // Downloads are Tor-only (same guarantee as the manual Add flow) so a
-      // download never exposes your IP to peers.
+      // Downloads are anonymized-only (same guarantee as the manual Add flow)
+      // so a download never exposes your IP to peers: I2P when it's the global
+      // route, Tor otherwise (incl. direct/proxy — one-click stays private).
+      const route = state.settings.route === "i2p" ? "i2p" : "tor";
       await addTransfer(
         `magnet:?xt=urn:btih:${d.hash}&dn=${encodeURIComponent(d.title)}`,
-        "tor",
+        route,
         true,
       );
       setAdded((s) => ({ ...s, [d.id]: true }));

@@ -164,6 +164,24 @@ function LeakCheck({ route, proxy }: { route: Route; proxy: ProxyHealth }) {
     );
   }
 
+  // I2P doesn't use the SOCKS proxy (the daemon talks to the SAM bridge per
+  // transfer), so the SOCKS health probe is reported "disabled" — show the
+  // route's own contract instead of a bogus proxy status.
+  if (route === "i2p") {
+    return (
+      <div className="leak-check lc-safe">
+        <span className="lc-dot" />
+        <div className="lc-body">
+          <div className="lc-title">I2P route — peers dialed via SAM</div>
+          <div className="lc-detail mono">
+            transport fail-closed (no clearnet peers/trackers/DHT) · SAM bridge
+            127.0.0.1:7656 · Nostr relay discovery is clearnet
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   const ep = proxy.endpoint || "the proxy";
   const TITLE: Record<ProxyHealth["state"], string> = {
     ok: "Proxy reachable — leak check passed",
@@ -193,16 +211,16 @@ function LeakCheck({ route, proxy }: { route: Route; proxy: ProxyHealth }) {
   );
 }
 
-// Routes the GUI can select as its global anonymity setting. I2P is deliberately
-// absent: desktop downloads are Tor-only (see AddModal/Discover) and i2p seeding
-// is rejected by the daemon, so selecting i2p here would have no usable effect.
-// I2P is a daemon/CLI route (`carl daemon --route i2p`, see docs/i2p.md); the
-// Route type, ROUTE_META, badges and VIS_LABEL still carry i2p so a transfer
-// surfaced by a CLI-run daemon renders correctly.
+// Routes the GUI can select as its global anonymity setting. Selecting I2P
+// makes Discover one-click downloads dial peers as `.b32.i2p` destinations
+// over the SAM bridge (default 127.0.0.1:7656); the Add modal also offers
+// Tor/I2P per transfer. I2P seeding is not supported yet (rejected by the
+// daemon — #35 P2), so tor seeds remain the private seeding path.
 const ROUTES: [Route, string, string, string][] = [
   ["direct", "Direct", "Connect straight to peers. Fastest, no privacy.", "globe"],
   ["proxy", "SOCKS5 proxy", "Tunnel all traffic through a SOCKS5 proxy.", "shield"],
   ["tor", "Tor", "Route through the Tor network. Seed as a hidden service.", "onion"],
+  ["i2p", "I2P", "Native I2P (SAM v3). Downloads dial .b32.i2p peers; seeding not yet supported.", "shield"],
 ];
 
 export function SettingsScreen() {
