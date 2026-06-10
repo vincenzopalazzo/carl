@@ -7,6 +7,7 @@ const ROUTE_META: Record<Route, { label: string; cls: string; icon: string }> = 
   direct: { label: "clearnet", cls: "rt-clearnet", icon: "globe" },
   proxy: { label: "proxied", cls: "rt-proxy", icon: "shield" },
   tor: { label: "tor", cls: "rt-tor", icon: "onion" },
+  i2p: { label: "i2p", cls: "rt-tor", icon: "onion" },
 };
 
 export function RouteBadge({

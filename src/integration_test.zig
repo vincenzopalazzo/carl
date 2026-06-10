@@ -11,6 +11,7 @@ const storage_mod = @import("storage.zig");
 const session_mod = @import("session.zig");
 const extension = @import("extension.zig");
 const proxy_mod = @import("proxy.zig");
+const i2p_sam = @import("i2p_sam.zig");
 
 /// Generate deterministic test data of a given size.
 fn generateTestData(allocator: std.mem.Allocator, size: usize) ![]u8 {
@@ -252,6 +253,7 @@ fn seederThread(args: SeederArgs) void {
         null,
         .any,
         false,
+        null,
     ) catch return;
     defer sess.deinit();
 
@@ -329,6 +331,7 @@ test "full session seed and download over loopback" {
         null,
         .any,
         false,
+        null,
     ) catch {
         session_mod.shutdown_requested.store(true, .release);
         seeder_handle.join();
@@ -426,6 +429,7 @@ test "magnet metadata exchange then download over loopback" {
         null,
         .loopback,
         false,
+        null,
     ) catch return;
     defer seeder.deinit();
     // init opens the inbound listener for seed mode; read back the real port.
@@ -466,6 +470,7 @@ test "magnet metadata exchange then download over loopback" {
         null,
         .loopback,
         false,
+        null,
     ) catch return;
     defer dl.deinit();
     dl.info_hash = info_hash;
@@ -536,6 +541,7 @@ test "connectOnionPeer cleans up exactly once when the dial fails" {
         proxy,
         .any,
         false,
+        null,
     );
     defer sess.deinit();
 
@@ -543,5 +549,55 @@ test "connectOnionPeer cleans up exactly once when the dial fails" {
     // exactly once. On the pre-fix code this double-frees and the test aborts.
     try std.testing.expectError(error.ConnectionFailed, sess.connectOnionPeer("examplepeer.onion", 6881));
     // The failed peer must not have been adopted into the peer set.
+    try std.testing.expectEqual(@as(usize, 0), sess.peers.items.len);
+}
+
+// The I2P path shares finishPeerConnect's single-owner contract: connectI2pPeer
+// sets up the PeerConnection with `errdefer p.deinit()` and finishPeerConnect
+// must NOT also free it when the SAM dial fails — the same double-free shape as
+// the onion regression above, on the path where failed dials (CANT_REACH_PEER)
+// are the common case.
+test "connectI2pPeer cleans up exactly once when the SAM dial fails" {
+    const allocator = std.testing.allocator;
+
+    const test_data = try generateTestData(allocator, 1024);
+    defer allocator.free(test_data);
+
+    var tm = try buildTestMetainfo(allocator, test_data, 1024, "i2p_double_free.bin");
+    defer tm.deinit();
+
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    const dir_path = try dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+
+    // SAM session whose bridge refuses immediately, so the dial fails fast
+    // without touching the network. `connect` only reads allocator/bridge/id;
+    // control/destination are never touched, so dummies are fine (no deinit —
+    // this Session owns nothing).
+    var sam = i2p_sam.Session{
+        .allocator = allocator,
+        .bridge = .{ .host = "127.0.0.1", .port = 1 },
+        .id = @constCast("carltest-0"),
+        .destination = @constCast(""),
+        .control = undefined,
+    };
+
+    var sess = try session_mod.Session.init(
+        allocator,
+        tm.meta,
+        dir_path,
+        .download,
+        0,
+        null,
+        .any,
+        false,
+        &sam,
+    );
+    defer sess.deinit();
+
+    // Must surface the error and free the peer exactly once (the testing
+    // allocator aborts on a double free, failing the test on the buggy code).
+    try std.testing.expectError(error.ConnectionFailed, sess.connectI2pPeer("examplepeer.b32.i2p", 6881));
     try std.testing.expectEqual(@as(usize, 0), sess.peers.items.len);
 }
