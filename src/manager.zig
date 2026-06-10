@@ -837,6 +837,12 @@ pub const Manager = struct {
     /// the caller drops the spec — there's no safe way to retain it.
     fn retainSpec(self: *Manager, t: state_mod.TransferSpec) bool {
         const src = self.allocator.dupe(u8, t.source) catch return false;
+        // `restoreTransfers` now runs on a background thread while the daemon
+        // serves, so this can race a concurrent add's `dropRetained` (and
+        // `persist`'s read) — all of which touch `retained_specs` under the
+        // mutex. Take the lock here too.
+        self.mutex.lock();
+        defer self.mutex.unlock();
         self.retained_specs.append(self.allocator, .{
             .kind = t.kind,
             .source = src,
