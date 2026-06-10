@@ -77,7 +77,21 @@ destination as a kind-30078 peer-announce so leechers can find and dial it.
 
 In the desktop app, pick **I2P** in the "Seed a file" visibility selector; the
 seed's `.b32.i2p` address is surfaced once the SAM session is up. On the daemon
-the seed is created via `POST /api/seeds` with `X-Carl-Route: i2p`.
+the seed is created via `POST /api/seeds` with `X-Carl-Route: i2p`. From the CLI,
+seed with `--i2p-seed` (the I2P analog of `--tor-seed`):
+
+```sh
+carl seed file.torrent ./data --i2p-seed --nostr --i2p-sam 127.0.0.1:7656
+```
+
+### Transport health
+
+Like the Tor route (which reports SOCKS-proxy health), the i2p route reports
+**SAM-bridge health**: the daemon probes the bridge with a `HELLO` handshake and
+surfaces `ok` / `not_running` / `timeout` / `rejected` (not a SAM bridge) in the
+`proxy` field of the state API, so the desktop Settings screen shows live I2P
+transport status instead of a guess. A missing router shows "SAM bridge not
+running" rather than silently failing.
 
 When the I2P route is active, the **BitTorrent transport fails closed** the same
 way the proxy/Tor routes do: clearnet DHT, UDP/HTTP trackers, web seeds, and the
@@ -115,6 +129,13 @@ persistence) for the implementation.
 | Addressing | `.onion` (v3) | `.b32.i2p` destination |
 | carl transport | SOCKS5h proxy (`--socks`) | native SAM v3 (`--i2p-sam`) |
 | Inbound/seeding | Tor hidden service (see tor-hidden-service.md) | SAM `STREAM FORWARD` + stable `.b32.i2p` |
+| Downloads (GUI/CLI/daemon) | yes | yes |
+| Seeding (GUI/CLI/daemon) | yes | yes |
+| Transport health in the UI | SOCKS probe | SAM `HELLO` probe |
+| Nostr discovery over the network | yes (via SOCKS) | not yet (relays are clearnet) |
+
+The feature surface is at parity except **Nostr discovery is not yet routed over
+I2P** (relay traffic on the i2p route is clearnet; see *Known limitations*).
 
 Either way, carl's **discovery layer is the same** — signed NIP-35 / kind-30078
 events over Nostr — so the privacy network you pick is independent of how you

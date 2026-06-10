@@ -181,6 +181,82 @@ fn hello(stream: std.net.Stream) SamError!Version {
     return parseVersion(samField(line, "VERSION") orelse "3.0");
 }
 
+// --- bridge health probe -----------------------------------------------------
+
+/// Health of the SAM bridge, the I2P analog of `proxy.ProxyState`. Lets the
+/// daemon/GUI say *why* the i2p route isn't working, the same way the Tor route
+/// reports SOCKS health, instead of failing silently.
+pub const Health = enum {
+    /// Reachable and speaks SAM v3 (`HELLO REPLY RESULT=OK`).
+    ok,
+    /// Nothing is listening on the SAM port (connection refused) — the I2P
+    /// router isn't running, or the SAM bridge is disabled.
+    not_running,
+    /// The connect or the `HELLO` handshake timed out.
+    timeout,
+    /// Reachable but did not speak SAM (no `HELLO REPLY RESULT=OK`) — e.g. the
+    /// port points at something that isn't a SAM bridge.
+    handshake_failed,
+
+    pub fn jsonName(self: Health) []const u8 {
+        return @tagName(self);
+    }
+};
+
+/// Probe the SAM bridge once: non-blocking connect (so a filtered/dead host
+/// yields a real timeout and a refused port is distinguished from a timeout —
+/// `SO_SNDTIMEO` does not bound `connect()` on macOS), then a `HELLO VERSION`
+/// handshake. Never creates a session or leaks; greeting only. Mirrors
+/// `proxy.classifySocks5`.
+pub fn classifyBridge(allocator: Allocator, bridge: Bridge, timeout_s: u32) Health {
+    const list = std.net.getAddressList(allocator, bridge.host, bridge.port) catch
+        return .not_running;
+    defer list.deinit();
+    var target: ?std.net.Address = null;
+    for (list.addrs) |a| {
+        if (a.any.family == posix.AF.INET) {
+            target = a;
+            break;
+        }
+    }
+    const addr = target orelse return .not_running;
+
+    const timeout_ms: i32 = if (timeout_s > 600) 600_000 else @intCast(timeout_s * 1000);
+    const sock = posix.socket(
+        posix.AF.INET,
+        posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
+        posix.IPPROTO.TCP,
+    ) catch return .timeout;
+    defer posix.close(sock);
+
+    const flags = posix.fcntl(sock, posix.F.GETFL, 0) catch return .timeout;
+    var o: posix.O = @bitCast(@as(u32, @truncate(flags)));
+    o.NONBLOCK = true;
+    _ = posix.fcntl(sock, posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
+
+    posix.connect(sock, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
+        error.WouldBlock => {
+            var pfd = [_]posix.pollfd{.{ .fd = sock, .events = posix.POLL.OUT, .revents = 0 }};
+            const ready = posix.poll(&pfd, timeout_ms) catch return .timeout;
+            if (ready == 0) return .timeout;
+            posix.getsockoptError(sock) catch |e| return if (e == error.ConnectionRefused) .not_running else .timeout;
+        },
+        error.ConnectionRefused => return .not_running,
+        else => return .timeout,
+    };
+
+    // Connected. Back to blocking with bounded reads/writes for the handshake.
+    o.NONBLOCK = false;
+    _ = posix.fcntl(sock, posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
+    const tv = posix.timeval{ .sec = @intCast(timeout_s), .usec = 0 };
+    posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
+    posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+
+    const stream = std.net.Stream{ .handle = sock };
+    _ = hello(stream) catch return .handshake_failed;
+    return .ok;
+}
+
 // --- destination address derivation -----------------------------------------
 
 /// I2P's base64 alphabet: standard base64 with `-` and `~` replacing `+`/`/`.
@@ -654,6 +730,33 @@ test "i2p_sam: TO_PORT omitted on a pre-3.2 bridge (best-effort default port)" {
     // TO_PORT omitted.
     var peer = try sess.connect("examplepeer.b32.i2p", 6881);
     peer.close();
+}
+
+test "i2p_sam: classifyBridge reports ok against a SAM bridge, not_running on a dead port" {
+    const allocator = testing.allocator;
+    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var server = try addr.listen(.{ .reuse_address = true });
+    const port = server.listen_address.getPort();
+    var ctx = MockCtx{ .server = &server, .stop = std.atomic.Value(bool).init(false) };
+    const t = try std.Thread.spawn(.{}, mockRun, .{&ctx});
+    defer {
+        ctx.stop.store(true, .release);
+        t.join();
+        server.deinit();
+    }
+
+    // Live mock bridge → ok (it answers HELLO with RESULT=OK).
+    try testing.expectEqual(Health.ok, classifyBridge(allocator, .{ .host = "127.0.0.1", .port = port }, 3));
+
+    // A port with nothing listening → not_running (connection refused). Bind and
+    // immediately release a port to get one that's almost certainly free.
+    const probe_port = blk: {
+        var s = try addr.listen(.{ .reuse_address = true });
+        const p = s.listen_address.getPort();
+        s.deinit();
+        break :blk p;
+    };
+    try testing.expectEqual(Health.not_running, classifyBridge(allocator, .{ .host = "127.0.0.1", .port = probe_port }, 2));
 }
 
 test "i2p_sam: STREAM FORWARD arms inbound and is idempotent-guarded" {

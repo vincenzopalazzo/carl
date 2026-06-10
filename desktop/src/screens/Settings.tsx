@@ -164,19 +164,34 @@ function LeakCheck({ route, proxy }: { route: Route; proxy: ProxyHealth }) {
     );
   }
 
-  // I2P doesn't use the SOCKS proxy (the daemon talks to the SAM bridge per
-  // transfer), so the SOCKS health probe is reported "disabled" — show the
-  // route's own contract instead of a bogus proxy status.
+  // I2P uses the SAM bridge, not SOCKS — the daemon probes it and reports its
+  // health through the same `proxy` field, so show live SAM status (the parity
+  // of the Tor SOCKS leak check).
   if (route === "i2p") {
+    const sam = proxy.endpoint || "127.0.0.1:7656";
+    const I2P_TITLE: Record<ProxyHealth["state"], string> = {
+      ok: "SAM bridge reachable — I2P transport up",
+      checking: "Checking SAM bridge…",
+      not_running: "SAM bridge not running",
+      timeout: "SAM bridge connection timed out",
+      rejected: "Not a SAM bridge",
+      disabled: "",
+    };
+    const I2P_DETAIL: Record<ProxyHealth["state"], string> = {
+      ok: `peers dialed via ${sam} · transport fail-closed · Nostr discovery is clearnet`,
+      checking: `probing ${sam}…`,
+      not_running: `${sam} refused the connection — is your I2P router running with SAM enabled?`,
+      timeout: `${sam} timed out — check the address and that SAM is enabled`,
+      rejected: `${sam} did not speak SAM${proxy.detail ? ` · ${proxy.detail}` : ""} — is this the SAM port?`,
+      disabled: "",
+    };
+    const ok = proxy.state === "ok";
     return (
-      <div className="leak-check lc-safe">
+      <div className={"leak-check " + (ok ? "lc-safe" : "lc-warn")}>
         <span className="lc-dot" />
         <div className="lc-body">
-          <div className="lc-title">I2P route — peers dialed via SAM</div>
-          <div className="lc-detail mono">
-            transport fail-closed (no clearnet peers/trackers/DHT) · SAM bridge
-            127.0.0.1:7656 · Nostr relay discovery is clearnet
-          </div>
+          <div className="lc-title">{I2P_TITLE[proxy.state]}</div>
+          <div className="lc-detail mono">{I2P_DETAIL[proxy.state]}</div>
         </div>
       </div>
     );
