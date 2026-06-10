@@ -305,9 +305,10 @@ export function SeedingScreen() {
             </div>
             <div className="empty-title">Nothing seeding yet</div>
             <div className="empty-sub">
-              Completed downloads keep seeding and show up here. Tor-routed seeds
-              surface their <span className="mono">.onion</span> address with a
-              "no IP leaked" guarantee.
+              Completed downloads keep seeding and show up here. Tor and I2P
+              seeds surface their <span className="mono">.onion</span> /{" "}
+              <span className="mono">.b32.i2p</span> address with a "no IP leaked"
+              guarantee.
             </div>
           </div>
         ) : (

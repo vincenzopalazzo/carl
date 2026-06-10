@@ -19,8 +19,17 @@ export interface DaemonConfig {
 }
 
 /** Abort a stuck request so the UI falls back to its offline state instead of
- *  awaiting a hung daemon socket forever. */
+ *  awaiting a hung daemon socket forever. Used for the fast read endpoints. */
 const REQUEST_TIMEOUT_MS = 8000;
+
+/** Adding a transfer or seed on an anonymized route blocks the daemon while it
+ *  stands up the network session: a Tor hidden service, or an I2P SAM
+ *  `SESSION CREATE` that builds tunnels (commonly 10-30s, bounded by the
+ *  daemon's 60s SAM timeout). The 8s read timeout would abort that mid-build —
+ *  the transfer/seed never registers and the UI looks like "i2p doesn't work" —
+ *  so add/seed get a timeout that comfortably covers session setup. (A bridge
+ *  that's actually down still fails fast: connection refused is instant.) */
+const SESSION_SETUP_TIMEOUT_MS = 90_000;
 
 /** Matches the daemon's body cap (docs/daemon-api.md) — guard before reading the
  *  whole file into memory so a huge drop fails fast with a clear message. */
@@ -92,6 +101,9 @@ export class DaemonClient {
     const res = await this.fetch("/api/transfers", {
       method: "POST",
       body: JSON.stringify({ source, route, nostr }),
+      // Anonymized routes build a session before the daemon responds (see
+      // SESSION_SETUP_TIMEOUT_MS); don't abort mid-build.
+      signal: AbortSignal.timeout(SESSION_SETUP_TIMEOUT_MS),
     });
     return this.json<{ id: string }>(res);
   }
@@ -155,6 +167,9 @@ export class DaemonClient {
         "Content-Type": "application/octet-stream",
       },
       body: bytes,
+      // A tor/i2p seed stands up its network session before responding; bound
+      // the wait generously rather than hang forever or abort mid-setup.
+      signal: AbortSignal.timeout(SESSION_SETUP_TIMEOUT_MS),
     });
     return this.json<{ id: string }>(res);
   }
