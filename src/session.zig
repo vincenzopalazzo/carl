@@ -15,6 +15,7 @@ const extension = @import("extension.zig");
 const bencode = @import("bencode.zig");
 const dht_mod = @import("dht.zig");
 const proxy_mod = @import("proxy.zig");
+const i2p_sam = @import("i2p_sam.zig");
 
 const log = std.log.scoped(.session);
 
@@ -147,6 +148,11 @@ pub const Session = struct {
     // listener are disabled to avoid leaking the real IP.
     proxy: ?proxy_mod.Proxy,
 
+    /// Native I2P transport (SAM v3). Borrowed; owned by the manager and set
+    /// after init for the `i2p` route. When set, peers are dialed as `.b32.i2p`
+    /// destinations over SAM instead of TCP/SOCKS. Mutually exclusive with proxy.
+    i2p: ?*i2p_sam.Session = null,
+
     /// Where the inbound listener binds when active.
     listen_bind: ListenBind,
     /// Tor hidden-service seed: no tracker/DHT (would leak or bypass Tor).
@@ -166,6 +172,7 @@ pub const Session = struct {
         proxy: ?proxy_mod.Proxy,
         listen_bind: ListenBind,
         tor_hidden: bool,
+        i2p: ?*i2p_sam.Session,
     ) !Session {
         const total_length = piece_mod.totalLength(meta.files);
         const num_pieces = piece_mod.numPieces(total_length, meta.piece_length);
@@ -214,10 +221,12 @@ pub const Session = struct {
             }
         }
 
-        // Skip the inbound listener entirely when proxied: accepting incoming
-        // peers would reveal the real IP to whoever connects.
+        // Skip the inbound listener entirely on any anonymized transport
+        // (proxy/Tor/I2P): accepting incoming clearnet peers would reveal the
+        // real IP. (Anonymized inbound — Tor hidden service / I2P — is wired
+        // separately, not via this clearnet listener.)
         var listener: ?std.net.Server = null;
-        if (proxy == null and (mode == .seed or our_bitfield.count() > 0)) {
+        if (proxy == null and i2p == null and (mode == .seed or our_bitfield.count() > 0)) {
             const bind_ip: [4]u8 = switch (listen_bind) {
                 .any => .{ 0, 0, 0, 0 },
                 .loopback => .{ 127, 0, 0, 1 },
@@ -260,6 +269,7 @@ pub const Session = struct {
             .dht_instance = null,
             .dht_failed = false,
             .proxy = proxy,
+            .i2p = i2p,
             .listen_bind = listen_bind,
             .tor_hidden = tor_hidden,
             .start_time = now,
@@ -455,8 +465,9 @@ pub const Session = struct {
                     break;
                 }
 
-                // Don't open an inbound listener when proxied (would leak our IP).
-                if (self.listener == null and self.proxy == null) {
+                // Don't open an inbound clearnet listener on any anonymized
+                // transport (would leak our IP).
+                if (self.listener == null and !self.anonymized()) {
                     const bind_ip: [4]u8 = switch (self.listen_bind) {
                         .any => .{ 0, 0, 0, 0 },
                         .loopback => .{ 127, 0, 0, 1 },
@@ -468,10 +479,10 @@ pub const Session = struct {
                 // Seeding only reads — swap the write handles for read-only
                 // ones so the completed files are usable by other programs.
                 self.store.downgradeToReadOnly();
-                if (self.proxy == null) {
+                if (!self.anonymized()) {
                     stdout.print("now seeding on port {d}...\n", .{self.listen_port}) catch {};
                 } else {
-                    stdout.print("download complete; seeding to outbound peers only (proxied)\n", .{}) catch {};
+                    stdout.print("download complete; seeding to outbound peers only (anonymized)\n", .{}) catch {};
                 }
             }
 
@@ -1446,6 +1457,10 @@ pub const Session = struct {
     }
 
     fn tryAnnounceUrl(self: *Session, url: []const u8, req: tracker_mod.AnnounceRequest) ?tracker_mod.AnnounceResponse {
+        // I2P (anonymized with no SOCKS/HTTP proxy) can't reach clearnet
+        // trackers, and announcing over them directly would leak the real IP.
+        // (I2P-native trackers are a follow-up.) Skip all clearnet trackers.
+        if (self.anonymized() and self.proxy == null) return null;
         if (std.mem.startsWith(u8, url, "udp://")) {
             // UDP cannot be carried over an HTTP/SOCKS CONNECT tunnel; disable
             // when proxied so we never leak the real IP via a raw datagram.
@@ -1537,6 +1552,10 @@ pub const Session = struct {
     /// Useful for testing and for manual peer addition.
     pub fn connectDirectPeer(self: *Session, addr: std.net.Address) !void {
         if (self.peers.items.len >= max_peers) return;
+        // On the I2P transport there is no clearnet route (and no proxy to tunnel
+        // through), so a clearnet IPv4 peer is unreachable and dialing it would
+        // leak the real IP — skip it. I2P peers arrive via connectI2pPeer.
+        if (self.i2p != null) return;
 
         const p = self.allocator.create(peer_mod.PeerConnection) catch return error.OutOfMemory;
         errdefer self.allocator.destroy(p);
@@ -1557,6 +1576,30 @@ pub const Session = struct {
         p.* = try peer_mod.PeerConnection.initOnion(self.allocator, host, port);
         errdefer p.deinit();
         p.proxy = px;
+        try self.finishPeerConnect(p);
+    }
+
+    /// True when this transfer must not touch the clearnet — a proxy/Tor proxy
+    /// is set, or it's on the native I2P transport. All clearnet peer-discovery
+    /// and seeding machinery (inbound listener, DHT, UDP/HTTP trackers, web
+    /// seeds, direct dials) is disabled when this is true, so the real IP never
+    /// leaks regardless of which anonymity network is selected.
+    pub fn anonymized(self: *const Session) bool {
+        return self.proxy != null or self.i2p != null;
+    }
+
+    /// Connect to an I2P peer by `.b32.i2p` destination over the session's SAM
+    /// transport. `port` is the peer's advertised I2CP destination port (passed
+    /// to SAM as `TO_PORT`; 0 = default). Requires the `i2p` route (a live SAM
+    /// session).
+    pub fn connectI2pPeer(self: *Session, dest: []const u8, port: u16) !void {
+        if (self.peers.items.len >= max_peers) return;
+        const sam = self.i2p orelse return error.ConnectionFailed;
+
+        const p = self.allocator.create(peer_mod.PeerConnection) catch return error.OutOfMemory;
+        errdefer self.allocator.destroy(p);
+        p.* = try peer_mod.PeerConnection.initI2p(self.allocator, dest, port, sam);
+        errdefer p.deinit();
         try self.finishPeerConnect(p);
     }
 
@@ -1604,9 +1647,9 @@ pub const Session = struct {
     // --- BEP 5: DHT peer discovery ---
 
     fn tryDhtPeerDiscovery(self: *Session) !void {
-        // DHT runs over UDP, which cannot be tunneled through an HTTP/SOCKS
-        // CONNECT proxy. Disable it when proxied to avoid leaking the real IP.
-        if (self.proxy != null) return;
+        // DHT runs over clearnet UDP, which can't be tunneled. Disable it on any
+        // anonymized transport (proxy/Tor/I2P) to avoid leaking the real IP.
+        if (self.anonymized()) return;
 
         // Don't retry if DHT previously failed to start (e.g. port busy)
         if (self.dht_failed) return;
@@ -1636,9 +1679,9 @@ pub const Session = struct {
     // --- BEP 19: Web seed downloads ---
 
     fn tryWebSeedDownload(self: *Session) !void {
-        // Web seeds use std.http.Client directly; disable when proxied (a
-        // proxied + Range-aware path is a follow-up).
-        if (self.proxy != null) return;
+        // Web seeds use std.http.Client directly (clearnet); disable on any
+        // anonymized transport (a tunneled, Range-aware path is a follow-up).
+        if (self.anonymized()) return;
 
         const urls = self.meta.url_list orelse return;
         if (urls.len == 0) return;

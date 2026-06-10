@@ -10,6 +10,7 @@ const VIS_LABEL: Record<Route, string> = {
   direct: "Public IP",
   proxy: "Proxy",
   tor: "Tor hidden service",
+  i2p: "I2P destination",
 };
 
 function OnionCallout({ onion, relays }: { onion: string; relays: number }) {
@@ -91,6 +92,7 @@ const VIS_DESC: Record<Route, string> = {
   direct: "Announced to peers over your IP.",
   proxy: "Outbound via SOCKS5. Trackers/DHT disabled; peers via Nostr.",
   tor: "Routed through Tor. No clearnet IP exposed.",
+  i2p: "Native I2P (SAM v3). No clearnet IP exposed; peers via Nostr.",
 };
 
 function SeedFlow({ onClose }: { onClose: () => void }) {

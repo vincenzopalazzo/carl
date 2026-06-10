@@ -23,6 +23,7 @@ const session_mod = @import("session.zig");
 const metainfo = @import("metainfo.zig");
 const magnet_mod = @import("magnet.zig");
 const proxy_mod = @import("proxy.zig");
+const i2p_sam = @import("i2p_sam.zig");
 const extension = @import("extension.zig");
 const relay_mod = @import("relay.zig");
 const peer_announce = @import("peer_announce.zig");
@@ -43,6 +44,11 @@ pub const Error = error{
     HttpFailed,
     BadProxy,
     SessionInitFailed,
+    /// The requested operation has no I2P-routed implementation yet, so doing it
+    /// would either leak over clearnet or produce an unreachable transfer. We
+    /// fail closed rather than silently fall back. Covers HTTP `.torrent`
+    /// fetches and seeding on the `i2p` route (see #35 P2/P3 follow-ups).
+    UnsupportedOnI2p,
     /// Failed to stand up the Tor hidden service for a `.tor` seed (Tor
     /// ControlPort unreachable, cookie auth failed, etc.). Fails closed rather
     /// than creating a seed nobody can reach.
@@ -54,7 +60,14 @@ pub const Error = error{
 /// are owned; setters free and re-dup.
 pub const Config = struct {
     route: api.Route = .direct,
+    /// True when `route` came from an explicit `--route` flag. `restore` then
+    /// keeps it instead of applying the persisted (GUI-set) route: silently
+    /// downgrading e.g. `--route i2p`/`tor` to a stale persisted `direct` would
+    /// put a daemon the user asked to anonymize on the clearnet.
+    route_explicit: bool = false,
     socks: []const u8 = "",
+    /// I2P SAM bridge address for the `i2p` route (e.g. `127.0.0.1:7656`).
+    i2p_sam: []const u8 = "",
     download_dir: []const u8 = "",
     /// True when `download_dir` came from a source that outranks the persisted
     /// setting (an explicit --download-dir flag or $CARL_DIR), so `restore`
@@ -98,6 +111,9 @@ const ManagedTransfer = struct {
     /// Owned copy of the socks URL the proxy slices borrow from.
     socks_owned: ?[]u8,
     proxy: ?proxy_mod.Proxy,
+    /// Owned SAM session for the `i2p` route (the session borrows it). Torn down
+    /// in `destroy` after the session thread has stopped.
+    i2p_session: ?*i2p_sam.Session,
     /// Tor hidden service backing a `.tor` seed (the onion leechers dial).
     /// Owned; torn down (DEL_ONION) in `destroy` after the session stops.
     hidden: ?tor_control.HiddenService,
@@ -131,6 +147,11 @@ const ManagedTransfer = struct {
         // gone, so we DEL_ONION only once nothing is forwarding to it.
         if (self.hidden) |*h| h.deinit();
         self.meta.deinit(self.allocator);
+        // The session (now stopped) borrowed this SAM session; tear it down last.
+        if (self.i2p_session) |s| {
+            s.deinit();
+            self.allocator.destroy(s);
+        }
         if (self.socks_owned) |s| self.allocator.free(s);
         self.allocator.free(self.id);
         self.allocator.free(self.name);
@@ -154,13 +175,22 @@ pub const Manager = struct {
     /// of the override, so an ephemeral override never clobbers the setting on
     /// disk. Cleared when the user picks a new dir via `setDownloadDir`. Owned.
     saved_download_dir: ?[]u8 = null,
+    /// Persisted transfer specs that failed to re-add on `restore` (the SAM
+    /// bridge / I2P router or Tor still starting, a proxy down, a seed file on
+    /// a not-yet-mounted disk). They aren't live (no session), but `persist`
+    /// re-includes them so a failure at startup never deletes a user's saved
+    /// transfers — the next restart retries them. Sources are owned by
+    /// `allocator`.
+    retained_specs: std.ArrayList(state_mod.TransferSpec) = .empty,
 
     pub fn init(allocator: Allocator, cfg: Config) Allocator.Error!Manager {
         return .{
             .allocator = allocator,
             .cfg = .{
                 .route = cfg.route,
+                .route_explicit = cfg.route_explicit,
                 .socks = try allocator.dupe(u8, if (cfg.socks.len > 0) cfg.socks else "socks5h://127.0.0.1:9050"),
+                .i2p_sam = try allocator.dupe(u8, if (cfg.i2p_sam.len > 0) cfg.i2p_sam else "127.0.0.1:7656"),
                 .download_dir = try allocator.dupe(u8, if (cfg.download_dir.len > 0) cfg.download_dir else "."),
                 .download_dir_pinned = cfg.download_dir_pinned,
                 .listen_port = cfg.listen_port,
@@ -178,7 +208,10 @@ pub const Manager = struct {
         // No lock: deinit happens after the server loop has stopped.
         for (self.transfers.items) |mt| mt.destroy();
         self.transfers.deinit(self.allocator);
+        for (self.retained_specs.items) |s| self.allocator.free(s.source);
+        self.retained_specs.deinit(self.allocator);
         self.allocator.free(self.cfg.socks);
+        self.allocator.free(self.cfg.i2p_sam);
         self.allocator.free(self.cfg.download_dir);
         if (self.saved_download_dir) |d| self.allocator.free(d);
         self.allocator.free(self.cfg.tor_control);
@@ -192,31 +225,60 @@ pub const Manager = struct {
     /// Add a transfer from a magnet URI, .torrent path, or HTTP(S) URL on the
     /// given route. Spawns the session thread. Returns the new transfer id
     /// (owned by the caller).
-    pub fn addTransfer(self: *Manager, source: []const u8, route: api.Route, want_nostr: bool) Error![]u8 {
-        // Each transfer owns the socks URL its Proxy slices borrow from, so a
-        // later `setRoute`/config change can't dangle a running transfer.
-        var socks_owned: ?[]u8 = null;
-        var resolved_proxy: ?proxy_mod.Proxy = null;
-        if (route != .direct) {
-            const dup = try self.allocator.dupe(u8, self.cfg.socks);
-            socks_owned = dup;
-            resolved_proxy = proxy_mod.parseUrl(dup) catch {
-                self.allocator.free(dup);
-                return error.BadProxy;
-            };
+    /// Open a SAM session for the `i2p` route (the per-transfer transport,
+    /// analogous to resolving a proxy). Caller owns the returned session.
+    fn resolveI2p(self: *Manager) Error!*i2p_sam.Session {
+        const bridge = i2p_sam.parseUrl(self.cfg.i2p_sam) catch return error.BadProxy;
+        const sam = self.allocator.create(i2p_sam.Session) catch return error.OutOfMemory;
+        errdefer self.allocator.destroy(sam);
+        sam.* = i2p_sam.Session.create(self.allocator, bridge, "carl") catch return error.SessionInitFailed;
+        return sam;
+    }
+
+    /// The per-transfer transport resolved from a route: a proxy (with its owned
+    /// socks URL) for proxy/Tor, a SAM session for I2P, or nothing for direct.
+    const Transport = struct {
+        socks_owned: ?[]u8 = null,
+        proxy: ?proxy_mod.Proxy = null,
+        i2p: ?*i2p_sam.Session = null,
+    };
+
+    /// Resolve the transport for `route`. Each transfer owns its transport so a
+    /// later config change can't dangle a running one. On error nothing leaks.
+    fn resolveTransport(self: *Manager, route: api.Route) Error!Transport {
+        if (route == .i2p) return .{ .i2p = try self.resolveI2p() };
+        if (route == .direct) return .{};
+        const dup = try self.allocator.dupe(u8, self.cfg.socks);
+        const proxy = proxy_mod.parseUrl(dup) catch {
+            self.allocator.free(dup);
+            return error.BadProxy;
+        };
+        return .{ .socks_owned = dup, .proxy = proxy };
+    }
+
+    /// Free a resolved transport on a pre-`register` error path (after `register`
+    /// succeeds, the ManagedTransfer owns it). Idempotent over the null fields.
+    fn freeTransport(self: *Manager, t: Transport) void {
+        if (t.socks_owned) |s| self.allocator.free(s);
+        if (t.i2p) |s| {
+            s.deinit();
+            self.allocator.destroy(s);
         }
+    }
+
+    pub fn addTransfer(self: *Manager, source: []const u8, route: api.Route, want_nostr: bool) Error![]u8 {
+        const t = try self.resolveTransport(route);
 
         std.fs.cwd().makePath(self.cfg.download_dir) catch {};
 
-        const built = self.buildSession(source, resolved_proxy) catch |err| {
-            if (socks_owned) |s| self.allocator.free(s);
+        const built = self.buildSession(source, t.proxy, t.i2p) catch |err| {
+            self.freeTransport(t);
             return err;
         };
         const magnet = if (std.mem.startsWith(u8, source, "magnet:")) source else "";
-        return self.register(built, route, resolved_proxy, socks_owned, null, want_nostr, false, magnet, source);
+        return self.register(built, route, t.proxy, t.socks_owned, t.i2p, null, want_nostr, false, magnet, source);
     }
 
-    /// Create a torrent from a local file (or archive) and start seeding it. The
     /// Bind a throwaway loopback socket to discover a free port. Each `.tor`
     /// seed needs its own listener port: every seed otherwise reuses
     /// `cfg.listen_port`, but only one Session can bind a given port, so a second
@@ -231,22 +293,20 @@ pub const Manager = struct {
         return server.listen_address.getPort();
     }
 
+    /// Create a torrent from a local file (or archive) and start seeding it. The
     /// file is hashed in-process — carl needs no external torrent tool. With
     /// `want_nostr`, a NIP-35 torrent event is published so it's discoverable.
     pub fn addSeed(self: *Manager, path: []const u8, route: api.Route, want_nostr: bool) Error![]u8 {
-        var socks_owned: ?[]u8 = null;
-        var resolved_proxy: ?proxy_mod.Proxy = null;
-        if (route != .direct) {
-            const dup = try self.allocator.dupe(u8, self.cfg.socks);
-            socks_owned = dup;
-            resolved_proxy = proxy_mod.parseUrl(dup) catch {
-                self.allocator.free(dup);
-                return error.BadProxy;
-            };
-        }
+        // I2P inbound seeding (STREAM ACCEPT/FORWARD + a persisted destination +
+        // an `.b32.i2p` peer-announce) is P2 follow-up work (#35). Without it an
+        // i2p seed would suppress the clearnet listener yet expose no reachable
+        // endpoint — advertised as private but unreachable. Fail closed instead
+        // of creating a dead seed.
+        if (route == .i2p) return error.UnsupportedOnI2p;
+        const t = try self.resolveTransport(route);
 
         const mi = metainfo.createSingleFile(self.allocator, path, metainfo.default_piece_length) catch |e| {
-            if (socks_owned) |s| self.allocator.free(s);
+            self.freeTransport(t);
             return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,
                 else => error.InvalidTorrent,
@@ -263,7 +323,7 @@ pub const Manager = struct {
         // over Tor; the session itself takes no proxy (inbound-only via the onion).
         // Fails closed (`TorControlFailed`) rather than creating an unreachable seed.
         var hidden: ?tor_control.HiddenService = null;
-        var session_proxy = resolved_proxy;
+        var session_proxy = t.proxy;
         var listen_bind: session_mod.ListenBind = .any;
         var tor_hidden = false;
         var seed_port = self.cfg.listen_port;
@@ -277,7 +337,7 @@ pub const Manager = struct {
                 .local_port = seed_port,
                 .onion_port = self.cfg.tor_onion_port,
             }) catch {
-                if (socks_owned) |s| self.allocator.free(s);
+                self.freeTransport(t);
                 mi.deinit(self.allocator);
                 return error.TorControlFailed;
             };
@@ -287,13 +347,13 @@ pub const Manager = struct {
         }
 
         const session = self.allocator.create(session_mod.Session) catch {
-            if (socks_owned) |s| self.allocator.free(s);
+            self.freeTransport(t);
             if (hidden) |*h| h.deinit();
             mi.deinit(self.allocator);
             return error.OutOfMemory;
         };
-        session.* = session_mod.Session.init(self.allocator, mi, data_dir, .seed, seed_port, session_proxy, listen_bind, tor_hidden) catch {
-            if (socks_owned) |s| self.allocator.free(s);
+        session.* = session_mod.Session.init(self.allocator, mi, data_dir, .seed, seed_port, session_proxy, listen_bind, tor_hidden, t.i2p) catch {
+            self.freeTransport(t);
             if (hidden) |*h| h.deinit();
             self.allocator.destroy(session);
             mi.deinit(self.allocator);
@@ -309,7 +369,7 @@ pub const Manager = struct {
         var hex: [40]u8 = undefined;
         secp.toHex(&session.info_hash, &hex);
         const magnet = std.fmt.allocPrint(self.allocator, "magnet:?xt=urn:btih:{s}&dn={s}", .{ hex, mi.name }) catch {
-            if (socks_owned) |s| self.allocator.free(s);
+            self.freeTransport(t);
             if (hidden) |*h| h.deinit();
             session.deinit();
             self.allocator.destroy(session);
@@ -318,7 +378,7 @@ pub const Manager = struct {
         };
         defer self.allocator.free(magnet);
 
-        return self.register(built, route, resolved_proxy, socks_owned, hidden, want_nostr, true, magnet, path);
+        return self.register(built, route, t.proxy, t.socks_owned, t.i2p, hidden, want_nostr, true, magnet, path);
     }
 
     /// Register a built session as a managed transfer and spawn its thread.
@@ -332,6 +392,7 @@ pub const Manager = struct {
         route: api.Route,
         resolved_proxy: ?proxy_mod.Proxy,
         socks_owned: ?[]u8,
+        i2p_session: ?*i2p_sam.Session,
         hidden: ?tor_control.HiddenService,
         want_nostr: bool,
         is_seed: bool,
@@ -348,6 +409,10 @@ pub const Manager = struct {
             }
             built.meta.deinit(self.allocator);
             if (socks_owned) |s| self.allocator.free(s);
+            if (i2p_session) |s| {
+                s.deinit();
+                self.allocator.destroy(s);
+            }
         };
 
         const mt = try self.allocator.create(ManagedTransfer);
@@ -382,6 +447,7 @@ pub const Manager = struct {
             .has_http_tracker = std.mem.startsWith(u8, built.meta.announce, "http"),
             .socks_owned = socks_owned,
             .proxy = resolved_proxy,
+            .i2p_session = i2p_session,
             .hidden = hidden,
             .session = built.session,
             .meta = built.meta,
@@ -397,15 +463,24 @@ pub const Manager = struct {
             mt.destroy();
             return err;
         };
-        self.mutex.unlock();
-
         // Spawn after publishing so a snapshot taken mid-spawn sees the row.
+        // (spawn doesn't block on the child, and we never join under the lock,
+        // so holding the mutex across it is safe.)
         mt.thread = std.Thread.spawn(.{}, runThread, .{mt}) catch {
             // Roll back: remove from the list and destroy (frees `id` too, so we
             // must not touch it afterward on this path).
+            self.mutex.unlock();
             _ = self.removeTransfer(id) catch {};
             return error.SessionInitFailed;
         };
+
+        // The spec is live for real (spawn succeeded): drop any retained copy of
+        // the same source so `persist` doesn't write it twice (a duplicate would
+        // re-add the transfer twice on the next restart — two sessions on the
+        // same files). Only after the spawn: dropping earlier would let the
+        // failed-spawn rollback persist state with the saved spec already gone.
+        self.dropRetained(source_src);
+        self.mutex.unlock();
 
         self.persist();
         return self.allocator.dupe(u8, id);
@@ -561,6 +636,18 @@ pub const Manager = struct {
                 .nostr = mt.want_nostr,
             }) catch break;
         }
+        // Re-include transfers whose transport was unavailable at restore so a
+        // transient outage doesn't erase them on the next persist (which any
+        // add/remove triggers). They carry no live session, just the saved spec.
+        for (self.retained_specs.items) |s| {
+            const src = aa.dupe(u8, s.source) catch break;
+            specs.append(aa, .{
+                .kind = s.kind,
+                .source = src,
+                .route = s.route,
+                .nostr = s.nostr,
+            }) catch break;
+        }
         self.mutex.unlock();
 
         state_mod.save(self.allocator, route, dir, specs.items) catch |e| {
@@ -579,7 +666,9 @@ pub const Manager = struct {
         defer st.deinit(self.allocator);
 
         self.mutex.lock();
-        self.cfg.route = st.route;
+        // An explicit --route wins over the persisted (GUI-set) route; the
+        // persisted one only fills in when the user didn't ask for anything.
+        if (!self.cfg.route_explicit) self.cfg.route = st.route;
         // Apply the persisted downloadDir only when it doesn't get outranked:
         // a pinned dir (explicit --download-dir or $CARL_DIR) wins over the DB
         // value so the daemon matches the CLI's `$CARL_DIR > setting > default`
@@ -603,7 +692,7 @@ pub const Manager = struct {
 
         self.restoring = true;
         var restored: usize = 0;
-        var failed: usize = 0;
+        var retained: usize = 0;
         for (st.transfers) |t| {
             const res = switch (t.kind) {
                 .download => self.addTransfer(t.source, t.route, t.nostr),
@@ -613,22 +702,61 @@ pub const Manager = struct {
                 self.allocator.free(id);
                 restored += 1;
             } else |e| {
-                failed += 1;
-                log.warn("restore: could not re-add '{s}': {} (keeping it on disk)", .{ t.source, e });
+                // Never drop a saved spec on a failed re-add: the cause is often
+                // transient (the SAM bridge / I2P router or Tor still starting, a
+                // proxy down, a seed file on a not-yet-mounted disk). Keep it in
+                // `retained_specs` so every `persist` — at the end of restore AND
+                // any later add/remove — re-includes it, and the next restart
+                // retries instead of silently deleting the user's transfer.
+                // (Genuinely-invalid specs cost a warning per startup; that beats
+                // data loss.) Only an OOM on the copy can drop one.
+                if (self.retainSpec(t)) {
+                    retained += 1;
+                    log.warn("restore: could not re-add '{s}' ({}); keeping it for retry", .{ t.source, e });
+                } else {
+                    log.warn("restore: dropping '{s}': {} (out of memory)", .{ t.source, e });
+                }
             }
         }
         self.restoring = false;
-        // Only re-persist when every saved transfer came back. `persist` rewrites
-        // the DB purely from the live set, so persisting after a failure would
-        // permanently delete the dropped specs — e.g. a `tor` seed whose hidden
-        // service couldn't be created because Tor wasn't up yet at restart. Leave
-        // the on-disk state intact so the next restart retries them.
-        if (failed == 0) {
-            self.persist();
-        } else {
-            log.warn("restore: {d} transfer(s) didn't come back; leaving saved state intact for retry", .{failed});
-        }
+        // Persisting here is safe even after failures: every failed spec was just
+        // retained, and `persist` re-includes `retained_specs` alongside the live
+        // set, so nothing is erased.
+        self.persist();
         if (restored > 0) log.info("restored {d} transfer(s) from saved state", .{restored});
+        if (retained > 0) log.info("kept {d} saved transfer(s) that could not be re-added", .{retained});
+    }
+
+    /// Remove every retained spec whose source matches (the spec became live
+    /// again, or the caller is discarding it). Caller must hold `mutex` when the
+    /// manager is serving (restore runs single-threaded before that).
+    fn dropRetained(self: *Manager, source: []const u8) void {
+        var i: usize = 0;
+        while (i < self.retained_specs.items.len) {
+            if (std.mem.eql(u8, self.retained_specs.items[i].source, source)) {
+                self.allocator.free(self.retained_specs.items[i].source);
+                _ = self.retained_specs.swapRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Copy a persisted spec into `retained_specs` so `persist` re-includes it.
+    /// Returns false if the (owned) source copy can't be allocated, in which case
+    /// the caller drops the spec — there's no safe way to retain it.
+    fn retainSpec(self: *Manager, t: state_mod.TransferSpec) bool {
+        const src = self.allocator.dupe(u8, t.source) catch return false;
+        self.retained_specs.append(self.allocator, .{
+            .kind = t.kind,
+            .source = src,
+            .route = t.route,
+            .nostr = t.nostr,
+        }) catch {
+            self.allocator.free(src);
+            return false;
+        };
+        return true;
     }
 
     /// Capture any download whose (magnet) metadata has resolved: write the real
@@ -682,34 +810,39 @@ pub const Manager = struct {
         name: []const u8, // borrows from meta
     };
 
-    fn buildSession(self: *Manager, source: []const u8, proxy: ?proxy_mod.Proxy) Error!Built {
-        if (std.mem.startsWith(u8, source, "magnet:")) return self.buildMagnet(source, proxy);
+    fn buildSession(self: *Manager, source: []const u8, proxy: ?proxy_mod.Proxy, i2p: ?*i2p_sam.Session) Error!Built {
+        if (std.mem.startsWith(u8, source, "magnet:")) return self.buildMagnet(source, proxy, i2p);
         if (std.mem.startsWith(u8, source, "http://") or std.mem.startsWith(u8, source, "https://"))
-            return self.buildHttp(source, proxy);
-        return self.buildFile(source, proxy);
+            return self.buildHttp(source, proxy, i2p);
+        return self.buildFile(source, proxy, i2p);
     }
 
-    fn buildFile(self: *Manager, path: []const u8, proxy: ?proxy_mod.Proxy) Error!Built {
+    fn buildFile(self: *Manager, path: []const u8, proxy: ?proxy_mod.Proxy, i2p: ?*i2p_sam.Session) Error!Built {
         const data = std.fs.cwd().readFileAlloc(self.allocator, path, 10 * 1024 * 1024) catch return error.InvalidTorrent;
         defer self.allocator.free(data);
         const mi = metainfo.parse(self.allocator, data) catch return error.InvalidTorrent;
-        return self.fromMetainfo(mi, proxy);
+        return self.fromMetainfo(mi, proxy, i2p);
     }
 
-    fn buildHttp(self: *Manager, url: []const u8, proxy: ?proxy_mod.Proxy) Error!Built {
+    fn buildHttp(self: *Manager, url: []const u8, proxy: ?proxy_mod.Proxy, i2p: ?*i2p_sam.Session) Error!Built {
+        // The i2p route has no clearnet-tunneled fetch path: `fetchUrl` would
+        // dial the `.torrent` host directly (proxy is null on this route),
+        // leaking the real IP despite the route being documented as fail-closed.
+        // HTTP-over-SAM is P3 follow-up work (#35); until then, reject.
+        if (i2p != null) return error.UnsupportedOnI2p;
         const data = fetchUrl(self.allocator, url, proxy) catch return error.HttpFailed;
         defer self.allocator.free(data);
         const mi = metainfo.parse(self.allocator, data) catch return error.InvalidTorrent;
-        return self.fromMetainfo(mi, proxy);
+        return self.fromMetainfo(mi, proxy, i2p);
     }
 
-    fn fromMetainfo(self: *Manager, mi: metainfo.Metainfo, proxy: ?proxy_mod.Proxy) Error!Built {
+    fn fromMetainfo(self: *Manager, mi: metainfo.Metainfo, proxy: ?proxy_mod.Proxy, i2p: ?*i2p_sam.Session) Error!Built {
         // On a failed Session.init the metainfo is ours to free (it only becomes
         // the session's on success); mirrors the magnet path's errdefer.
         errdefer mi.deinit(self.allocator);
         const session = self.allocator.create(session_mod.Session) catch return error.OutOfMemory;
         errdefer self.allocator.destroy(session);
-        session.* = session_mod.Session.init(self.allocator, mi, self.cfg.download_dir, .download, self.cfg.listen_port, proxy, .any, false) catch {
+        session.* = session_mod.Session.init(self.allocator, mi, self.cfg.download_dir, .download, self.cfg.listen_port, proxy, .any, false, i2p) catch {
             return error.SessionInitFailed;
         };
         // Daemon downloads keep seeding once complete — the GUI lists them
@@ -721,7 +854,7 @@ pub const Manager = struct {
 
     /// Build a metadata-only session from a magnet link (BEP 9 bootstrap),
     /// mirroring the CLI's magnet path minus the optional NIP-35 enrichment.
-    fn buildMagnet(self: *Manager, uri: []const u8, proxy: ?proxy_mod.Proxy) Error!Built {
+    fn buildMagnet(self: *Manager, uri: []const u8, proxy: ?proxy_mod.Proxy, i2p: ?*i2p_sam.Session) Error!Built {
         const ml = magnet_mod.parse(self.allocator, uri) catch return error.InvalidMagnet;
         defer ml.deinit(self.allocator);
         const a = self.allocator;
@@ -731,7 +864,7 @@ pub const Manager = struct {
 
         const session = a.create(session_mod.Session) catch return error.OutOfMemory;
         errdefer a.destroy(session);
-        session.* = session_mod.Session.init(a, mi, self.cfg.download_dir, .download, self.cfg.listen_port, proxy, .any, false) catch {
+        session.* = session_mod.Session.init(a, mi, self.cfg.download_dir, .download, self.cfg.listen_port, proxy, .any, false, i2p) catch {
             return error.SessionInitFailed;
         };
         session.info_hash = ml.info_hash; // use the magnet's hash, not SHA1("")
@@ -933,12 +1066,25 @@ pub fn deriveSources(
             }
         },
         .proxy, .tor => {
-            // Proxied: DHT and UDP trackers are disabled to avoid IP leaks.
+            // Tunneled via SOCKS: clearnet DHT and UDP trackers are disabled to
+            // avoid leaks, but HTTP-tracker announces are routed through the
+            // proxy, so peers come from HTTP trackers and Nostr.
             if (has_http_tracker) {
                 out[n] = .tracker;
                 n += 1;
             }
             if (want_nostr or n == 0) {
+                out[n] = .nostr;
+                n += 1;
+            }
+        },
+        .i2p => {
+            // I2P can't reach clearnet trackers/DHT and has no I2P-native
+            // trackers yet, so `Session.tryAnnounceUrl` skips every announce
+            // (even HTTP ones). Reporting `tracker` here would imply peer
+            // discovery that never happens — Nostr `.b32.i2p` announces are the
+            // only real source, and only when the user opted into Nostr.
+            if (want_nostr) {
                 out[n] = .nostr;
                 n += 1;
             }
@@ -1030,6 +1176,13 @@ fn collectNostrPeers(mt: *ManagedTransfer) void {
             if (added >= 50) break;
             switch (ann.endpoint) {
                 .ipv4 => |ep| {
+                    // On the I2P transport a clearnet IPv4 peer is unreachable
+                    // (connectDirectPeer skips it to avoid leaking the real IP).
+                    // Skip it here too so clearnet announces don't silently count
+                    // against the discovery budget and starve later `.b32.i2p`
+                    // announces. (proxy/Tor dial IPv4 through the proxy, so they
+                    // still count.)
+                    if (mt.session.i2p != null) continue;
                     const addr = std.net.Address.initIp4(ep.ip, ep.port);
                     mt.session.connectDirectPeer(addr) catch continue;
                     added += 1;
@@ -1037,6 +1190,11 @@ fn collectNostrPeers(mt: *ManagedTransfer) void {
                 .onion => |ep| {
                     if (mt.session.proxy == null) continue;
                     mt.session.connectOnionPeer(ep.host, ep.port) catch continue;
+                    added += 1;
+                },
+                .i2p => |ep| {
+                    if (mt.session.i2p == null) continue; // needs an I2P route
+                    mt.session.connectI2pPeer(ep.host, ep.port) catch continue;
                     added += 1;
                 },
             }
@@ -1132,6 +1290,20 @@ test "deriveSources: proxy with http tracker keeps tracker + nostr" {
     try testing.expectEqual(api.SourceKind.nostr, s[1]);
 }
 
+test "deriveSources: i2p reports nostr only when opted in (never tracker)" {
+    var buf: [3]api.SourceKind = undefined;
+    // HTTP tracker present but never contacted on i2p, and nostr opted in:
+    // report nostr only, not tracker.
+    const with_nostr = deriveSources(&buf, .i2p, true, true, true);
+    try testing.expectEqual(@as(usize, 1), with_nostr.len);
+    try testing.expectEqual(api.SourceKind.nostr, with_nostr[0]);
+
+    // Without nostr there is no peer discovery at all on i2p: report nothing
+    // rather than implying a tracker is being used.
+    const no_nostr = deriveSources(&buf, .i2p, true, true, false);
+    try testing.expectEqual(@as(usize, 0), no_nostr.len);
+}
+
 test "formatEta" {
     var buf: [24]u8 = undefined;
     try testing.expectEqualStrings("stalled", formatEta(&buf, .stalled, 100, 0));
@@ -1141,6 +1313,27 @@ test "formatEta" {
     try testing.expectEqualStrings("10s", formatEta(&buf, .downloading, 1000, 100));
     try testing.expectEqualStrings("1m 40s", formatEta(&buf, .downloading, 10000, 100));
     try testing.expectEqualStrings("2h 46m", formatEta(&buf, .downloading, 1_000_000, 100));
+}
+
+test "Manager: dropRetained removes a re-added source so persist can't duplicate it" {
+    const allocator = testing.allocator;
+    var m = try Manager.init(allocator, .{});
+    defer m.deinit();
+
+    try testing.expect(m.retainSpec(.{ .kind = .download, .source = "magnet:?xt=urn:btih:aa", .route = .i2p, .nostr = true }));
+    try testing.expect(m.retainSpec(.{ .kind = .seed, .source = "/data/file.bin", .route = .tor, .nostr = false }));
+    try testing.expectEqual(@as(usize, 2), m.retained_specs.items.len);
+
+    // The magnet came back (user re-added it / transport recovered): its
+    // retained copy must go away or persist() would write it twice and the
+    // next restart would run two sessions on the same files.
+    m.dropRetained("magnet:?xt=urn:btih:aa");
+    try testing.expectEqual(@as(usize, 1), m.retained_specs.items.len);
+    try testing.expectEqualStrings("/data/file.bin", m.retained_specs.items[0].source);
+
+    // Unrelated source is a no-op.
+    m.dropRetained("magnet:?xt=urn:btih:bb");
+    try testing.expectEqual(@as(usize, 1), m.retained_specs.items.len);
 }
 
 test "Manager: init/deinit with config defaults" {

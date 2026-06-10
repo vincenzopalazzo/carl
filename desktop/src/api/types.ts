@@ -1,6 +1,6 @@
 // Mirrors the carl daemon JSON contract (docs/daemon-api.md).
 
-export type Route = "direct" | "proxy" | "tor";
+export type Route = "direct" | "proxy" | "tor" | "i2p";
 export type Status =
   | "downloading"
   | "seeding"

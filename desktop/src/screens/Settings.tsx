@@ -193,6 +193,12 @@ function LeakCheck({ route, proxy }: { route: Route; proxy: ProxyHealth }) {
   );
 }
 
+// Routes the GUI can select as its global anonymity setting. I2P is deliberately
+// absent: desktop downloads are Tor-only (see AddModal/Discover) and i2p seeding
+// is rejected by the daemon, so selecting i2p here would have no usable effect.
+// I2P is a daemon/CLI route (`carl daemon --route i2p`, see docs/i2p.md); the
+// Route type, ROUTE_META, badges and VIS_LABEL still carry i2p so a transfer
+// surfaced by a CLI-run daemon renders correctly.
 const ROUTES: [Route, string, string, string][] = [
   ["direct", "Direct", "Connect straight to peers. Fastest, no privacy.", "globe"],
   ["proxy", "SOCKS5 proxy", "Tunnel all traffic through a SOCKS5 proxy.", "shield"],

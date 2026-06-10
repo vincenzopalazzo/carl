@@ -18,6 +18,8 @@ pub const Route = enum {
     direct,
     proxy,
     tor,
+    /// Native I2P transport via the SAM v3 bridge (see src/i2p_sam.zig).
+    i2p,
 
     pub fn jsonName(self: Route) []const u8 {
         return @tagName(self);
@@ -25,6 +27,14 @@ pub const Route = enum {
 
     pub fn parse(s: []const u8) ?Route {
         return std.meta.stringToEnum(Route, s);
+    }
+
+    /// True when this route tunnels TCP through the configured SOCKS endpoint.
+    /// `direct` doesn't tunnel at all; `i2p` uses the SAM bridge, not SOCKS, so
+    /// SOCKS health/probing and relay-over-SOCKS logic must skip it too — a
+    /// single gate keeps every call site in lockstep.
+    pub fn usesSocks(self: Route) bool {
+        return self == .proxy or self == .tor;
     }
 };
 

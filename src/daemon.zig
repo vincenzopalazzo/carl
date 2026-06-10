@@ -156,7 +156,10 @@ pub const Daemon = struct {
         const raw = self.manager.cfg.socks;
         const rbuf = try arena.alloc(u8, raw.len + 4);
         const endpoint = try arena.dupe(u8, proxy_mod.redactUrl(raw, rbuf));
-        if (self.manager.cfg.route == .direct)
+        // direct doesn't use the SOCKS endpoint and neither does i2p (SAM
+        // bridge): reporting SOCKS state on those routes would show a bogus
+        // proxy error in the GUI.
+        if (!self.manager.cfg.route.usesSocks())
             return .{ .state = "disabled", .endpoint = endpoint };
 
         self.health_mutex.lock();
@@ -179,11 +182,12 @@ pub const Daemon = struct {
     /// Probe the SOCKS proxy once (proxy/tor route only) and cache the result.
     /// Never opens an upstream connection (greeting only) — see classifySocks5.
     fn probeProxy(self: *Daemon) void {
-        if (self.manager.cfg.route == .direct) {
+        if (!self.manager.cfg.route.usesSocks()) {
             // Don't fabricate an "ok": mark unprobed so that if the route later
             // switches to proxy/tor, the snapshot shows an honest "checking"
             // until a real probe lands (rather than a stale/false "ok"). The
-            // direct route is reported as "disabled" by the snapshot regardless.
+            // direct and i2p routes are reported as "disabled" by the snapshot
+            // regardless (i2p talks to the SAM bridge, not the SOCKS endpoint).
             self.health_mutex.lock();
             self.proxy_probed = false;
             self.health_mutex.unlock();
@@ -233,7 +237,10 @@ pub const Daemon = struct {
         defer nostr_config.freeRelays(a, urls);
 
         var proxy: ?proxy_mod.Proxy = null;
-        if (self.manager.cfg.route != .direct) {
+        // Only proxy/Tor route relay traffic through the SOCKS endpoint. The i2p
+        // route's `socks` is irrelevant (SAM, not SOCKS); routing relays over it
+        // would (wrongly) require Tor. Nostr-over-I2P is a follow-up.
+        if (self.manager.cfg.route.usesSocks()) {
             proxy = proxy_mod.parseUrl(self.manager.cfg.socks) catch null;
         }
 
@@ -974,9 +981,11 @@ fn runSearch(arena: Allocator, daemon: *Daemon, query: []const u8) ![]u8 {
     const health = daemon.healthSnapshot(arena) catch &.{};
 
     // Match the route the manager is configured for, so search over Tor/proxy
-    // doesn't leak the real IP.
+    // doesn't leak the real IP. The i2p route's `socks` is a SAM endpoint, not a
+    // SOCKS proxy, so don't route relay search through it (Nostr-over-I2P is a
+    // follow-up; until then i2p relay search is clearnet like the transfer side).
     var proxy: ?proxy_mod.Proxy = null;
-    if (daemon.manager.cfg.route != .direct) {
+    if (daemon.manager.cfg.route.usesSocks()) {
         proxy = proxy_mod.parseUrl(daemon.manager.cfg.socks) catch null;
     }
 

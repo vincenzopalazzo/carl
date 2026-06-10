@@ -5,6 +5,7 @@ const wire = @import("wire.zig");
 const piece_mod = @import("piece.zig");
 const extension = @import("extension.zig");
 const proxy_mod = @import("proxy.zig");
+const i2p_sam = @import("i2p_sam.zig");
 
 pub const PeerState = enum {
     connecting,
@@ -27,7 +28,12 @@ pub const PeerConnection = struct {
     proxy: ?proxy_mod.Proxy,
 
     /// When set with `proxy`, connect via SOCKS to this hostname (e.g. `.onion`).
+    /// Also carries the `.b32.i2p` destination when `i2p` is set.
     connect_host: ?[]const u8 = null,
+
+    /// Borrowed SAM session (owned by the manager). When set, dial `connect_host`
+    /// (a `.b32.i2p` destination) over native I2P instead of TCP/SOCKS.
+    i2p: ?*i2p_sam.Session = null,
 
     // Protocol state
     am_choking: bool,
@@ -122,6 +128,16 @@ pub const PeerConnection = struct {
         };
     }
 
+    /// Outbound connection to an I2P `.b32.i2p` destination over a SAM session
+    /// (owned by the caller). The session must outlive this connection. `port`
+    /// is the peer's advertised I2CP destination port (0 = default), stored in
+    /// `address` and passed to SAM as `TO_PORT` at connect time.
+    pub fn initI2p(allocator: Allocator, host: []const u8, port: u16, sam: *i2p_sam.Session) !PeerConnection {
+        var p = try PeerConnection.initOnion(allocator, host, port);
+        p.i2p = sam;
+        return p;
+    }
+
     pub fn deinit(self: *PeerConnection) void {
         if (self.stream) |s| s.close();
         if (self.connect_host) |h| self.allocator.free(h);
@@ -137,6 +153,21 @@ pub const PeerConnection = struct {
 
     /// Initiate TCP connection with a timeout.
     pub fn connect(self: *PeerConnection) !void {
+        // Native I2P: open a SAM stream to the destination. Synchronous, so on
+        // success the stream is ready for the BT handshake (like the proxy path).
+        if (self.i2p) |sam| {
+            const dest = self.connect_host orelse {
+                self.state = .disconnected;
+                return error.ConnectionFailed;
+            };
+            self.stream = sam.connect(dest, self.address.getPort()) catch {
+                self.state = .disconnected;
+                return error.ConnectionFailed;
+            };
+            self.state = .handshaking;
+            return;
+        }
+
         // When a proxy is configured, tunnel through it. The handshake is
         // synchronous, so on success the stream is ready for the BT handshake.
         if (self.proxy) |px| {

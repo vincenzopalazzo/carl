@@ -24,6 +24,9 @@ pub const kind_peer_announce: u32 = 30078;
 /// Tor v3 onion hostname: 56 base32 chars + `.onion` (62 bytes total).
 pub const v3_onion_host_len: usize = 62;
 
+/// I2P base32 destination hostname: 52 base32 chars + `.b32.i2p` (60 bytes).
+pub const b32_i2p_host_len: usize = 60;
+
 pub const Error = error{
     InvalidEvent,
     MissingD,
@@ -42,6 +45,11 @@ pub const Endpoint = union(enum) {
     },
     /// `host` is borrowed from the event tag when parsed from the network.
     onion: struct {
+        host: []const u8,
+        port: u16,
+    },
+    /// I2P `*.b32.i2p` destination; `host` is borrowed from the event tag.
+    i2p: struct {
         host: []const u8,
         port: u16,
     },
@@ -80,6 +88,31 @@ pub fn build(
     return buildTagged(allocator, sk, pk, &tag_sets);
 }
 
+/// Shared builder for a host-based endpoint (Tor onion or I2P): identical
+/// `d`/`host`/`port`/`client` tag schema; the suffix in `host` distinguishes
+/// the network. Validation is the caller's responsibility.
+fn buildHostEndpoint(
+    allocator: Allocator,
+    sk: secp.SecretKey,
+    pk: secp.PublicKey,
+    info_hash: [20]u8,
+    host: []const u8,
+    port: u16,
+) !nostr.Event {
+    var infohash_hex: [40]u8 = undefined;
+    secp.toHex(&info_hash, &infohash_hex);
+
+    var port_buf: [6]u8 = undefined;
+    const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch unreachable;
+
+    const d_tag = [_][]const u8{ "d", &infohash_hex };
+    const host_tag = [_][]const u8{ "host", host };
+    const port_tag = [_][]const u8{ "port", port_str };
+    const client_tag = [_][]const u8{ "client", "carl/0.1" };
+    const tag_sets = [_][]const []const u8{ d_tag[0..], host_tag[0..], port_tag[0..], client_tag[0..] };
+    return buildTagged(allocator, sk, pk, &tag_sets);
+}
+
 /// Build and sign a kind-30078 event for a Tor v3 hidden service.
 pub fn buildOnion(
     allocator: Allocator,
@@ -90,23 +123,26 @@ pub fn buildOnion(
     port: u16,
 ) !nostr.Event {
     if (!isValidV3OnionHost(onion_host)) return error.BadHost;
+    return buildHostEndpoint(allocator, sk, pk, info_hash, onion_host, port);
+}
 
-    var infohash_hex: [40]u8 = undefined;
-    secp.toHex(&info_hash, &infohash_hex);
-
-    var port_buf: [6]u8 = undefined;
-    const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch unreachable;
-
-    const d_tag = [_][]const u8{ "d", &infohash_hex };
-    const host_tag = [_][]const u8{ "host", onion_host };
-    const port_tag = [_][]const u8{ "port", port_str };
-    const client_tag = [_][]const u8{ "client", "carl/0.1" };
-    const tag_sets = [_][]const []const u8{ d_tag[0..], host_tag[0..], port_tag[0..], client_tag[0..] };
-    return buildTagged(allocator, sk, pk, &tag_sets);
+/// Build and sign a kind-30078 event for an I2P `*.b32.i2p` destination. Same
+/// `host`-tag schema as the onion path; the suffix distinguishes the two.
+pub fn buildI2p(
+    allocator: Allocator,
+    sk: secp.SecretKey,
+    pk: secp.PublicKey,
+    info_hash: [20]u8,
+    i2p_host: []const u8,
+    port: u16,
+) !nostr.Event {
+    if (!isValidI2pB32Host(i2p_host)) return error.BadHost;
+    return buildHostEndpoint(allocator, sk, pk, info_hash, i2p_host, port);
 }
 
 /// Parse and validate a kind-30078 event. Supports legacy `ip` tags and `host`
-/// tags for `.onion` endpoints. Caller must have already verified the signature.
+/// tags for `.onion` and `.b32.i2p` endpoints. Caller must have already verified
+/// the signature.
 pub fn parse(event: nostr.Event) Error!PeerAnnounce {
     if (event.kind != kind_peer_announce) return error.InvalidEvent;
 
@@ -130,6 +166,14 @@ pub fn parse(event: nostr.Event) Error!PeerAnnounce {
                 .created_at = event.created_at,
             };
         }
+        if (isValidI2pB32Host(host)) {
+            return .{
+                .info_hash = info_hash,
+                .endpoint = .{ .i2p = .{ .host = host, .port = port } },
+                .pubkey = event.pubkey,
+                .created_at = event.created_at,
+            };
+        }
         return error.BadHost;
     }
 
@@ -149,6 +193,18 @@ pub fn isValidV3OnionHost(host: []const u8) bool {
     if (host.len != v3_onion_host_len) return false;
     if (!std.mem.endsWith(u8, host, ".onion")) return false;
     const label = host[0 .. host.len - 6];
+    for (label) |c| {
+        const ok = (c >= 'a' and c <= 'z') or (c >= '2' and c <= '7');
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// True for an I2P base32 destination hostname (52-char base32 label + `.b32.i2p`).
+pub fn isValidI2pB32Host(host: []const u8) bool {
+    if (host.len != b32_i2p_host_len) return false;
+    if (!std.mem.endsWith(u8, host, ".b32.i2p")) return false;
+    const label = host[0 .. host.len - ".b32.i2p".len];
     for (label) |c| {
         const ok = (c >= 'a' and c <= 'z') or (c >= '2' and c <= '7');
         if (!ok) return false;
@@ -298,6 +354,48 @@ test "build + parse onion round trip" {
     try std.testing.expect(ann.endpoint == .onion);
     try std.testing.expectEqualStrings(onion, ann.endpoint.onion.host);
     try std.testing.expectEqual(@as(u16, 80), ann.endpoint.onion.port);
+}
+
+test "build + parse i2p round trip" {
+    const allocator = std.testing.allocator;
+    var label: [52]u8 = undefined;
+    @memset(&label, 'a');
+    var host_buf: [b32_i2p_host_len]u8 = undefined;
+    const dest = std.fmt.bufPrint(&host_buf, "{s}.b32.i2p", .{&label}) catch unreachable;
+
+    var sk: secp.SecretKey = undefined;
+    try secp.fromHex("0000000000000000000000000000000000000000000000000000000000000003", &sk);
+    const pk = try secp.publicKeyFromSecret(sk);
+
+    const info_hash: [20]u8 = .{0xCD} ** 20;
+    var ev = try buildI2p(allocator, sk, pk, info_hash, dest, 6881);
+    defer ev.deinit(allocator);
+
+    const ann = try parse(ev);
+    try std.testing.expect(ann.endpoint == .i2p);
+    try std.testing.expectEqualStrings(dest, ann.endpoint.i2p.host);
+    try std.testing.expectEqual(@as(u16, 6881), ann.endpoint.i2p.port);
+}
+
+test "isValidI2pB32Host" {
+    var label: [52]u8 = undefined;
+    @memset(&label, 'a');
+    var host_buf: [b32_i2p_host_len]u8 = undefined;
+    const ok = std.fmt.bufPrint(&host_buf, "{s}.b32.i2p", .{&label}) catch unreachable;
+    try std.testing.expect(isValidI2pB32Host(ok));
+    try std.testing.expect(!isValidI2pB32Host("short.b32.i2p"));
+    try std.testing.expect(!isValidI2pB32Host("aaaa.onion"));
+    // i2p host must not validate as onion and vice-versa
+    try std.testing.expect(!isValidV3OnionHost(ok));
+}
+
+test "buildI2p rejects non-i2p host" {
+    const allocator = std.testing.allocator;
+    var sk: secp.SecretKey = undefined;
+    try secp.fromHex("0000000000000000000000000000000000000000000000000000000000000003", &sk);
+    const pk = try secp.publicKeyFromSecret(sk);
+    const info_hash: [20]u8 = .{0} ** 20;
+    try std.testing.expectError(error.BadHost, buildI2p(allocator, sk, pk, info_hash, "nope.i2p", 80));
 }
 
 test "parse rejects private IP" {

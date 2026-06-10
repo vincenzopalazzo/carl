@@ -244,3 +244,20 @@ Optional flags: `--tor-control host:port`, `--tor-cookie path`,
 - **IPv4 only** -- consistent with the rest of carl.
 - **Connects are blocking** -- each proxied peer handshake runs synchronously
   (up to ~10s), so a batch of unreachable peers can briefly stall progress.
+
+## Tor vs I2P for BitTorrent
+
+The `--proxy`/Tor path tunnels over SOCKS5/SOCKS5h/HTTP. carl also supports
+**I2P** as a separate transport route (`--route i2p`, native SAM v3), which is
+purpose-built for P2P and avoids the Tor-over-BitTorrent baggage (Tor is slow
+for swarms, strains the network, and is leak-prone if misconfigured).
+
+| | Tor / `--proxy` | I2P (`--route i2p`) |
+|---|---|---|
+| Built for | general anonymity | peer-to-peer / file sharing |
+| BitTorrent fit | discouraged | purpose-built |
+| Addressing | `.onion` (v3) | `.b32.i2p` destination |
+| carl transport | SOCKS5h (`--proxy`/`--socks`) | native SAM v3 (`--i2p-sam`) |
+
+carl's discovery (signed NIP-35 / kind-30078 over Nostr) is the same on either
+network. See [i2p.md](i2p.md) for I2P setup and usage.

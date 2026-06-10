@@ -159,10 +159,12 @@ fn printUsage() void {
         \\  search <query> [--limit n] [--relay <wss://...>]
         \\           search nostr relays for kind-2003 torrent events
         \\  nostr-keygen                                     generate a fresh nostr key
-        \\  daemon [--port p] [--bt-port p] [--route direct|proxy|tor] [--socks url]
-        \\         [--download-dir d] [--token tok] [--parent-pid pid]
+        \\  daemon [--port p] [--bt-port p] [--route direct|proxy|tor|i2p] [--socks url]
+        \\         [--i2p-sam host:port] [--download-dir d] [--token tok] [--parent-pid pid]
         \\         [--tor-control host:port] [--tor-cookie path] [--tor-onion-port p]
         \\           run a localhost HTTP+WebSocket API for the desktop GUI.
+        \\           --route i2p connects peers over native I2P (SAM v3); set the
+        \\           SAM bridge with --i2p-sam (default 127.0.0.1:7656). See docs/i2p.md.
         \\           --tor-* configure the ControlPort used to create hidden
         \\           services for tor-route seeds (default 127.0.0.1:9051).
         \\           binds 127.0.0.1 only; every request needs the printed token
@@ -393,7 +395,7 @@ fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []c
         defer mi.deinit(allocator);
 
         std.fs.cwd().makePath(output_dir) catch {};
-        var session = carl.session.Session.init(allocator, mi, output_dir, .download, port, proxy, .any, false) catch |err| {
+        var session = carl.session.Session.init(allocator, mi, output_dir, .download, port, proxy, .any, false, null) catch |err| {
             log.err("failed to initialize session: {}", .{err});
             std.process.exit(1);
         };
@@ -434,7 +436,7 @@ fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []c
 
 fn startDownload(allocator: std.mem.Allocator, mi: carl.metainfo.Metainfo, output_dir: []const u8, port: u16, proxy: ?carl.proxy.Proxy, want_nostr: bool, want_seed: bool) void {
     std.fs.cwd().makePath(output_dir) catch {};
-    var session = carl.session.Session.init(allocator, mi, output_dir, .download, port, proxy, .any, false) catch |err| {
+    var session = carl.session.Session.init(allocator, mi, output_dir, .download, port, proxy, .any, false, null) catch |err| {
         log.err("failed to initialize session: {}", .{err});
         std.process.exit(1);
     };
@@ -570,7 +572,7 @@ fn cmdSeed(
     }
 
     const listen_bind: carl.session.ListenBind = if (tor_seed) .loopback else .any;
-    var session = carl.session.Session.init(allocator, mi, data_dir, .seed, port, null, listen_bind, tor_seed) catch |err| {
+    var session = carl.session.Session.init(allocator, mi, data_dir, .seed, port, null, listen_bind, tor_seed, null) catch |err| {
         log.err("failed to initialize session: {}", .{err});
         std.process.exit(1);
     };
@@ -864,12 +866,14 @@ fn parentWatchdog(parent_pid: std.posix.pid_t) void {
 fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u8) !void {
     const port = parsePortFlag(extra, "--port", 8088);
     const bt_port = parsePortFlag(extra, "--bt-port", 6881);
-    const route_str = parseFlag(extra, "--route") orelse "direct";
+    const route_flag = parseFlag(extra, "--route");
+    const route_str = route_flag orelse "direct";
     const route = carl.api.Route.parse(route_str) orelse {
-        log.err("invalid --route '{s}' (expected direct|proxy|tor)", .{route_str});
+        log.err("invalid --route '{s}' (expected direct|proxy|tor|i2p)", .{route_str});
         std.process.exit(1);
     };
     const socks = parseFlag(extra, "--socks") orelse "";
+    const i2p_sam = parseFlag(extra, "--i2p-sam") orelse "";
     // Default to the unified carl work dir (CARL_DIR > persisted Settings
     // value > ~/Downloads/carl) so the daemon/GUI and the CLI share one
     // download + seed directory. An explicit flag or $CARL_DIR outranks the
@@ -911,7 +915,9 @@ fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u
 
     var mgr = carl.manager.Manager.init(allocator, .{
         .route = route,
+        .route_explicit = route_flag != null,
         .socks = socks,
+        .i2p_sam = i2p_sam,
         .download_dir = download_dir,
         .download_dir_pinned = download_dir_pinned,
         .listen_port = bt_port,
@@ -955,7 +961,9 @@ fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u
 
     // On a proxy/tor route, check the SOCKS proxy up front and say clearly why
     // it's unreachable (the daemon keeps running and the GUI shows live health).
-    if (route != .direct) {
+    // The i2p route doesn't use SOCKS (SAM bridge) — probing it here would warn
+    // about Tor on a route that doesn't need it.
+    if (route.usesSocks()) {
         // Mask any user:pass@ credentials before logging the proxy URL. redactUrl
         // is credential-safe even if this buffer is too small (it then returns
         // the bare host:port), so a fixed buffer can't leak the password.
@@ -1102,6 +1110,15 @@ fn collectNostrPeers(
                     }
                     session.connectOnionPeer(ep.host, ep.port) catch continue;
                     added += 1;
+                },
+                .i2p => |ep| {
+                    // I2P peers need the daemon's `--route i2p` (a SAM session);
+                    // the bare CLI download path has no I2P transport wired.
+                    log.warn(
+                        "nostr peer {s} is an I2P destination; run the daemon with --route i2p to connect",
+                        .{ep.host},
+                    );
+                    continue;
                 },
             }
         }
