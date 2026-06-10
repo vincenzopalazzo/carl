@@ -3,9 +3,14 @@ name: Desktop Release
 # Builds the carl desktop app (Tauri) into distributable bundles.
 # Linux must be built on Linux and macOS on macOS — Tauri does not
 # cross-compile the GUI bundle — so each target runs on its own runner.
-# Trigger manually from the Actions tab or with `gh workflow run`.
+# Trigger manually from the Actions tab, or automatically on pushes to a
+# `build/**` branch (so a packaging branch produces artifacts without needing
+# the workflow on the default branch first).
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - "build/**"
 
 jobs:
   linux-x86_64:
