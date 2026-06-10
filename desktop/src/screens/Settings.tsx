@@ -229,13 +229,13 @@ function LeakCheck({ route, proxy }: { route: Route; proxy: ProxyHealth }) {
 // Routes the GUI can select as its global anonymity setting. Selecting I2P
 // makes Discover one-click downloads dial peers as `.b32.i2p` destinations
 // over the SAM bridge (default 127.0.0.1:7656); the Add modal also offers
-// Tor/I2P per transfer. I2P seeding is not supported yet (rejected by the
-// daemon — #35 P2), so tor seeds remain the private seeding path.
+// Tor/I2P per transfer, and "Seed a file" can seed over I2P (inbound via a
+// SAM STREAM FORWARD to a stable `.b32.i2p`).
 const ROUTES: [Route, string, string, string][] = [
   ["direct", "Direct", "Connect straight to peers. Fastest, no privacy.", "globe"],
   ["proxy", "SOCKS5 proxy", "Tunnel all traffic through a SOCKS5 proxy.", "shield"],
   ["tor", "Tor", "Route through the Tor network. Seed as a hidden service.", "onion"],
-  ["i2p", "I2P", "Native I2P (SAM v3). Downloads dial .b32.i2p peers; seeding not yet supported.", "shield"],
+  ["i2p", "I2P", "Native I2P (SAM v3). Download and seed over .b32.i2p destinations.", "shield"],
 ];
 
 export function SettingsScreen() {
