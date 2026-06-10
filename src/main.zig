@@ -64,26 +64,44 @@ pub fn main() !void {
             break :blk @as([]const u8, allocator.dupe(u8, parts.items) catch @panic("OOM"));
         };
         defer if (source_owned) allocator.free(source);
-        const output_dir = parseFlag(args[3..], "--output-dir") orelse ".";
+        // Default to the unified carl work dir (shared with the daemon/GUI)
+        // so downloads from any frontend land in one reseedable place.
+        var output_dir_owned: ?[]u8 = null;
+        defer if (output_dir_owned) |d| allocator.free(d);
+        const output_dir = parseFlag(args[3..], "--output-dir") orelse blk: {
+            output_dir_owned = try carl.workdir.ensure(allocator);
+            break :blk @as([]const u8, output_dir_owned.?);
+        };
         const port = parsePort(args[3..]);
         const want_nostr = parseFlagPresent(args[3..], "--nostr");
         const want_seed = parseFlagPresent(args[3..], "--seed");
         try cmdDownload(allocator, source, output_dir, port, parseProxy(args[3..]), want_nostr, want_seed);
     } else if (std.mem.eql(u8, command, "seed")) {
-        if (args.len < 4) {
-            log.err("usage: carl seed <file.torrent> <data-dir> [--port p] [--nostr] [--external-ip ip] [--tor-seed] [--tor-control addr] [--tor-cookie path] [--tor-onion-port p] [--tor-socks url] [--description \"...\"]", .{});
+        if (args.len < 3) {
+            log.err("usage: carl seed <file.torrent> [data-dir] [--port p] [--nostr] [--external-ip ip] [--tor-seed] [--tor-control addr] [--tor-cookie path] [--tor-onion-port p] [--tor-socks url] [--description \"...\"]", .{});
             std.process.exit(1);
         }
-        const port = parsePort(args[4..]);
-        const want_nostr = parseFlagPresent(args[4..], "--nostr");
-        const tor_seed = parseFlagPresent(args[4..], "--tor-seed");
-        const external_ip = parseFlag(args[4..], "--external-ip");
-        const description = parseFlag(args[4..], "--description") orelse "";
-        const tor_control = parseFlag(args[4..], "--tor-control") orelse "127.0.0.1:9051";
-        const tor_cookie = parseFlag(args[4..], "--tor-cookie");
-        const tor_onion_port: u16 = parsePortFlag(args[4..], "--tor-onion-port", 80);
-        const tor_socks_url = parseFlag(args[4..], "--tor-socks") orelse "socks5h://127.0.0.1:9050";
-        try cmdSeed(allocator, args[2], args[3], port, parseProxy(args[4..]), want_nostr, tor_seed, external_ip, description, .{
+        // data-dir is optional: when omitted (next arg is a flag or absent),
+        // seed from the unified carl work dir — the same directory downloads
+        // land in, so anything dropped there reseeds without extra arguments.
+        const has_data_dir = args.len >= 4 and !std.mem.startsWith(u8, args[3], "--");
+        const flag_args = if (has_data_dir) args[4..] else args[3..];
+        var data_dir_owned: ?[]u8 = null;
+        defer if (data_dir_owned) |d| allocator.free(d);
+        const data_dir: []const u8 = if (has_data_dir) args[3] else blk: {
+            data_dir_owned = try carl.workdir.ensure(allocator);
+            break :blk data_dir_owned.?;
+        };
+        const port = parsePort(flag_args);
+        const want_nostr = parseFlagPresent(flag_args, "--nostr");
+        const tor_seed = parseFlagPresent(flag_args, "--tor-seed");
+        const external_ip = parseFlag(flag_args, "--external-ip");
+        const description = parseFlag(flag_args, "--description") orelse "";
+        const tor_control = parseFlag(flag_args, "--tor-control") orelse "127.0.0.1:9051";
+        const tor_cookie = parseFlag(flag_args, "--tor-cookie");
+        const tor_onion_port: u16 = parsePortFlag(flag_args, "--tor-onion-port", 80);
+        const tor_socks_url = parseFlag(flag_args, "--tor-socks") orelse "socks5h://127.0.0.1:9050";
+        try cmdSeed(allocator, args[2], data_dir, port, parseProxy(flag_args), want_nostr, tor_seed, external_ip, description, .{
             .control_addr = tor_control,
             .cookie_path = tor_cookie,
             .onion_port = tor_onion_port,
@@ -123,12 +141,14 @@ fn printUsage() void {
         \\  announce <file.torrent> [--proxy url]            query tracker for peers
         \\  download <source> [--output-dir d] [--port p] [--proxy url] [--nostr] [--seed]
         \\           source: file.torrent, magnet:?..., or http(s):// URL
+        \\           --output-dir: defaults to the carl work dir (see below)
         \\           --nostr: also subscribe to nostr peer-announce events
         \\           --seed: keep seeding after the download completes
         \\                   (default: exit once the download is done)
-        \\  seed <file.torrent> <data-dir> [--port p] [--proxy url] [--nostr] [--external-ip <ip>]
+        \\  seed <file.torrent> [data-dir] [--port p] [--proxy url] [--nostr] [--external-ip <ip>]
         \\           [--tor-seed] [--tor-control host:port] [--tor-cookie path]
         \\           [--tor-onion-port p] [--tor-socks url] [--description "..."]
+        \\           data-dir: defaults to the carl work dir (see below)
         \\           --nostr: publish NIP-35 torrent event + peer-announce
         \\           --external-ip: public IPv4 for peer-announce (classic seeding)
         \\           --tor-seed: hidden service via Tor ControlPort; requires --nostr
@@ -154,6 +174,12 @@ fn printUsage() void {
         \\                http://[user:pass@]host:port     (HTTP CONNECT)
         \\                When set, DHT, UDP trackers, web seeds, and incoming
         \\                peers are disabled for anonymity.
+        \\
+        \\  work dir      the shared download + seed directory used by the CLI,
+        \\                daemon, and desktop app when no directory is given:
+        \\                $CARL_DIR, else the GUI's persisted download folder
+        \\                setting, else ~/Downloads/carl. Drop a file there and
+        \\                `carl seed <file.torrent>` (or the app) can reseed it.
         \\
     , .{}) catch {};
 }
@@ -844,7 +870,15 @@ fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u
         std.process.exit(1);
     };
     const socks = parseFlag(extra, "--socks") orelse "";
-    const download_dir = parseFlag(extra, "--download-dir") orelse "";
+    // Default to the unified carl work dir (CARL_DIR > persisted Settings
+    // value > ~/Downloads/carl) so the daemon/GUI and the CLI share one
+    // download + seed directory.
+    var download_dir_owned: ?[]u8 = null;
+    defer if (download_dir_owned) |d| allocator.free(d);
+    const download_dir = parseFlag(extra, "--download-dir") orelse blk: {
+        download_dir_owned = try carl.workdir.resolve(allocator);
+        break :blk @as([]const u8, download_dir_owned.?);
+    };
     // Tor ControlPort config for reachable `.tor` seeds (hidden services). The
     // empty defaults let Manager.init fall back to 127.0.0.1:9051 + the default
     // cookie path, matching the CLI `carl seed --tor-seed` defaults.

@@ -29,6 +29,7 @@ const peer_announce = @import("peer_announce.zig");
 const seeding = @import("seeding.zig");
 const tor_control = @import("tor_control.zig");
 const state_mod = @import("state.zig");
+const workdir = @import("workdir.zig");
 const nostr_config = @import("nostr_config.zig");
 const nostr_mod = @import("nostr.zig");
 const secp = @import("secp.zig");
@@ -561,10 +562,11 @@ pub const Manager = struct {
 
         self.mutex.lock();
         self.cfg.route = st.route;
-        // Treat "." (the bare placeholder default) as "unset" so a stale
-        // persisted "." doesn't clobber an explicit --download-dir passed on
-        // startup (e.g. the desktop shell's ~/Downloads/carl-download).
-        if (st.download_dir.len > 0 and !std.mem.eql(u8, st.download_dir, ".")) {
+        // Treat placeholder values ("", ".", and the retired desktop default
+        // ~/Downloads/carl-download) as "unset" so stale persisted state from
+        // before the unified work dir doesn't clobber the directory resolved
+        // at startup (--download-dir, or workdir's CARL_DIR/setting/default).
+        if (!workdir.isPlaceholder(self.allocator, st.download_dir)) {
             if (self.allocator.dupe(u8, st.download_dir)) |d| {
                 self.allocator.free(self.cfg.download_dir);
                 self.cfg.download_dir = d;
@@ -684,6 +686,10 @@ pub const Manager = struct {
         session.* = session_mod.Session.init(self.allocator, mi, self.cfg.download_dir, .download, self.cfg.listen_port, proxy, .any, false) catch {
             return error.SessionInitFailed;
         };
+        // Daemon downloads keep seeding once complete — the GUI lists them
+        // under Seeds, and anything in the work dir stays reseedable. The
+        // session downgrades its file handles to read-only at that point.
+        session.seed_after_complete = true;
         return .{ .session = session, .meta = mi, .info_hash = session.info_hash, .name = mi.name };
     }
 
@@ -705,6 +711,8 @@ pub const Manager = struct {
         session.info_hash = ml.info_hash; // use the magnet's hash, not SHA1("")
         session.metadata_download = extension.MetadataDownload.init(a, ml.info_hash);
         session.metadata_only = true;
+        // Same as the .torrent path: keep seeding after the download completes.
+        session.seed_after_complete = true;
         return .{ .session = session, .meta = mi, .info_hash = ml.info_hash, .name = session.meta.name };
     }
 };
