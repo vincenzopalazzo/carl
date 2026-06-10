@@ -175,7 +175,12 @@ pub const Manager = struct {
     cfg: Config,
     /// While replaying persisted state on startup, suppress per-add persistence
     /// (we write once at the end of `restore`).
-    restoring: bool = false,
+    /// True while `restoreTransfers` is replaying persisted state. Atomic because
+    /// restore now runs on a background thread (so the daemon serves while it
+    /// replays slow anonymized re-adds) and `persist` reads it from the serving
+    /// threads. `persist` no-ops while set, so each re-add doesn't rewrite the DB
+    /// — restore writes it once at the end.
+    restoring: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// The user's persisted downloadDir, kept aside while a pinned override
     /// ($CARL_DIR / --download-dir) is active: `persist` re-saves this instead
     /// of the override, so an ephemeral override never clobbers the setting on
@@ -612,7 +617,9 @@ pub const Manager = struct {
                 .size = p.total_length,
                 .up_total = p.uploaded,
                 .up = p.up_rate,
-                .leechers = 0,
+                // Peers connected to a seed are leechers pulling from us. Was
+                // hardcoded 0, so the UI never reflected active downloaders.
+                .leechers = p.peers,
                 .ratio = ratio,
                 .relays = 0,
             });
@@ -677,7 +684,7 @@ pub const Manager = struct {
     /// a no-op while `restore` is replaying. Snapshots under the lock, then does
     /// file I/O unlocked.
     pub fn persist(self: *Manager) void {
-        if (self.restoring) return;
+        if (self.restoring.load(.acquire)) return;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const aa = arena.allocator();
@@ -717,10 +724,10 @@ pub const Manager = struct {
         };
     }
 
-    /// Replay persisted state on startup: apply settings and re-add every
-    /// transfer/seed. Downloads resume from on-disk pieces; seeds re-hash their
-    /// file. Call once, before serving. Blocking.
-    pub fn restore(self: *Manager) void {
+    /// Apply persisted settings (route, download dir) synchronously. Cheap and
+    /// non-blocking, so the daemon's first snapshot already reflects them. Call
+    /// before serving; the slow transfer replay (`restoreTransfers`) runs after.
+    pub fn restoreSettings(self: *Manager) void {
         const st = (state_mod.load(self.allocator) catch |e| {
             log.warn("failed to load daemon state: {}", .{e});
             return;
@@ -751,8 +758,22 @@ pub const Manager = struct {
         }
         self.mutex.unlock();
         std.fs.cwd().makePath(self.cfg.download_dir) catch {};
+    }
 
-        self.restoring = true;
+    /// Re-add every persisted transfer/seed. Downloads resume from on-disk
+    /// pieces; seeds re-hash their file. SLOW for anonymized routes (each i2p
+    /// SAM SESSION CREATE / Tor hidden service blocks), so the daemon runs this
+    /// on a background thread (see main.zig) — it's mutex-safe against the
+    /// serving handlers, and `persist` no-ops (atomic `restoring`) until the end
+    /// so a partial replay can never rewrite the DB with fewer transfers.
+    pub fn restoreTransfers(self: *Manager) void {
+        const st = (state_mod.load(self.allocator) catch |e| {
+            log.warn("failed to load daemon state: {}", .{e});
+            return;
+        }) orelse return;
+        defer st.deinit(self.allocator);
+
+        self.restoring.store(true, .release);
         var restored: usize = 0;
         var retained: usize = 0;
         for (st.transfers) |t| {
@@ -780,13 +801,20 @@ pub const Manager = struct {
                 }
             }
         }
-        self.restoring = false;
+        self.restoring.store(false, .release);
         // Persisting here is safe even after failures: every failed spec was just
         // retained, and `persist` re-includes `retained_specs` alongside the live
         // set, so nothing is erased.
         self.persist();
         if (restored > 0) log.info("restored {d} transfer(s) from saved state", .{restored});
         if (retained > 0) log.info("kept {d} saved transfer(s) that could not be re-added", .{retained});
+    }
+
+    /// Full synchronous restore (settings + transfers). Kept for tests and the
+    /// inline fallback when the background restore thread can't be spawned.
+    pub fn restore(self: *Manager) void {
+        self.restoreSettings();
+        self.restoreTransfers();
     }
 
     /// Remove every retained spec whose source matches (the spec became live

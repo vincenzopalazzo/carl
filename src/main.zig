@@ -927,6 +927,12 @@ fn parentWatchdog(parent_pid: std.posix.pid_t) void {
     }
 }
 
+/// Replay persisted transfers off the serve path so a slow anonymized re-add
+/// (i2p SAM session / Tor hidden service) can't delay the daemon's HTTP bind.
+fn restoreInBackground(mgr: *carl.manager.Manager) void {
+    mgr.restoreTransfers();
+}
+
 fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u8) !void {
     const port = parsePortFlag(extra, "--port", 8088);
     const bt_port = parsePortFlag(extra, "--bt-port", 6881);
@@ -1013,8 +1019,22 @@ fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u
         } else |_| log.warn("invalid --parent-pid '{s}', ignoring", .{pid_str});
     }
 
-    // Restore persisted transfers/seeds + settings so a restart loses nothing.
-    mgr.restore();
+    // Restore persisted transfers/seeds + settings in the BACKGROUND so the
+    // daemon binds and answers the GUI immediately. Re-adding an anonymized
+    // transfer does a slow blocking setup (an i2p SAM SESSION CREATE, a Tor
+    // hidden service) — doing that inline froze startup for minutes with the
+    // HTTP port unbound, so the app looked empty/stateless on restart. Now the
+    // transfers re-appear in the UI as they come back. restore() is mutex-safe
+    // against the concurrently-serving handlers (it goes through the same
+    // add/persist locks). settings (route/download dir) are applied up front by
+    // restoreSettings so the very first snapshot already reflects them.
+    mgr.restoreSettings();
+    if (std.Thread.spawn(.{}, restoreInBackground, .{&mgr})) |t| {
+        t.detach();
+    } else |e| {
+        log.warn("restore thread failed to start ({}); restoring inline", .{e});
+        mgr.restore();
+    }
 
     // The token line is machine-readable (the GUI parses it); keep the format
     // stable: "token: <hex>".
