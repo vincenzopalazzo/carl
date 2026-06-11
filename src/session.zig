@@ -2032,7 +2032,8 @@ test "sampleRate counts block bytes as progress before a piece verifies" {
 /// Re-encode a resolved Metainfo into full `.torrent` bytes: a top-level dict
 /// `{ "announce", "info" }`. The info dict is decoded from `raw_info` and
 /// re-encoded canonically, so the info-hash is preserved. Caller owns the result.
-fn buildTorrentBytes(a: Allocator, meta: metainfo.Metainfo) ![]u8 {
+/// Public so the manager can checkpoint created seeds into the seeds shelf.
+pub fn buildTorrentBytes(a: Allocator, meta: metainfo.Metainfo) ![]u8 {
     const info_val = try bencode.decode(a, meta.raw_info);
     defer info_val.deinit(a);
     const entries = [_]bencode.Value.DictEntry{

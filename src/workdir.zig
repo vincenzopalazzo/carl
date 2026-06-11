@@ -69,11 +69,29 @@ pub fn ensure(a: Allocator) Allocator.Error![]u8 {
     return dir;
 }
 
+/// The restart shelf: `<base>/seeds`, a subdirectory of the work dir holding
+/// everything needed to bring transfers back after a restart — each transfer's
+/// resolved `.torrent`, checkpointed as `<infohash>.torrent`. Keeping the
+/// recipes here (instead of pointing at a magnet source or a user file
+/// elsewhere on disk) means a restart never depends on the original seeder
+/// being online or on a file outside carl's own directory. Shared convention:
+/// the `carl follow` mirror flow checkpoints its torrents the same way.
+/// Caller owns the returned slice; the directory is not created here.
+pub fn seedsDir(a: Allocator, base: []const u8) Allocator.Error![]u8 {
+    return std.fmt.allocPrint(a, "{s}/seeds", .{base});
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
 
 const testing = std.testing;
+
+test "seedsDir: appends the seeds shelf to the base dir" {
+    const dir = try seedsDir(testing.allocator, "/tmp/carl-work");
+    defer testing.allocator.free(dir);
+    try testing.expectEqualStrings("/tmp/carl-work/seeds", dir);
+}
 
 test "isPlaceholder: empty and dot are placeholders" {
     try testing.expect(isPlaceholder(testing.allocator, ""));

@@ -287,7 +287,61 @@ pub const Manager = struct {
             return err;
         };
         const magnet = if (std.mem.startsWith(u8, source, "magnet:")) source else "";
-        return self.register(built, route, t.proxy, t.socks_owned, t.i2p, null, null, want_nostr, false, magnet, source);
+        // Pin a local `.torrent` source onto the seeds shelf: the picked file
+        // can live anywhere (a file-picker temp path, a folder the user later
+        // cleans), and the restart replay would silently fail once it's gone.
+        // Persist the recipe as `<download_dir>/seeds/<infohash>.torrent`
+        // instead. Best-effort: on any failure the original source is kept.
+        var pinned: ?[]u8 = null;
+        defer if (pinned) |p| self.allocator.free(p);
+        if (magnet.len == 0 and
+            !std.mem.startsWith(u8, source, "http://") and
+            !std.mem.startsWith(u8, source, "https://"))
+        {
+            pinned = self.pinTorrentSource(source, built.info_hash);
+        }
+        return self.register(built, route, t.proxy, t.socks_owned, t.i2p, null, null, want_nostr, false, magnet, pinned orelse source);
+    }
+
+    /// Ensure the seeds shelf (`<dir>/seeds`) exists and return its path, or
+    /// null when it can't be created. Caller owns the slice.
+    fn ensureSeedsDir(self: *Manager, dir: []const u8) ?[]u8 {
+        const sdir = workdir.seedsDir(self.allocator, dir) catch return null;
+        std.fs.cwd().makePath(sdir) catch {
+            self.allocator.free(sdir);
+            return null;
+        };
+        return sdir;
+    }
+
+    /// Copy a local `.torrent` recipe onto the seeds shelf, named by
+    /// info-hash. Returns the owned shelf path, or null when the copy isn't
+    /// possible (the original path is then persisted unchanged). A source that
+    /// already is the shelf file — a restart replaying the persisted spec —
+    /// is returned as-is without rewriting it onto itself.
+    fn pinTorrentSource(self: *Manager, source: []const u8, info_hash: [20]u8) ?[]u8 {
+        var hex: [40]u8 = undefined;
+        secp.toHex(&info_hash, &hex);
+        const sdir = self.ensureSeedsDir(self.cfg.download_dir) orelse return null;
+        defer self.allocator.free(sdir);
+        const dest = std.fmt.allocPrint(self.allocator, "{s}/{s}.torrent", .{ sdir, &hex }) catch return null;
+        if (std.mem.eql(u8, dest, source)) return dest;
+
+        const data = std.fs.cwd().readFileAlloc(self.allocator, source, 10 * 1024 * 1024) catch {
+            self.allocator.free(dest);
+            return null;
+        };
+        defer self.allocator.free(data);
+        var f = std.fs.cwd().createFile(dest, .{ .truncate = true }) catch {
+            self.allocator.free(dest);
+            return null;
+        };
+        defer f.close();
+        f.writeAll(data) catch {
+            self.allocator.free(dest);
+            return null;
+        };
+        return dest;
     }
 
     /// Bind a throwaway loopback socket to discover a free port. Each `.tor`
@@ -369,6 +423,13 @@ pub const Manager = struct {
 
         var hex: [40]u8 = undefined;
         secp.toHex(&metainfo.infoHash(mi.raw_info), &hex);
+
+        // Checkpoint the created torrent onto the seeds shelf
+        // (`<download_dir>/seeds/<infohash>.torrent`): a stable artifact other
+        // tooling (e.g. the `carl follow` mirror flow) can pick up, independent
+        // of where the data file lives. Best-effort — the seed itself restores
+        // by re-hashing its data file at the persisted path.
+        self.writeSeedTorrent(&hex, mi);
 
         // Per-route seed wiring. Tor stands up a v3 hidden service; I2P opens a
         // SAM session with a stable destination and (after the listener is up)
@@ -817,6 +878,59 @@ pub const Manager = struct {
         self.restoreTransfers();
     }
 
+    /// Best-effort write of a seed's `.torrent` onto the seeds shelf; a failure
+    /// only costs the artifact (the seed still restores by re-hashing its data
+    /// file at the persisted path).
+    fn writeSeedTorrent(self: *Manager, hex: *const [40]u8, mi: metainfo.Metainfo) void {
+        const blob = session_mod.buildTorrentBytes(self.allocator, mi) catch return;
+        defer self.allocator.free(blob);
+        const sdir = self.ensureSeedsDir(self.cfg.download_dir) orelse return;
+        defer self.allocator.free(sdir);
+        const path = std.fmt.allocPrint(self.allocator, "{s}/{s}.torrent", .{ sdir, hex }) catch return;
+        defer self.allocator.free(path);
+        var f = std.fs.cwd().createFile(path, .{ .truncate = true }) catch return;
+        defer f.close();
+        f.writeAll(blob) catch {};
+    }
+
+    /// Retry every retained spec — a persisted transfer whose re-add failed at
+    /// restore (the I2P router / SAM bridge or Tor still starting, a proxy
+    /// down, a file on a not-yet-mounted disk). Called periodically by the
+    /// daemon's health loop, so a seed lost to a slow-starting router comes
+    /// back within one tick (~30s) instead of "after the next restart" — until
+    /// then the transfer existed only as an invisible DB row, which to the user
+    /// reads as "I restarted and my seed is gone". A successful re-add drops
+    /// the retained copy via `register`; failures stay retained for the next
+    /// tick (and the next restart) and are logged at debug to avoid a warning
+    /// every 30s for a genuinely-dead spec.
+    pub fn retryRetained(self: *Manager) void {
+        if (self.restoring.load(.acquire)) return;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        self.mutex.lock();
+        var specs: std.ArrayList(state_mod.TransferSpec) = .empty;
+        for (self.retained_specs.items) |s| {
+            const src = aa.dupe(u8, s.source) catch break;
+            specs.append(aa, .{ .kind = s.kind, .source = src, .route = s.route, .nostr = s.nostr }) catch break;
+        }
+        self.mutex.unlock();
+
+        for (specs.items) |t| {
+            const res = switch (t.kind) {
+                .download => self.addTransfer(t.source, t.route, t.nostr),
+                .seed => self.addSeed(t.source, t.route, t.nostr),
+            };
+            if (res) |id| {
+                self.allocator.free(id);
+                log.info("retry: restored '{s}'", .{t.source});
+            } else |e| {
+                log.debug("retry: '{s}' still unavailable: {}", .{ t.source, e });
+            }
+        }
+    }
+
     /// Remove every retained spec whose source matches (the spec became live
     /// again, or the caller is discarding it). Caller must hold `mutex` when the
     /// manager is serving (restore runs single-threaded before that).
@@ -867,8 +981,11 @@ pub const Manager = struct {
             if (mt.is_seed or mt.resolved) continue;
             const blob = mt.session.copyTorrent(self.allocator) orelse continue;
             defer self.allocator.free(blob);
-            // Name the file by info-hash (safe; the display name may contain /).
-            const path = std.fmt.allocPrint(self.allocator, "{s}/{s}.carl.torrent", .{ self.cfg.download_dir, &mt.hash_hex }) catch continue;
+            // Name the file by info-hash (safe; the display name may contain /),
+            // on the seeds shelf so every restart recipe lives in one place.
+            const sdir = self.ensureSeedsDir(self.cfg.download_dir) orelse continue;
+            defer self.allocator.free(sdir);
+            const path = std.fmt.allocPrint(self.allocator, "{s}/{s}.torrent", .{ sdir, &mt.hash_hex }) catch continue;
             var wrote = true;
             {
                 var f = std.fs.cwd().createFile(path, .{ .truncate = true }) catch {
