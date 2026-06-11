@@ -408,6 +408,43 @@ test "storage write and read roundtrip" {
     try std.testing.expectEqual(@as(u8, 0xBB), read1[0]);
 }
 
+test "readRange reads a mid-piece block spanning a file boundary" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = tmp_dir.dir.realpathAlloc(allocator, ".") catch return;
+    defer allocator.free(tmp_path);
+
+    // One 16 KiB piece split across two files (10000 + 6384 bytes), so a
+    // mid-piece range crosses the file boundary.
+    const files = [_]metainfo.FileInfo{
+        .{ .length = 10000, .path = &.{"a.bin"} },
+        .{ .length = 6384, .path = &.{"b.bin"} },
+    };
+
+    var store = Storage.init(allocator, testMeta(&files), tmp_path, true) catch return;
+    defer store.deinit();
+
+    var data: [16384]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @truncate(i);
+    try store.writePiece(0, &data);
+
+    // Serve a block-request-sized range straddling the boundary: the offset
+    // math (`index * piece_len + begin`) must hold for a non-zero `begin`.
+    const begin: u32 = 9000;
+    const length: u32 = 2000;
+    const got = try store.readRange(allocator, 0, begin, length);
+    defer allocator.free(got);
+    try std.testing.expectEqualSlices(u8, data[begin .. begin + length], got);
+
+    // And a range entirely inside the second file.
+    const got2 = try store.readRange(allocator, 0, 12000, 1000);
+    defer allocator.free(got2);
+    try std.testing.expectEqualSlices(u8, data[12000..13000], got2);
+}
+
 fn testMeta(files: []const metainfo.FileInfo) metainfo.Metainfo {
     return .{
         .announce = "http://example.com",
