@@ -246,6 +246,11 @@ pub const Daemon = struct {
             // Persist any newly-resolved magnet torrents (headless coverage; the
             // WS push also does this ~1/s when the GUI is connected).
             self.manager.checkpoint();
+            // Re-add transfers whose transport was unavailable at restore (an
+            // i2p seed restored before the router was up, a proxy that was
+            // down) so they come back within a tick instead of after the next
+            // restart — until now they existed only as invisible DB rows.
+            self.manager.retryRetained();
             var slept: u64 = 0;
             while (slept < probe_interval_ns and
                 self.running.load(.acquire) and
