@@ -40,6 +40,7 @@ test {
     _ = piece;
     _ = storage;
     _ = peer;
+    _ = session;
     _ = magnet;
     _ = extension;
     _ = dht;
