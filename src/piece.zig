@@ -74,6 +74,13 @@ pub const PieceProgress = struct {
     piece_len: u32,
     num_blocks: u32,
     received: []u8,
+    /// Blocks currently requested from some peer (in flight). Tracked
+    /// separately from `received` so the scheduler never re-requests a block
+    /// that is already on the wire — without this, every pipeline slot fills
+    /// with duplicates of the first missing block. Bits are cleared when the
+    /// owning request is released (choke, disconnect, timeout) so the block
+    /// becomes schedulable again.
+    requested: []u8,
     data: []u8,
 
     pub fn init(allocator: Allocator, index: u32, piece_len: u32) error{OutOfMemory}!PieceProgress {
@@ -81,8 +88,14 @@ pub const PieceProgress = struct {
         const recv_bytes = (num_blocks + 7) / 8;
         const received = allocator.alloc(u8, recv_bytes) catch return error.OutOfMemory;
         @memset(received, 0);
+        const requested = allocator.alloc(u8, recv_bytes) catch {
+            allocator.free(received);
+            return error.OutOfMemory;
+        };
+        @memset(requested, 0);
         const data = allocator.alloc(u8, piece_len) catch {
             allocator.free(received);
+            allocator.free(requested);
             return error.OutOfMemory;
         };
         @memset(data, 0);
@@ -91,12 +104,14 @@ pub const PieceProgress = struct {
             .piece_len = piece_len,
             .num_blocks = num_blocks,
             .received = received,
+            .requested = requested,
             .data = data,
         };
     }
 
     pub fn deinit(self: PieceProgress, allocator: Allocator) void {
         allocator.free(self.received);
+        allocator.free(self.requested);
         allocator.free(self.data);
     }
 
@@ -140,6 +155,40 @@ pub const PieceProgress = struct {
         return null;
     }
 
+    pub fn isRequested(self: PieceProgress, block_idx: u32) bool {
+        if (block_idx >= self.num_blocks) return false;
+        const byte_idx = block_idx / 8;
+        const bit_idx: u3 = @intCast(7 - (block_idx % 8));
+        return (self.requested[byte_idx] & (@as(u8, 1) << bit_idx)) != 0;
+    }
+
+    pub fn markRequested(self: *PieceProgress, block_idx: u32) void {
+        if (block_idx >= self.num_blocks) return;
+        const byte_idx = block_idx / 8;
+        const bit_idx: u3 = @intCast(7 - (block_idx % 8));
+        self.requested[byte_idx] |= @as(u8, 1) << bit_idx;
+    }
+
+    /// Release an in-flight mark (the owning request was choked away,
+    /// timed out, or its peer disconnected) so the block is schedulable again.
+    pub fn clearRequested(self: *PieceProgress, block_idx: u32) void {
+        if (block_idx >= self.num_blocks) return;
+        const byte_idx = block_idx / 8;
+        const bit_idx: u3 = @intCast(7 - (block_idx % 8));
+        self.requested[byte_idx] &= ~(@as(u8, 1) << bit_idx);
+    }
+
+    /// Return the next block that is neither received nor in flight, or null.
+    /// This is what the scheduler uses; `nextMissingBlock` (received-only) is
+    /// for completeness checks where in-flight state must not hide a block.
+    pub fn nextUnrequestedBlock(self: PieceProgress) ?u32 {
+        for (0..self.num_blocks) |i| {
+            const idx: u32 = @intCast(i);
+            if (!self.hasBlock(idx) and !self.isRequested(idx)) return idx;
+        }
+        return null;
+    }
+
     /// Compute begin offset and length for a given block index.
     pub fn blockSpec(self: PieceProgress, block_idx: u32) struct { begin: u32, length: u32 } {
         const begin = block_idx * block_size;
@@ -148,9 +197,10 @@ pub const PieceProgress = struct {
         return .{ .begin = begin, .length = length };
     }
 
-    /// Reset all received state (for retry after hash failure).
+    /// Reset all received and in-flight state (for retry after hash failure).
     pub fn reset(self: *PieceProgress) void {
         @memset(self.received, 0);
+        @memset(self.requested, 0);
         @memset(self.data, 0);
     }
 };
@@ -290,6 +340,37 @@ test "piece progress next missing block" {
     try std.testing.expectEqual(@as(?u32, 2), pp.nextMissingBlock());
     _ = pp.addBlock(32768, &([_]u8{0} ** 16384));
     try std.testing.expectEqual(@as(?u32, null), pp.nextMissingBlock());
+}
+
+test "piece progress requested tracking" {
+    const allocator = std.testing.allocator;
+    var pp = try PieceProgress.init(allocator, 0, 49152); // 3 blocks
+    defer pp.deinit(allocator);
+
+    // Scheduling marks blocks in flight: each pick advances, never repeats.
+    try std.testing.expectEqual(@as(?u32, 0), pp.nextUnrequestedBlock());
+    pp.markRequested(0);
+    try std.testing.expectEqual(@as(?u32, 1), pp.nextUnrequestedBlock());
+    pp.markRequested(1);
+    pp.markRequested(2);
+    try std.testing.expectEqual(@as(?u32, null), pp.nextUnrequestedBlock());
+
+    // `nextMissingBlock` still sees in-flight blocks as missing.
+    try std.testing.expectEqual(@as(?u32, 0), pp.nextMissingBlock());
+
+    // Releasing an in-flight block (peer choked/disconnected/timed out)
+    // makes it schedulable again.
+    pp.clearRequested(1);
+    try std.testing.expectEqual(@as(?u32, 1), pp.nextUnrequestedBlock());
+
+    // A received block stays unschedulable even with no requested bit.
+    pp.clearRequested(0);
+    _ = pp.addBlock(0, &([_]u8{0} ** 16384));
+    try std.testing.expectEqual(@as(?u32, 1), pp.nextUnrequestedBlock());
+
+    // reset() clears in-flight state too.
+    pp.reset();
+    try std.testing.expectEqual(@as(?u32, 0), pp.nextUnrequestedBlock());
 }
 
 test "piece progress block spec" {
