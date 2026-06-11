@@ -23,6 +23,21 @@ const max_peers: usize = 50;
 const unchoke_slots: usize = 4;
 const unchoke_interval_secs: i64 = 10;
 const optimistic_interval_secs: i64 = 30;
+/// How often to re-run Nostr peer discovery while a transfer has zero peers.
+/// One-shot discovery at startup isn't enough — a download whose only seed
+/// dropped (or that found nothing at first) must keep retrying or it stalls at
+/// no_peers forever. Re-querying relays is slow (~seconds per relay), so only
+/// retry when stuck at zero peers and not more often than this.
+const peer_rediscovery_interval_secs: i64 = 45;
+
+/// Periodic peer re-discovery hook. The session run loop calls `run(ctx)` on
+/// its own thread when the transfer has zero peers, so the callback can safely
+/// add peers (the peer set is single-threaded). The manager/CLI wire this to
+/// their Nostr peer-announce lookup for `--nostr` downloads.
+pub const PeerDiscovery = struct {
+    ctx: *anyopaque,
+    run: *const fn (ctx: *anyopaque) void,
+};
 
 /// Global flag for graceful shutdown on SIGINT. Atomic because it's
 /// written from a signal handler and read from event loop / test threads.
@@ -162,6 +177,12 @@ pub const Session = struct {
     /// must come up (bound to loopback only; the forward is the public face).
     /// Clearnet discovery stays off via `anonymized()` (i2p is set).
     i2p_hidden: bool,
+
+    /// Optional periodic peer re-discovery (set by the manager/CLI for `--nostr`
+    /// downloads). Invoked by the run loop when the transfer has zero peers.
+    peer_discovery: ?PeerDiscovery = null,
+    /// Timestamp of the last peer re-discovery, to rate-limit retries.
+    last_peer_discovery_s: i64 = 0,
 
     // Progress tracking
     start_time: i64,
@@ -410,9 +431,18 @@ pub const Session = struct {
         self.rate_last_out = out_bytes;
     }
 
+    /// Wire a periodic peer re-discovery callback (see `PeerDiscovery`). Call
+    /// before `run`; the loop invokes it on this thread when peers hit zero.
+    pub fn setPeerDiscovery(self: *Session, ctx: *anyopaque, run_fn: *const fn (ctx: *anyopaque) void) void {
+        self.peer_discovery = .{ .ctx = ctx, .run = run_fn };
+    }
+
     pub fn run(self: *Session) !void {
         const stdout = std.fs.File.stdout().deprecatedWriter();
         const stderr = std.fs.File.stderr().deprecatedWriter();
+        // Start the re-discovery clock now so the first retry waits a full
+        // interval after any startup discovery the caller already ran.
+        self.last_peer_discovery_s = std.time.timestamp();
 
         const act = std.posix.Sigaction{
             .handler = .{ .handler = sigintHandler },
@@ -1400,6 +1430,20 @@ pub const Session = struct {
             // DHT: retry more aggressively when we have zero peers
             if (self.peers.items.len == 0 and now - self.last_announce_time > 30) {
                 self.tryDhtPeerDiscovery() catch {};
+            }
+        }
+
+        // Nostr: while DOWNLOADING with zero peers, periodically re-query the
+        // relays for fresh peer-announces — a seed may have appeared or come
+        // back. Runs on this (the session) thread, so the callback adds peers
+        // safely. Gated on download mode + zero peers so it never duplicates a
+        // live connection, competes with an active download, or fires once the
+        // transfer has completed and is only seeding (dialing out is pointless
+        // then); rate-limited because relay queries are slow.
+        if (self.peer_discovery) |pd| {
+            if (self.mode == .download and self.peers.items.len == 0 and now - self.last_peer_discovery_s > peer_rediscovery_interval_secs) {
+                self.last_peer_discovery_s = now;
+                pd.run(pd.ctx);
             }
         }
     }
