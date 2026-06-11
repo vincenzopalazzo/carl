@@ -85,6 +85,16 @@ From then on the file is fetchable even with the laptop off — any client
 following the same npub (or downloading the magnet with `--nostr` on an
 i2p-routed daemon) finds the mirror's announce and pulls from it.
 
+## Desktop / daemon
+
+The desktop app has a **Following** tab with the same engine embedded in the
+daemon: paste an npub, pick `direct` or `i2p`, and each followed publisher
+shows its mirrored torrents with live phase (downloading → seeding) and rates.
+Follows persist in the daemon's SQLite state and are restored (resuming from
+the checkpointed torrents) on restart. The HTTP API is
+`GET/POST /api/follows` + `DELETE /api/follows/<id>` (see
+`docs/daemon-api.md`).
+
 ### Running as a service
 
 A systemd user unit (`%i` is the npub):

@@ -377,6 +377,7 @@ const Conn = struct {
             if (std.mem.eql(u8, path, "/api/relays")) return self.serveRelays();
             if (std.mem.eql(u8, path, "/api/identity")) return self.serveIdentity();
             if (std.mem.eql(u8, path, "/api/settings")) return self.serveSettings();
+            if (std.mem.eql(u8, path, "/api/follows")) return self.serveFollows();
             return self.sendStatus(.not_found);
         }
         if (std.mem.eql(u8, req.method, "POST")) {
@@ -385,12 +386,18 @@ const Conn = struct {
             if (std.mem.eql(u8, path, "/api/torrents")) return self.createTorrent(body);
             if (std.mem.eql(u8, path, "/api/search")) return self.search(req, body);
             if (std.mem.eql(u8, path, "/api/settings")) return self.updateSettings(body);
+            if (std.mem.eql(u8, path, "/api/follows")) return self.addFollow(body);
             return self.sendStatus(.not_found);
         }
         if (std.mem.eql(u8, req.method, "DELETE")) {
             if (std.mem.startsWith(u8, path, "/api/transfers/")) {
                 const id = path["/api/transfers/".len..];
                 const removed = self.daemon.manager.removeTransfer(id) catch false;
+                return self.sendStatus(if (removed) .no_content else .not_found);
+            }
+            if (std.mem.startsWith(u8, path, "/api/follows/")) {
+                const id = path["/api/follows/".len..];
+                const removed = self.daemon.manager.removeFollow(id) catch false;
                 return self.sendStatus(if (removed) .no_content else .not_found);
             }
             return self.sendStatus(.not_found);
@@ -479,7 +486,52 @@ const Conn = struct {
         try self.sendJson(.ok, j.buf.items);
     }
 
+    fn serveFollows(self: *Conn) !void {
+        const a = self.daemon.allocator;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const aa = arena.allocator();
+        const follows = try self.daemon.manager.followsSnapshot(aa);
+        var j = api.Json.init(aa);
+        try j.beginArray();
+        for (follows) |f| try api.writeFollow(&j, f);
+        try j.endArray();
+        try self.sendJson(.ok, j.buf.items);
+    }
+
     // ----- POST/DELETE handlers -----
+
+    /// POST /api/follows — body is JSON {pubkey, route?}. `pubkey` is an npub
+    /// or 64-char hex; `route` is "direct"|"i2p" (default: the configured route
+    /// when it's one of those, else direct). Returns { id }.
+    fn addFollow(self: *Conn, body: []const u8) !void {
+        const a = self.daemon.allocator;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        const parsed = std.json.parseFromSlice(std.json.Value, aa, body, .{}) catch
+            return self.sendStatus(.bad_request);
+        const obj = if (parsed.value == .object) parsed.value.object else return self.sendStatus(.bad_request);
+        const pubkey = strField(obj, "pubkey") orelse return self.sendStatus(.bad_request);
+        const default_route: api.Route = if (self.daemon.manager.cfg.route == .i2p) .i2p else .direct;
+        const route_val = api.Route.parse(strField(obj, "route") orelse "") orelse default_route;
+
+        const id = self.daemon.manager.addFollow(pubkey, route_val) catch |err| {
+            log.warn("addFollow failed: {}", .{err});
+            if (err == error.InvalidFollow) {
+                return self.sendError(.bad_request, "Invalid follow: expected an npub or 64-char hex pubkey not already followed, on the direct or i2p route.");
+            }
+            return self.sendStatus(.bad_request);
+        };
+        defer a.free(id);
+
+        var j = api.Json.init(aa);
+        try j.beginObject();
+        try j.keyString("id", id);
+        try j.endObject();
+        try self.sendJson(.ok, j.buf.items);
+    }
 
     fn addTransfer(self: *Conn, body: []const u8) !void {
         const a = self.daemon.allocator;
@@ -905,6 +957,10 @@ fn buildStateJson(arena: Allocator, daemon: *Daemon, relays: []const api.Relay, 
     try j.beginArray();
     for (seeds) |s| try api.writeSeed(&j, s);
     try j.endArray();
+    try j.key("follows");
+    try j.beginArray();
+    for (try daemon.manager.followsSnapshot(arena)) |f| try api.writeFollow(&j, f);
+    try j.endArray();
     try j.key("relays");
     try j.beginArray();
     for (relays) |r| try api.writeRelay(&j, r);
@@ -1160,6 +1216,7 @@ test "buildStateJson: produces the five top-level keys" {
     const o = p.value.object;
     try testing.expect(o.get("transfers").? == .array);
     try testing.expect(o.get("seeds").? == .array);
+    try testing.expect(o.get("follows").? == .array);
     try testing.expect(o.get("relays").? == .array);
     try testing.expect(o.get("identity").? == .object);
     try testing.expect(o.get("settings").? == .object);

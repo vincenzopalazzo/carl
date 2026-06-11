@@ -22,6 +22,8 @@ interface CarlContextValue {
   error: string | null;
   addTransfer: (source: string, route: Route, nostr: boolean) => Promise<void>;
   removeTransfer: (id: string) => Promise<void>;
+  addFollow: (pubkey: string, route: Route) => Promise<void>;
+  removeFollow: (id: string) => Promise<void>;
   search: (query: string) => Promise<import("./types").DiscoverResult[]>;
   setRoute: (route: Route) => Promise<void>;
   updateSettings: (patch: {
@@ -140,6 +142,26 @@ export function CarlProvider({ children }: { children: React.ReactNode }) {
     [refresh],
   );
 
+  const addFollow = useCallback(
+    async (pubkey: string, route: Route) => {
+      const c = clientRef.current;
+      if (!c) throw new Error("daemon not connected");
+      await c.addFollow(pubkey, route);
+      await refresh();
+    },
+    [refresh],
+  );
+
+  const removeFollow = useCallback(
+    async (id: string) => {
+      const c = clientRef.current;
+      if (!c) return;
+      await c.removeFollow(id);
+      await refresh();
+    },
+    [refresh],
+  );
+
   const search = useCallback(async (query: string) => {
     const c = clientRef.current;
     if (!c) throw new Error("daemon not connected");
@@ -188,6 +210,8 @@ export function CarlProvider({ children }: { children: React.ReactNode }) {
     error,
     addTransfer,
     removeTransfer,
+    addFollow,
+    removeFollow,
     search,
     setRoute,
     updateSettings,
