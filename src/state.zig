@@ -44,6 +44,9 @@ const SCHEMA =
     \\CREATE TABLE IF NOT EXISTS transfers(
     \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
     \\  kind TEXT NOT NULL, source TEXT NOT NULL, route TEXT NOT NULL, nostr INTEGER NOT NULL);
+    \\CREATE TABLE IF NOT EXISTS follows(
+    \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+    \\  pubkey TEXT NOT NULL, route TEXT NOT NULL);
 ;
 
 pub const Error = error{ DbOpen, DbExec, DbPrepare } || Allocator.Error;
@@ -68,15 +71,26 @@ pub const TransferSpec = struct {
     nostr: bool,
 };
 
+/// A followed publisher to re-create on restart: the pubkey (64-char hex) and
+/// the mirror route. The mirror dir is derived from the download dir + pubkey,
+/// so it's not persisted.
+pub const FollowSpec = struct {
+    pubkey: []const u8,
+    route: api.Route,
+};
+
 pub const State = struct {
     route: api.Route,
     download_dir: []const u8,
     transfers: []const TransferSpec,
+    follows: []const FollowSpec = &.{},
 
     pub fn deinit(self: State, a: Allocator) void {
         a.free(self.download_dir);
         for (self.transfers) |t| a.free(t.source);
         a.free(self.transfers);
+        for (self.follows) |f| a.free(f.pubkey);
+        a.free(self.follows);
     }
 };
 
@@ -111,12 +125,13 @@ pub fn save(
     route: api.Route,
     download_dir: []const u8,
     specs: []const TransferSpec,
+    follows: []const FollowSpec,
 ) !void {
     const dir = try nostr_config.ensureConfigDir(a);
     defer a.free(dir);
     const path = try std.fmt.allocPrintSentinel(a, "{s}/carl.db", .{dir}, 0);
     defer a.free(path);
-    try saveTo(path, route, download_dir, specs);
+    try saveTo(path, route, download_dir, specs, follows);
 }
 
 fn saveTo(
@@ -124,6 +139,7 @@ fn saveTo(
     route: api.Route,
     download_dir: []const u8,
     specs: []const TransferSpec,
+    follows: []const FollowSpec,
 ) Error!void {
     const db = try open(path);
     defer _ = sqlite3_close(db);
@@ -146,6 +162,18 @@ fn saveTo(
         bindText(stmt, 3, s.route.jsonName());
         _ = sqlite3_bind_int(stmt, 4, if (s.nostr) 1 else 0);
         if (sqlite3_step(stmt) != SQLITE_DONE) return error.DbExec;
+    }
+
+    try exec(db, "DELETE FROM follows");
+    var fstmt: ?*Stmt = null;
+    const fsql = "INSERT INTO follows(pubkey,route) VALUES(?,?)";
+    if (sqlite3_prepare_v2(db, fsql, @intCast(fsql.len), &fstmt, null) != SQLITE_OK) return error.DbPrepare;
+    defer _ = sqlite3_finalize(fstmt);
+    for (follows) |f| {
+        _ = sqlite3_reset(fstmt);
+        bindText(fstmt, 1, f.pubkey);
+        bindText(fstmt, 2, f.route.jsonName());
+        if (sqlite3_step(fstmt) != SQLITE_DONE) return error.DbExec;
     }
 
     try exec(db, "COMMIT");
@@ -191,7 +219,33 @@ fn loadFrom(a: Allocator, path: [:0]const u8) Error!State {
         try list.append(a, .{ .kind = kind, .source = src, .route = r, .nostr = nostr });
     }
 
-    return .{ .route = route, .download_dir = download_dir, .transfers = try list.toOwnedSlice(a) };
+    var follows: std.ArrayList(FollowSpec) = .empty;
+    errdefer {
+        for (follows.items) |f| a.free(f.pubkey);
+        follows.deinit(a);
+    }
+    var fstmt: ?*Stmt = null;
+    const fsql = "SELECT pubkey,route FROM follows ORDER BY id";
+    if (sqlite3_prepare_v2(db, fsql, @intCast(fsql.len), &fstmt, null) != SQLITE_OK) return error.DbPrepare;
+    defer _ = sqlite3_finalize(fstmt);
+    while (sqlite3_step(fstmt) == SQLITE_ROW) {
+        const pk = try a.dupe(u8, columnText(fstmt, 0));
+        errdefer a.free(pk);
+        const r = api.Route.parse(columnText(fstmt, 1)) orelse .direct;
+        try follows.append(a, .{ .pubkey = pk, .route = r });
+    }
+
+    const transfers = try list.toOwnedSlice(a);
+    errdefer {
+        for (transfers) |t| a.free(t.source);
+        a.free(transfers);
+    }
+    return .{
+        .route = route,
+        .download_dir = download_dir,
+        .transfers = transfers,
+        .follows = try follows.toOwnedSlice(a),
+    };
 }
 
 /// Read just the persisted `downloadDir` setting, or null when there is no
@@ -267,7 +321,7 @@ test "sqlite save/load round-trips settings + transfers" {
         .{ .kind = .download, .source = "magnet:?xt=urn:btih:abc", .route = .tor, .nostr = true },
         .{ .kind = .seed, .source = "/data/movie.tar", .route = .direct, .nostr = false },
     };
-    try saveTo(path, .proxy, "/home/u/dl", &specs);
+    try saveTo(path, .proxy, "/home/u/dl", &specs, &.{});
 
     const st = try loadFrom(a, path);
     defer st.deinit(a);
@@ -292,14 +346,43 @@ test "sqlite save replaces prior transfers (no accumulation)" {
     defer a.free(path);
 
     const one = [_]TransferSpec{.{ .kind = .download, .source = "a", .route = .direct, .nostr = false }};
-    try saveTo(path, .direct, "/x", &one);
-    try saveTo(path, .tor, "/y", &one); // overwrite
+    try saveTo(path, .direct, "/x", &one, &.{});
+    try saveTo(path, .tor, "/y", &one, &.{}); // overwrite
 
     const st = try loadFrom(a, path);
     defer st.deinit(a);
     try testing.expectEqual(@as(usize, 1), st.transfers.len);
     try testing.expectEqual(api.Route.tor, st.route);
     try testing.expectEqualStrings("/y", st.download_dir);
+}
+
+test "sqlite save/load round-trips follows" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/carl.db", .{dir}, 0);
+    defer a.free(path);
+
+    const follows = [_]FollowSpec{
+        .{ .pubkey = "16e8c40c332df0746a15d1e8c0a569af59d8da3ac0bafbe8f1c3f23156c44313", .route = .i2p },
+        .{ .pubkey = "ab" ** 32, .route = .direct },
+    };
+    try saveTo(path, .direct, "/dl", &.{}, &follows);
+
+    const st = try loadFrom(a, path);
+    defer st.deinit(a);
+    try testing.expectEqual(@as(usize, 2), st.follows.len);
+    try testing.expectEqualStrings(follows[0].pubkey, st.follows[0].pubkey);
+    try testing.expectEqual(api.Route.i2p, st.follows[0].route);
+    try testing.expectEqual(api.Route.direct, st.follows[1].route);
+
+    // Re-save with none: the table is rebuilt, not accumulated.
+    try saveTo(path, .direct, "/dl", &.{}, &.{});
+    const st2 = try loadFrom(a, path);
+    defer st2.deinit(a);
+    try testing.expectEqual(@as(usize, 0), st2.follows.len);
 }
 
 test "loadDownloadDirFrom reads the setting; empty/missing read as unset" {
@@ -314,11 +397,11 @@ test "loadDownloadDirFrom reads the setting; empty/missing read as unset" {
     // Fresh DB (schema only): no setting yet.
     try testing.expect(loadDownloadDirFrom(a, path) == null);
 
-    try saveTo(path, .direct, "/home/u/dl", &.{});
+    try saveTo(path, .direct, "/home/u/dl", &.{}, &.{});
     const got = loadDownloadDirFrom(a, path) orelse return error.TestUnexpectedResult;
     defer a.free(got);
     try testing.expectEqualStrings("/home/u/dl", got);
 
-    try saveTo(path, .direct, "", &.{});
+    try saveTo(path, .direct, "", &.{}, &.{});
     try testing.expect(loadDownloadDirFrom(a, path) == null);
 }

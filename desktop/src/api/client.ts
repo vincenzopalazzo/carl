@@ -115,6 +115,28 @@ export class DaemonClient {
     }
   }
 
+  /** Follow a publisher: mirror (download + reseed) everything they announce
+   *  via NIP-35. `pubkey` is an npub or 64-char hex; route is direct|i2p. */
+  async addFollow(pubkey: string, route: Route): Promise<{ id: string }> {
+    const res = await this.fetch("/api/follows", {
+      method: "POST",
+      body: JSON.stringify({ pubkey, route }),
+    });
+    return this.json<{ id: string }>(res);
+  }
+
+  /** Unfollow. The daemon joins the mirror's worker threads before answering,
+   *  which can take a few seconds if a relay query is mid-flight. */
+  async removeFollow(id: string): Promise<void> {
+    const res = await this.fetch(`/api/follows/${id}`, {
+      method: "DELETE",
+      signal: AbortSignal.timeout(SESSION_SETUP_TIMEOUT_MS),
+    });
+    if (!res.ok && res.status !== 404) {
+      throw new Error(`${res.status} ${res.statusText}`);
+    }
+  }
+
   async search(query: string): Promise<DiscoverResult[]> {
     const res = await this.fetch("/api/search", {
       method: "POST",

@@ -462,3 +462,22 @@ html[data-density="compact"] .trow-stat{ width:74px; flex-basis:74px; }
   .dm-hash{ display:none; }
 }
 @media (prefers-reduced-motion:reduce){ *{ animation:none!important; } }
+
+/* ============ FOLLOWING ============ */
+.fol-list{ display:flex; flex-direction:column; gap:14px; }
+.fol-card{ background:var(--bg-1); border:1px solid var(--border-soft); border-radius:var(--r-lg); overflow:hidden; }
+.fol-card:hover{ border-color:var(--border); }
+.fol-head{ display:flex; align-items:center; gap:14px; padding:14px 16px; border-bottom:1px solid var(--border-soft); background:var(--bg-2); }
+.fol-ic{ width:34px; height:34px; border-radius:9px; background:var(--accent-soft); color:var(--accent-dim);
+  display:flex; align-items:center; justify-content:center; flex:0 0 auto; }
+.fol-id{ flex:1; min-width:0; display:flex; flex-direction:column; gap:3px; }
+.fol-sub{ font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.fol-counts{ display:flex; gap:12px; font-size:11.5px; flex:0 0 auto; }
+.fol-failed{ color:var(--danger, #e06c75); }
+.fol-empty{ padding:18px 16px; font-size:12.5px; }
+.fol-trows{ display:flex; flex-direction:column; }
+.fol-trow{ display:flex; align-items:center; gap:16px; padding:var(--row-pad) 16px; border-bottom:1px solid var(--border-soft); }
+.fol-trow:last-child{ border-bottom:none; }
+.fol-trow-main{ flex:1; min-width:0; display:flex; align-items:center; gap:10px; }
+.fol-trow-bar{ flex:0 0 180px; display:flex; align-items:center; gap:8px; }
+.fol-trow-bar .pbar{ flex:1; }

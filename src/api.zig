@@ -184,6 +184,35 @@ pub const Seed = struct {
     relays: u32 = 0,
 };
 
+/// One torrent inside a followed publisher's mirror.
+pub const FollowTorrent = struct {
+    name: []const u8,
+    /// info-hash, lowercase hex (40 chars).
+    hash: []const u8,
+    /// "starting" | "downloading" | "seeding" | "failed"
+    state: []const u8,
+    pct: u8,
+    peers: u32,
+    down: u64,
+    up: u64,
+};
+
+/// A followed publisher: carl mirrors (downloads + reseeds) everything this
+/// pubkey announces via NIP-35. One row in the Following screen.
+pub const Follow = struct {
+    id: []const u8,
+    /// bech32 npub of the followed publisher.
+    npub: []const u8,
+    route: Route,
+    /// Mirror data directory.
+    dir: []const u8,
+    /// Aggregates over `torrents` (computed by the manager snapshot).
+    seeding: u32,
+    downloading: u32,
+    failed: u32,
+    torrents: []const FollowTorrent,
+};
+
 /// Local Nostr identity. The secret key (nsec) is NEVER serialized.
 pub const Identity = struct {
     /// bech32 npub, or empty if no key is configured.
@@ -472,6 +501,34 @@ pub fn writeSeed(j: *Json, s: Seed) Allocator.Error!void {
     try j.endObject();
 }
 
+pub fn writeFollowTorrent(j: *Json, t: FollowTorrent) Allocator.Error!void {
+    try j.beginObject();
+    try j.keyString("name", t.name);
+    try j.keyString("hash", t.hash);
+    try j.keyString("state", t.state);
+    try j.keyNumber("pct", t.pct);
+    try j.keyNumber("peers", t.peers);
+    try j.keyNumber("down", t.down);
+    try j.keyNumber("up", t.up);
+    try j.endObject();
+}
+
+pub fn writeFollow(j: *Json, f: Follow) Allocator.Error!void {
+    try j.beginObject();
+    try j.keyString("id", f.id);
+    try j.keyString("npub", f.npub);
+    try j.keyString("route", f.route.jsonName());
+    try j.keyString("dir", f.dir);
+    try j.keyNumber("seeding", f.seeding);
+    try j.keyNumber("downloading", f.downloading);
+    try j.keyNumber("failed", f.failed);
+    try j.key("torrents");
+    try j.beginArray();
+    for (f.torrents) |t| try writeFollowTorrent(j, t);
+    try j.endArray();
+    try j.endObject();
+}
+
 pub fn writeIdentity(j: *Json, id: Identity) Allocator.Error!void {
     try j.beginObject();
     try j.keyString("npub", id.npub);
@@ -683,6 +740,38 @@ test "writeSeed: upTotal camelCase and float ratio" {
     try testing.expectEqual(@as(i64, 382), o.get("upTotal").?.integer);
     try testing.expectApproxEqAbs(@as(f64, 3.41), o.get("ratio").?.float, 0.001);
     try testing.expectEqualStrings("abc.onion", o.get("onion").?.string);
+}
+
+test "writeFollow: nested torrents round-trip through std.json" {
+    const allocator = testing.allocator;
+    const torrents = [_]FollowTorrent{
+        .{ .name = "a.bin", .hash = "aa" ** 20, .state = "seeding", .pct = 100, .peers = 2, .down = 0, .up = 1024 },
+        .{ .name = "b.bin", .hash = "bb" ** 20, .state = "downloading", .pct = 40, .peers = 1, .down = 2048, .up = 0 },
+    };
+    const f = Follow{
+        .id = "f1",
+        .npub = "npub1test",
+        .route = .i2p,
+        .dir = "/data/follow-abc",
+        .seeding = 1,
+        .downloading = 1,
+        .failed = 0,
+        .torrents = &torrents,
+    };
+    var j = Json.init(allocator);
+    defer j.deinit();
+    try writeFollow(&j, f);
+
+    var p = try parse(allocator, j.buf.items);
+    defer p.deinit();
+    const o = p.value.object;
+    try testing.expectEqualStrings("npub1test", o.get("npub").?.string);
+    try testing.expectEqualStrings("i2p", o.get("route").?.string);
+    try testing.expectEqual(@as(i64, 1), o.get("seeding").?.integer);
+    const ts = o.get("torrents").?.array.items;
+    try testing.expectEqual(@as(usize, 2), ts.len);
+    try testing.expectEqualStrings("seeding", ts[0].object.get("state").?.string);
+    try testing.expectEqual(@as(i64, 40), ts[1].object.get("pct").?.integer);
 }
 
 test "Route.parse round-trips names" {

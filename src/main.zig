@@ -123,8 +123,16 @@ pub fn main() !void {
         const limit = parseUnsignedFlag(args[3..], "--limit", 50);
         const single_relay = parseFlag(args[3..], "--relay");
         try cmdSearch(allocator, stdout, args[2], limit, single_relay, parseProxy(args[3..]));
+    } else if (std.mem.eql(u8, command, "follow")) {
+        if (args.len < 3) {
+            log.err("usage: carl follow <npub|pubkey-hex> [--route direct|i2p] [--dir d] [--i2p-sam host:port] [--external-ip ip] [--interval secs]", .{});
+            std.process.exit(1);
+        }
+        try cmdFollow(allocator, args[2], args[3..]);
     } else if (std.mem.eql(u8, command, "nostr-keygen")) {
         try cmdNostrKeygen(allocator, stdout);
+    } else if (std.mem.eql(u8, command, "whoami")) {
+        try cmdWhoami(allocator, stdout);
     } else if (std.mem.eql(u8, command, "daemon")) {
         try cmdDaemon(allocator, stdout, args[2..]);
     } else {
@@ -163,7 +171,16 @@ fn printUsage() void {
         \\           -o defaults to <name>.torrent in the current directory.
         \\  search <query> [--limit n] [--relay <wss://...>]
         \\           search nostr relays for kind-2003 torrent events
+        \\  follow <npub|pubkey-hex> [--route direct|i2p] [--dir d] [--i2p-sam host:port]
+        \\         [--external-ip ip] [--interval secs]
+        \\           mirror a publisher: download every torrent they announce on
+        \\           nostr (NIP-35) and reseed it, publishing our own
+        \\           peer-announce so leechers can dial this mirror.
+        \\           --route i2p: download AND reseed over I2P (stable .b32.i2p
+        \\           per torrent); --external-ip enables dialable direct announces.
+        \\           --dir defaults to <work dir>/follow-<pubkey prefix>.
         \\  nostr-keygen                                     generate a fresh nostr key
+        \\  whoami                                           print the configured identity's npub
         \\  daemon [--port p] [--bt-port p] [--route direct|proxy|tor|i2p] [--socks url]
         \\         [--i2p-sam host:port] [--download-dir d] [--token tok] [--parent-pid pid]
         \\         [--tor-control host:port] [--tor-cookie path] [--tor-onion-port p]
@@ -874,6 +891,61 @@ fn printSearchResult(stdout: anytype, entry: carl.nip35.TorrentEntry) !void {
 }
 
 // -------------------------------------------------------------------------
+// `carl follow` — mirror everything a Nostr pubkey publishes
+// -------------------------------------------------------------------------
+
+fn cmdFollow(allocator: std.mem.Allocator, pubkey_arg: []const u8, extra: []const [:0]u8) !void {
+    const pubkey = carl.follow.parsePubkeyArg(pubkey_arg) catch {
+        log.err("invalid pubkey '{s}' (expected npub1... or 64-char hex)", .{pubkey_arg});
+        std.process.exit(1);
+    };
+
+    const route_str = parseFlag(extra, "--route") orelse "direct";
+    const route = carl.api.Route.parse(route_str) orelse {
+        log.err("invalid --route '{s}' (expected direct|i2p)", .{route_str});
+        std.process.exit(1);
+    };
+    if (route != .direct and route != .i2p) {
+        log.err("carl follow supports --route direct|i2p (tor/proxy mirrors are a follow-up)", .{});
+        std.process.exit(1);
+    }
+
+    var external_ip: ?[4]u8 = null;
+    if (parseFlag(extra, "--external-ip")) |s| {
+        external_ip = parseIpv4(s) orelse {
+            log.err("invalid --external-ip: {s}", .{s});
+            std.process.exit(1);
+        };
+        if (!carl.peer_announce.isRoutable(external_ip.?)) {
+            log.err("--external-ip {s} is not routable; refusing to publish peer-announces", .{s});
+            std.process.exit(1);
+        }
+    }
+
+    // Default mirror dir: <workdir>/follow-<pubkey prefix>, so different
+    // followed publishers never mix data and the workdir stays reseedable.
+    var dir_owned: ?[]u8 = null;
+    defer if (dir_owned) |d| allocator.free(d);
+    const dir = parseFlag(extra, "--dir") orelse blk: {
+        var pk_hex: [64]u8 = undefined;
+        carl.secp.toHex(&pubkey, &pk_hex);
+        const base = try carl.workdir.ensure(allocator);
+        defer allocator.free(base);
+        dir_owned = try std.fmt.allocPrint(allocator, "{s}/follow-{s}", .{ base, pk_hex[0..12] });
+        break :blk @as([]const u8, dir_owned.?);
+    };
+
+    try carl.follow.run(allocator, .{
+        .pubkey = pubkey,
+        .route = route,
+        .dir = dir,
+        .i2p_sam = parseFlag(extra, "--i2p-sam") orelse "127.0.0.1:7656",
+        .external_ip = external_ip,
+        .poll_interval_s = parseUnsignedFlag(extra, "--interval", 60),
+    });
+}
+
+// -------------------------------------------------------------------------
 // `carl nostr-keygen`
 // -------------------------------------------------------------------------
 
@@ -899,6 +971,26 @@ fn cmdNostrKeygen(allocator: std.mem.Allocator, stdout: anytype) !void {
     try stdout.print("wrote nsec (secret key) to your config dir\n", .{});
     try stdout.print("npub: {s}\n", .{npub});
     try stdout.print("\nkeep your nsec private. anyone with it can publish as you.\n", .{});
+}
+
+// -------------------------------------------------------------------------
+// `carl whoami` — print the configured identity's npub
+// -------------------------------------------------------------------------
+
+fn cmdWhoami(allocator: std.mem.Allocator, stdout: anytype) !void {
+    const sk = carl.nostr_config.readSecretKey(allocator) catch {
+        log.err("no nostr identity configured; run `carl nostr-keygen` first", .{});
+        std.process.exit(1);
+    };
+    const pk = carl.secp.publicKeyFromSecret(sk) catch {
+        log.err("could not derive public key", .{});
+        std.process.exit(1);
+    };
+    const npub = try carl.nip19.encode32(allocator, .npub, pk);
+    defer allocator.free(npub);
+    var pk_hex: [64]u8 = undefined;
+    carl.secp.toHex(&pk, &pk_hex);
+    try stdout.print("npub: {s}\nhex:  {s}\n", .{ npub, &pk_hex });
 }
 
 // -------------------------------------------------------------------------

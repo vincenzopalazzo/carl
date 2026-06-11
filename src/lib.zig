@@ -30,6 +30,7 @@ pub const manager = @import("manager.zig");
 pub const daemon = @import("daemon.zig");
 pub const state = @import("state.zig");
 pub const workdir = @import("workdir.zig");
+pub const follow = @import("follow.zig");
 
 test {
     _ = bencode;
@@ -63,5 +64,6 @@ test {
     _ = daemon;
     _ = state;
     _ = workdir;
+    _ = follow;
     _ = @import("integration_test.zig");
 }

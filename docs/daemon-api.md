@@ -156,6 +156,30 @@ reachable; if it isn't, the request fails `400` with
 `{ "error": "Tor hidden service setup failed: …" }`. `direct`/`proxy` seeds
 publish only the discoverable NIP-35 metadata (no routable endpoint to announce).
 
+### `GET /api/follows` → `[Follow]`
+
+The followed publishers (see `docs/follow.md`) with their mirrored torrents and
+live per-torrent phase/progress. Also included in `GET /api/state` and the
+WebSocket push under `follows`.
+
+### `POST /api/follows`
+
+Body: `{ "pubkey": "<npub1…|64-char hex>", "route": "direct|i2p" }` (`route`
+defaults to the configured route when it's one of those, else `direct`).
+Follows the publisher: a mirror worker downloads everything that pubkey
+announces via NIP-35 and reseeds it, publishing the mirror's own kind-30078
+peer-announce under the local identity. Mirror data lands in
+`<downloadDir>/follow-<pubkey prefix>`. Returns `{ "id": "f<N>" }`; `400` with
+`{ "error": … }` on a malformed pubkey, an unsupported route, or a duplicate
+follow. Follows persist and are restored on restart (resuming from
+checkpointed torrents).
+
+### `DELETE /api/follows/<id>`
+
+Unfollow: stops the mirror worker (joins its threads — may take a few seconds
+if a relay query is mid-flight). Mirrored data stays on disk. `204` on
+success, `404` if unknown.
+
 ### `POST /api/search`
 
 Body `{ "query": "<text>" }` (or `?q=<text>`). Searches configured Nostr relays
@@ -208,6 +232,8 @@ daemon does not read client frames; closing the socket ends the push.
 `DiscoverResult`: `{ id, title, hash, size, files, trackers, desc, verified, relays:[url], author, age }`.
 `Relay`: `{ url, state: "connected|connecting|unreachable|configured", net: "clearnet|tor", events }`.
 `Seed`: `{ id, name, visibility, onion|null, size, upTotal, up, leechers, ratio, relays }`.
+`Follow`: `{ id, npub, route, dir, seeding, downloading, failed, torrents:[FollowTorrent] }`.
+`FollowTorrent`: `{ name, hash, state: "starting|downloading|seeding|failed", pct, peers, down, up }`.
 `Identity`: `{ npub: "<bech32|''>" }` — the nsec is **never** serialized.
 `Settings`: `{ route, socks, relays:[url], downloadDir, listenPort, maxActive, peerLimit, publishNip35 }`.
 

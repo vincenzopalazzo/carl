@@ -3,11 +3,17 @@ import { RouteBadge, RelayDot } from "./components/atoms";
 import { trunc } from "./components/format";
 import { useCarl } from "./api/store";
 
-export type Screen = "transfers" | "discover" | "seeding" | "settings";
+export type Screen =
+  | "transfers"
+  | "discover"
+  | "following"
+  | "seeding"
+  | "settings";
 
 const NAV: [Screen, string, string][] = [
   ["transfers", "Transfers", "transfers"],
   ["discover", "Discover", "discover"],
+  ["following", "Following", "pulse"],
   ["seeding", "Seeding", "seeding"],
   ["settings", "Settings", "settings"],
 ];
@@ -24,6 +30,7 @@ export function Sidebar({
     transfers: state.transfers.filter(
       (t) => t.status === "downloading" || t.status === "metadata",
     ).length,
+    following: (state.follows ?? []).length,
     seeding: state.seeds.length,
   };
   const connectedRelays = state.relays.filter(

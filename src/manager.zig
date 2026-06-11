@@ -32,9 +32,11 @@ const seeding = @import("seeding.zig");
 const tor_control = @import("tor_control.zig");
 const state_mod = @import("state.zig");
 const workdir = @import("workdir.zig");
+const follow_mod = @import("follow.zig");
 const nostr_config = @import("nostr_config.zig");
 const nostr_mod = @import("nostr.zig");
 const secp = @import("secp.zig");
+const nip19 = @import("nip19.zig");
 const api = @import("api.zig");
 
 const log = std.log.scoped(.manager);
@@ -55,6 +57,9 @@ pub const Error = error{
     /// than creating a seed nobody can reach.
     TorControlFailed,
     NotFound,
+    /// A follow request was invalid: a malformed pubkey, an unsupported route
+    /// (follows run on `direct` or `i2p`), or the publisher is already followed.
+    InvalidFollow,
 } || Allocator.Error;
 
 /// Daemon-level configuration mirrored to the Settings screen. String fields
@@ -167,11 +172,38 @@ const ManagedTransfer = struct {
     }
 };
 
+/// One followed publisher: the embedded mirror worker plus the metadata the
+/// daemon needs to list and persist it.
+const FollowHandle = struct {
+    allocator: Allocator,
+    id: []u8,
+    pubkey: [32]u8,
+    pk_hex: [64]u8,
+    npub: []u8,
+    route: api.Route,
+    dir: []u8,
+    mirror: *follow_mod.Mirror,
+
+    /// Stop the mirror (joins its threads — can block on in-flight relay
+    /// queries) and free everything. Call without holding the manager mutex.
+    fn destroy(self: *FollowHandle) void {
+        self.mirror.destroy();
+        self.allocator.free(self.id);
+        self.allocator.free(self.npub);
+        self.allocator.free(self.dir);
+        self.allocator.destroy(self);
+    }
+};
+
 pub const Manager = struct {
     allocator: Allocator,
     mutex: std.Thread.Mutex = .{},
     transfers: std.ArrayList(*ManagedTransfer) = .empty,
     next_id: usize = 1,
+    /// Followed publishers (mirror workers). Guarded by `mutex` like
+    /// `transfers`; handles are destroyed outside the lock (joins threads).
+    follows: std.ArrayList(*FollowHandle) = .empty,
+    next_follow_id: usize = 1,
     cfg: Config,
     /// While replaying persisted state on startup, suppress per-add persistence
     /// (we write once at the end of `restore`).
@@ -217,6 +249,8 @@ pub const Manager = struct {
 
     pub fn deinit(self: *Manager) void {
         // No lock: deinit happens after the server loop has stopped.
+        for (self.follows.items) |f| f.destroy();
+        self.follows.deinit(self.allocator);
         for (self.transfers.items) |mt| mt.destroy();
         self.transfers.deinit(self.allocator);
         for (self.retained_specs.items) |s| self.allocator.free(s.source);
@@ -631,6 +665,153 @@ pub const Manager = struct {
     }
 
     // -----------------------------------------------------------------------
+    // Follows (mirror a Nostr publisher)
+    // -----------------------------------------------------------------------
+
+    /// Follow a publisher: spawn a mirror worker that downloads + reseeds
+    /// everything `pubkey_str` (npub or 64-char hex) announces via NIP-35.
+    /// Follows run on `direct` or `i2p`. Returns the new follow id (owned by
+    /// the caller).
+    pub fn addFollow(self: *Manager, pubkey_str: []const u8, route: api.Route) Error![]u8 {
+        const pubkey = follow_mod.parsePubkeyArg(pubkey_str) catch return error.InvalidFollow;
+        if (route != .direct and route != .i2p) return error.InvalidFollow;
+
+        var pk_hex: [64]u8 = undefined;
+        secp.toHex(&pubkey, &pk_hex);
+
+        self.mutex.lock();
+        for (self.follows.items) |f| {
+            if (std.mem.eql(u8, &f.pubkey, &pubkey)) {
+                self.mutex.unlock();
+                return error.InvalidFollow; // already following
+            }
+        }
+        const id_num = self.next_follow_id;
+        self.next_follow_id += 1;
+        // Mirror data lives beside regular downloads, namespaced by publisher.
+        const dir = std.fmt.allocPrint(self.allocator, "{s}/follow-{s}", .{ self.cfg.download_dir, pk_hex[0..12] }) catch {
+            self.mutex.unlock();
+            return error.OutOfMemory;
+        };
+        const sam = self.allocator.dupe(u8, self.cfg.i2p_sam) catch {
+            self.mutex.unlock();
+            self.allocator.free(dir);
+            return error.OutOfMemory;
+        };
+        self.mutex.unlock();
+        defer self.allocator.free(sam);
+
+        // Once the handle owns these, its `destroy` frees them; the errdefers
+        // below are disarmed so a later failure can't double-free.
+        var handle_owned = false;
+        errdefer if (!handle_owned) self.allocator.free(dir);
+
+        const id = std.fmt.allocPrint(self.allocator, "f{d}", .{id_num}) catch return error.OutOfMemory;
+        errdefer if (!handle_owned) self.allocator.free(id);
+        const npub = nip19.encode32(self.allocator, .npub, pubkey) catch return error.OutOfMemory;
+        errdefer if (!handle_owned) self.allocator.free(npub);
+
+        const mirror = follow_mod.Mirror.create(self.allocator, .{
+            .pubkey = pubkey,
+            .route = route,
+            .dir = dir,
+            .i2p_sam = sam,
+        }) catch return error.OutOfMemory;
+        errdefer if (!handle_owned) mirror.destroy();
+        mirror.start() catch return error.SessionInitFailed;
+
+        const handle = self.allocator.create(FollowHandle) catch return error.OutOfMemory;
+        handle.* = .{
+            .allocator = self.allocator,
+            .id = id,
+            .pubkey = pubkey,
+            .pk_hex = pk_hex,
+            .npub = npub,
+            .route = route,
+            .dir = dir,
+            .mirror = mirror,
+        };
+        handle_owned = true;
+
+        self.mutex.lock();
+        self.follows.append(self.allocator, handle) catch {
+            self.mutex.unlock();
+            handle.destroy(); // frees id/npub/dir + stops the mirror
+            return error.OutOfMemory;
+        };
+        self.mutex.unlock();
+
+        self.persist();
+        return self.allocator.dupe(u8, id);
+    }
+
+    /// Stop and remove the follow with `id`. Returns true if found. Joins the
+    /// mirror's threads, so this can block on an in-flight relay query.
+    pub fn removeFollow(self: *Manager, id: []const u8) Error!bool {
+        self.mutex.lock();
+        var found: ?*FollowHandle = null;
+        var idx: usize = 0;
+        for (self.follows.items, 0..) |f, i| {
+            if (std.mem.eql(u8, f.id, id)) {
+                found = f;
+                idx = i;
+                break;
+            }
+        }
+        if (found) |_| _ = self.follows.orderedRemove(idx);
+        self.mutex.unlock();
+
+        if (found) |f| {
+            f.destroy(); // joins threads outside the lock
+            self.persist();
+            return true;
+        }
+        return false;
+    }
+
+    /// Snapshot all follows (with their mirrored torrents) into `arena`.
+    pub fn followsSnapshot(self: *Manager, arena: Allocator) Allocator.Error![]api.Follow {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const out = try arena.alloc(api.Follow, self.follows.items.len);
+        for (self.follows.items, 0..) |f, i| {
+            const infos = try f.mirror.torrentsSnapshot(arena);
+            const torrents = try arena.alloc(api.FollowTorrent, infos.len);
+            var seeding_n: u32 = 0;
+            var downloading_n: u32 = 0;
+            var failed_n: u32 = 0;
+            for (infos, 0..) |info, k| {
+                switch (info.phase) {
+                    .seeding => seeding_n += 1,
+                    .downloading, .starting => downloading_n += 1,
+                    .failed => failed_n += 1,
+                }
+                torrents[k] = .{
+                    .name = info.name,
+                    .hash = try arena.dupe(u8, &info.hash_hex),
+                    .state = info.phase.jsonName(),
+                    .pct = info.pct,
+                    .peers = info.peers,
+                    .down = info.down,
+                    .up = info.up,
+                };
+            }
+            out[i] = .{
+                .id = try arena.dupe(u8, f.id),
+                .npub = try arena.dupe(u8, f.npub),
+                .route = f.route,
+                .dir = try arena.dupe(u8, f.dir),
+                .seeding = seeding_n,
+                .downloading = downloading_n,
+                .failed = failed_n,
+                .torrents = torrents,
+            };
+        }
+        return out;
+    }
+
+    // -----------------------------------------------------------------------
     // Snapshots
     // -----------------------------------------------------------------------
 
@@ -778,9 +959,14 @@ pub const Manager = struct {
                 .nostr = s.nostr,
             }) catch break;
         }
+        var follow_specs: std.ArrayList(state_mod.FollowSpec) = .empty;
+        for (self.follows.items) |f| {
+            const pk = aa.dupe(u8, &f.pk_hex) catch break;
+            follow_specs.append(aa, .{ .pubkey = pk, .route = f.route }) catch break;
+        }
         self.mutex.unlock();
 
-        state_mod.save(self.allocator, route, dir, specs.items) catch |e| {
+        state_mod.save(self.allocator, route, dir, specs.items, follow_specs.items) catch |e| {
             log.warn("failed to persist daemon state: {}", .{e});
         };
     }
@@ -862,12 +1048,25 @@ pub const Manager = struct {
                 }
             }
         }
+        // Re-spawn persisted follows. A failed re-add (bad key, OOM) is logged
+        // and dropped — unlike transfers there's no transient transport setup
+        // here; the mirror itself retries its relays/peers forever once spawned.
+        var followed: usize = 0;
+        for (st.follows) |f| {
+            if (self.addFollow(f.pubkey, f.route)) |id| {
+                self.allocator.free(id);
+                followed += 1;
+            } else |e| {
+                log.warn("restore: could not re-follow '{s}': {}", .{ f.pubkey, e });
+            }
+        }
         self.restoring.store(false, .release);
         // Persisting here is safe even after failures: every failed spec was just
         // retained, and `persist` re-includes `retained_specs` alongside the live
         // set, so nothing is erased.
         self.persist();
         if (restored > 0) log.info("restored {d} transfer(s) from saved state", .{restored});
+        if (followed > 0) log.info("restored {d} follow(s) from saved state", .{followed});
         if (retained > 0) log.info("kept {d} saved transfer(s) that could not be re-added", .{retained});
     }
 

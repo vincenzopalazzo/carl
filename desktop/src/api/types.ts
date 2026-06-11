@@ -54,6 +54,30 @@ export interface Seed {
   relays: number;
 }
 
+/** One torrent inside a followed publisher's mirror. */
+export interface FollowTorrent {
+  name: string;
+  hash: string;
+  state: "starting" | "downloading" | "seeding" | "failed";
+  pct: number;
+  peers: number;
+  down: number;
+  up: number;
+}
+
+/** A followed publisher: carl mirrors (downloads + reseeds) everything this
+ *  pubkey announces via NIP-35. */
+export interface Follow {
+  id: string;
+  npub: string;
+  route: Route;
+  dir: string;
+  seeding: number;
+  downloading: number;
+  failed: number;
+  torrents: FollowTorrent[];
+}
+
 export interface Identity {
   npub: string;
 }
@@ -110,6 +134,7 @@ export interface DiscoverResult {
 export interface AppState {
   transfers: Transfer[];
   seeds: Seed[];
+  follows: Follow[];
   relays: Relay[];
   proxy: ProxyHealth;
   identity: Identity;
@@ -119,6 +144,7 @@ export interface AppState {
 export const emptyState: AppState = {
   transfers: [],
   seeds: [],
+  follows: [],
   relays: [],
   proxy: { state: "disabled", endpoint: "", detail: "" },
   identity: { npub: "" },
