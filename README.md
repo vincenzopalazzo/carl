@@ -262,6 +262,11 @@ The session manages the download lifecycle:
 - **Piece verification** -- SHA-1 hash check on every completed piece
 - **Resume** -- on startup, existing data is verified and only missing pieces are requested
 
+## Links
+
+- Source & releases: https://github.com/vincenzopalazzo/carl
+- Listed on [nostrapps.com](https://nostrapps.com/) (Nostr apps directory)
+
 ## License
 
 [GPL-2.0](LICENSE)
