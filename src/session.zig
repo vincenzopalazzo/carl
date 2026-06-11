@@ -157,6 +157,11 @@ pub const Session = struct {
     listen_bind: ListenBind,
     /// Tor hidden-service seed: no tracker/DHT (would leak or bypass Tor).
     tor_hidden: bool,
+    /// I2P inbound seed: a SAM `STREAM FORWARD` delivers remote peers to our
+    /// loopback listener, so — unlike a leech-only i2p transfer — the listener
+    /// must come up (bound to loopback only; the forward is the public face).
+    /// Clearnet discovery stays off via `anonymized()` (i2p is set).
+    i2p_hidden: bool,
 
     // Progress tracking
     start_time: i64,
@@ -173,6 +178,7 @@ pub const Session = struct {
         listen_bind: ListenBind,
         tor_hidden: bool,
         i2p: ?*i2p_sam.Session,
+        i2p_hidden: bool,
     ) !Session {
         const total_length = piece_mod.totalLength(meta.files);
         const num_pieces = piece_mod.numPieces(total_length, meta.piece_length);
@@ -223,10 +229,11 @@ pub const Session = struct {
 
         // Skip the inbound listener entirely on any anonymized transport
         // (proxy/Tor/I2P): accepting incoming clearnet peers would reveal the
-        // real IP. (Anonymized inbound — Tor hidden service / I2P — is wired
-        // separately, not via this clearnet listener.)
+        // real IP. The exception is an I2P inbound seed (`i2p_hidden`): its
+        // listener binds loopback and is fed only by the SAM forward, never the
+        // clearnet — the same shape as a Tor hidden-service seed.
         var listener: ?std.net.Server = null;
-        if (proxy == null and i2p == null and (mode == .seed or our_bitfield.count() > 0)) {
+        if (((proxy == null and i2p == null) or i2p_hidden) and (mode == .seed or our_bitfield.count() > 0)) {
             const bind_ip: [4]u8 = switch (listen_bind) {
                 .any => .{ 0, 0, 0, 0 },
                 .loopback => .{ 127, 0, 0, 1 },
@@ -272,6 +279,7 @@ pub const Session = struct {
             .i2p = i2p,
             .listen_bind = listen_bind,
             .tor_hidden = tor_hidden,
+            .i2p_hidden = i2p_hidden,
             .start_time = now,
             .last_progress_time = now,
             .last_progress_bytes = 0,

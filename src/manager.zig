@@ -24,6 +24,7 @@ const metainfo = @import("metainfo.zig");
 const magnet_mod = @import("magnet.zig");
 const proxy_mod = @import("proxy.zig");
 const i2p_sam = @import("i2p_sam.zig");
+const i2p_seed = @import("i2p_seed.zig");
 const extension = @import("extension.zig");
 const relay_mod = @import("relay.zig");
 const peer_announce = @import("peer_announce.zig");
@@ -117,6 +118,9 @@ const ManagedTransfer = struct {
     /// Tor hidden service backing a `.tor` seed (the onion leechers dial).
     /// Owned; torn down (DEL_ONION) in `destroy` after the session stops.
     hidden: ?tor_control.HiddenService,
+    /// `.b32.i2p` address of an I2P seed (what we publish + dial). Owned; freed
+    /// in `destroy`. Null for non-i2p transfers and i2p downloads.
+    i2p_host: ?[]u8,
     session: *session_mod.Session,
     meta: metainfo.Metainfo,
     thread: ?std.Thread,
@@ -147,11 +151,13 @@ const ManagedTransfer = struct {
         // gone, so we DEL_ONION only once nothing is forwarding to it.
         if (self.hidden) |*h| h.deinit();
         self.meta.deinit(self.allocator);
-        // The session (now stopped) borrowed this SAM session; tear it down last.
+        // The session (now stopped) borrowed this SAM session; tear it down last
+        // (closing it also cancels the inbound STREAM FORWARD for an i2p seed).
         if (self.i2p_session) |s| {
             s.deinit();
             self.allocator.destroy(s);
         }
+        if (self.i2p_host) |h| self.allocator.free(h);
         if (self.socks_owned) |s| self.allocator.free(s);
         self.allocator.free(self.id);
         self.allocator.free(self.name);
@@ -169,7 +175,12 @@ pub const Manager = struct {
     cfg: Config,
     /// While replaying persisted state on startup, suppress per-add persistence
     /// (we write once at the end of `restore`).
-    restoring: bool = false,
+    /// True while `restoreTransfers` is replaying persisted state. Atomic because
+    /// restore now runs on a background thread (so the daemon serves while it
+    /// replays slow anonymized re-adds) and `persist` reads it from the serving
+    /// threads. `persist` no-ops while set, so each re-add doesn't rewrite the DB
+    /// — restore writes it once at the end.
+    restoring: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// The user's persisted downloadDir, kept aside while a pinned override
     /// ($CARL_DIR / --download-dir) is active: `persist` re-saves this instead
     /// of the override, so an ephemeral override never clobbers the setting on
@@ -276,7 +287,7 @@ pub const Manager = struct {
             return err;
         };
         const magnet = if (std.mem.startsWith(u8, source, "magnet:")) source else "";
-        return self.register(built, route, t.proxy, t.socks_owned, t.i2p, null, want_nostr, false, magnet, source);
+        return self.register(built, route, t.proxy, t.socks_owned, t.i2p, null, null, want_nostr, false, magnet, source);
     }
 
     /// Bind a throwaway loopback socket to discover a free port. Each `.tor`
@@ -296,89 +307,135 @@ pub const Manager = struct {
     /// Create a torrent from a local file (or archive) and start seeding it. The
     /// file is hashed in-process — carl needs no external torrent tool. With
     /// `want_nostr`, a NIP-35 torrent event is published so it's discoverable.
+    /// Open a SAM session for an I2P **seed**, reusing a persisted destination so
+    /// the seed keeps its `.b32.i2p` address across restarts (a fresh transient
+    /// one each time would invalidate every published peer-announce). On a first
+    /// run the transient key the router returns is persisted for next time.
+    /// Caller owns the returned session.
+    fn resolveI2pSeed(self: *Manager, info_hash_hex: []const u8) Error!*i2p_sam.Session {
+        const bridge = i2p_sam.parseUrl(self.cfg.i2p_sam) catch return error.BadProxy;
+        const sam = self.allocator.create(i2p_sam.Session) catch return error.OutOfMemory;
+        errdefer self.allocator.destroy(sam);
+
+        const persisted = i2p_seed.load(self.allocator, info_hash_hex) catch null;
+        defer if (persisted) |p| self.allocator.free(p);
+        const dest: i2p_sam.Session.Dest = if (persisted) |p| .{ .priv = p } else .transient;
+
+        sam.* = i2p_sam.Session.createWithDest(self.allocator, bridge, "carl-seed", dest) catch
+            return error.SessionInitFailed;
+        // First run (no persisted key): the SESSION CREATE reply carries the full
+        // private key — save it so the address is stable next time.
+        if (persisted == null) i2p_seed.save(self.allocator, info_hash_hex, sam.destination);
+        return sam;
+    }
+
+    /// Create a torrent from a local file (or archive) and start seeding it. The
+    /// file is hashed in-process — carl needs no external torrent tool. With
+    /// `want_nostr`, a NIP-35 torrent event is published so it's discoverable.
     pub fn addSeed(self: *Manager, path: []const u8, route: api.Route, want_nostr: bool) Error![]u8 {
-        // I2P inbound seeding (STREAM ACCEPT/FORWARD + a persisted destination +
-        // an `.b32.i2p` peer-announce) is P2 follow-up work (#35). Without it an
-        // i2p seed would suppress the clearnet listener yet expose no reachable
-        // endpoint — advertised as private but unreachable. Fail closed instead
-        // of creating a dead seed.
-        if (route == .i2p) return error.UnsupportedOnI2p;
-        const t = try self.resolveTransport(route);
+        // Non-i2p transport resolves up front. The i2p route resolves its SAM
+        // session below, after the info-hash is known (its persisted seed
+        // destination is keyed by info-hash). One consolidated errdefer frees
+        // whatever's been built so far; it's disarmed (`committed = true`) right
+        // before `register`, which then owns cleanup on its own error path.
+        var t: Transport = if (route == .i2p) .{} else try self.resolveTransport(route);
+        var mi_opt: ?metainfo.Metainfo = null;
+        var session_opt: ?*session_mod.Session = null;
+        var hidden: ?tor_control.HiddenService = null;
+        var i2p_host: ?[]u8 = null;
+        var committed = false;
+        errdefer if (!committed) {
+            // Order mirrors ManagedTransfer.destroy: session (stops borrowing
+            // the SAM session) before the transport frees it.
+            if (session_opt) |s| {
+                s.deinit();
+                self.allocator.destroy(s);
+            }
+            if (mi_opt) |m| m.deinit(self.allocator);
+            if (hidden) |*h| h.deinit();
+            if (i2p_host) |h| self.allocator.free(h);
+            self.freeTransport(t);
+        };
 
         const mi = metainfo.createSingleFile(self.allocator, path, metainfo.default_piece_length) catch |e| {
-            self.freeTransport(t);
             return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,
                 else => error.InvalidTorrent,
             };
         };
+        mi_opt = mi;
         // Seed from the file's own directory so storage resolves it by name.
         const data_dir = std.fs.path.dirname(path) orelse ".";
 
-        // Tor route: stand up a v3 hidden service so leechers can actually reach
-        // this seed, and run the session as a loopback hidden-service seed (no
-        // outbound proxy, tracker/DHT suppressed) — the same wiring as the CLI's
-        // `carl seed --tor-seed`. The resolved SOCKS proxy stays as the
-        // transfer's `proxy` so `publishSeedNostr` publishes the onion announce
-        // over Tor; the session itself takes no proxy (inbound-only via the onion).
-        // Fails closed (`TorControlFailed`) rather than creating an unreachable seed.
-        var hidden: ?tor_control.HiddenService = null;
+        var hex: [40]u8 = undefined;
+        secp.toHex(&metainfo.infoHash(mi.raw_info), &hex);
+
+        // Per-route seed wiring. Tor stands up a v3 hidden service; I2P opens a
+        // SAM session with a stable destination and (after the listener is up)
+        // registers an inbound STREAM FORWARD. Both run the session as a loopback
+        // seed with clearnet discovery suppressed — the anonymity network is the
+        // public face.
         var session_proxy = t.proxy;
         var listen_bind: session_mod.ListenBind = .any;
         var tor_hidden = false;
+        var i2p_hidden = false;
         var seed_port = self.cfg.listen_port;
-        if (route == .tor) {
-            // Give each tor seed its own loopback port so concurrent tor seeds
-            // don't collide on cfg.listen_port. The onion forwards to this port.
-            seed_port = self.pickLoopbackPort() orelse self.cfg.listen_port;
-            hidden = tor_control.addOnion(self.allocator, .{
-                .control_addr = self.cfg.tor_control,
-                .cookie_path = if (self.cfg.tor_cookie.len > 0) self.cfg.tor_cookie else null,
-                .local_port = seed_port,
-                .onion_port = self.cfg.tor_onion_port,
-            }) catch {
-                self.freeTransport(t);
-                mi.deinit(self.allocator);
-                return error.TorControlFailed;
-            };
-            session_proxy = null;
-            listen_bind = .loopback;
-            tor_hidden = true;
+        switch (route) {
+            .tor => {
+                // Give each tor seed its own loopback port so concurrent tor
+                // seeds don't collide on cfg.listen_port. The onion forwards here.
+                seed_port = self.pickLoopbackPort() orelse self.cfg.listen_port;
+                hidden = tor_control.addOnion(self.allocator, .{
+                    .control_addr = self.cfg.tor_control,
+                    .cookie_path = if (self.cfg.tor_cookie.len > 0) self.cfg.tor_cookie else null,
+                    .local_port = seed_port,
+                    .onion_port = self.cfg.tor_onion_port,
+                }) catch return error.TorControlFailed;
+                session_proxy = null;
+                listen_bind = .loopback;
+                tor_hidden = true;
+            },
+            .i2p => {
+                // Own loopback port per seed; the SAM forward delivers inbound
+                // peer streams here.
+                seed_port = self.pickLoopbackPort() orelse self.cfg.listen_port;
+                t.i2p = try self.resolveI2pSeed(&hex);
+                i2p_host = i2p_sam.b32Address(self.allocator, t.i2p.?.destination) catch
+                    return error.SessionInitFailed;
+                listen_bind = .loopback;
+                i2p_hidden = true;
+            },
+            else => {},
         }
 
-        const session = self.allocator.create(session_mod.Session) catch {
-            self.freeTransport(t);
-            if (hidden) |*h| h.deinit();
-            mi.deinit(self.allocator);
-            return error.OutOfMemory;
-        };
-        session.* = session_mod.Session.init(self.allocator, mi, data_dir, .seed, seed_port, session_proxy, listen_bind, tor_hidden, t.i2p) catch {
-            self.freeTransport(t);
-            if (hidden) |*h| h.deinit();
+        const session = self.allocator.create(session_mod.Session) catch return error.OutOfMemory;
+        session.* = session_mod.Session.init(self.allocator, mi, data_dir, .seed, seed_port, session_proxy, listen_bind, tor_hidden, t.i2p, i2p_hidden) catch {
             self.allocator.destroy(session);
-            mi.deinit(self.allocator);
             return error.SessionInitFailed;
         };
-        // A tor seed whose listener didn't bind is unreachable behind its onion
-        // (e.g. a port race). Surface it rather than silently half-seeding.
-        if (route == .tor and session.listener == null) {
-            log.warn("tor seed: listener failed to bind 127.0.0.1:{d}; the onion will be unreachable", .{seed_port});
+        session_opt = session; // now initialized; the errdefer will tear it down
+        // A hidden-service / forwarded seed whose loopback listener didn't bind
+        // is unreachable behind its address — surface it rather than half-seed.
+        if ((route == .tor or route == .i2p) and session.listener == null) {
+            log.warn("{s} seed: listener failed to bind 127.0.0.1:{d}; the address will be unreachable", .{ @tagName(route), seed_port });
+        }
+        // I2P: register inbound forwarding now that the listener exists. Fail
+        // closed — a seed that can't accept inbound streams is a dead address.
+        if (route == .i2p) {
+            t.i2p.?.forward(seed_port) catch {
+                log.warn("i2p seed: STREAM FORWARD to 127.0.0.1:{d} failed; the .b32.i2p address would be unreachable", .{seed_port});
+                return error.SessionInitFailed;
+            };
+            log.info("i2p seed: forwarding {s} -> 127.0.0.1:{d}", .{ i2p_host.?, seed_port });
         }
         const built = Built{ .session = session, .meta = mi, .info_hash = session.info_hash, .name = mi.name };
 
-        var hex: [40]u8 = undefined;
-        secp.toHex(&session.info_hash, &hex);
-        const magnet = std.fmt.allocPrint(self.allocator, "magnet:?xt=urn:btih:{s}&dn={s}", .{ hex, mi.name }) catch {
-            self.freeTransport(t);
-            if (hidden) |*h| h.deinit();
-            session.deinit();
-            self.allocator.destroy(session);
-            mi.deinit(self.allocator);
+        const magnet = std.fmt.allocPrint(self.allocator, "magnet:?xt=urn:btih:{s}&dn={s}", .{ hex, mi.name }) catch
             return error.OutOfMemory;
-        };
         defer self.allocator.free(magnet);
 
-        return self.register(built, route, t.proxy, t.socks_owned, t.i2p, hidden, want_nostr, true, magnet, path);
+        committed = true; // register owns cleanup-on-error from here
+        return self.register(built, route, t.proxy, t.socks_owned, t.i2p, hidden, i2p_host, want_nostr, true, magnet, path);
     }
 
     /// Register a built session as a managed transfer and spawn its thread.
@@ -394,6 +451,7 @@ pub const Manager = struct {
         socks_owned: ?[]u8,
         i2p_session: ?*i2p_sam.Session,
         hidden: ?tor_control.HiddenService,
+        i2p_host: ?[]u8,
         want_nostr: bool,
         is_seed: bool,
         magnet_src: []const u8,
@@ -413,6 +471,7 @@ pub const Manager = struct {
                 s.deinit();
                 self.allocator.destroy(s);
             }
+            if (i2p_host) |h| self.allocator.free(h);
         };
 
         const mt = try self.allocator.create(ManagedTransfer);
@@ -448,6 +507,7 @@ pub const Manager = struct {
             .socks_owned = socks_owned,
             .proxy = resolved_proxy,
             .i2p_session = i2p_session,
+            .i2p_host = i2p_host,
             .hidden = hidden,
             .session = built.session,
             .meta = built.meta,
@@ -546,11 +606,20 @@ pub const Manager = struct {
                 .id = mt.id,
                 .name = mt.name,
                 .visibility = mt.route,
-                .onion = if (mt.hidden) |h| try arena.dupe(u8, h.onion_host) else null,
+                // `onion` carries the seed's reachable hidden address: the
+                // `.onion` for a tor seed, the `.b32.i2p` for an i2p seed.
+                .onion = if (mt.hidden) |h|
+                    try arena.dupe(u8, h.onion_host)
+                else if (mt.i2p_host) |host|
+                    try arena.dupe(u8, host)
+                else
+                    null,
                 .size = p.total_length,
                 .up_total = p.uploaded,
                 .up = p.up_rate,
-                .leechers = 0,
+                // Peers connected to a seed are leechers pulling from us. Was
+                // hardcoded 0, so the UI never reflected active downloaders.
+                .leechers = p.peers,
                 .ratio = ratio,
                 .relays = 0,
             });
@@ -615,7 +684,7 @@ pub const Manager = struct {
     /// a no-op while `restore` is replaying. Snapshots under the lock, then does
     /// file I/O unlocked.
     pub fn persist(self: *Manager) void {
-        if (self.restoring) return;
+        if (self.restoring.load(.acquire)) return;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const aa = arena.allocator();
@@ -655,10 +724,10 @@ pub const Manager = struct {
         };
     }
 
-    /// Replay persisted state on startup: apply settings and re-add every
-    /// transfer/seed. Downloads resume from on-disk pieces; seeds re-hash their
-    /// file. Call once, before serving. Blocking.
-    pub fn restore(self: *Manager) void {
+    /// Apply persisted settings (route, download dir) synchronously. Cheap and
+    /// non-blocking, so the daemon's first snapshot already reflects them. Call
+    /// before serving; the slow transfer replay (`restoreTransfers`) runs after.
+    pub fn restoreSettings(self: *Manager) void {
         const st = (state_mod.load(self.allocator) catch |e| {
             log.warn("failed to load daemon state: {}", .{e});
             return;
@@ -689,8 +758,22 @@ pub const Manager = struct {
         }
         self.mutex.unlock();
         std.fs.cwd().makePath(self.cfg.download_dir) catch {};
+    }
 
-        self.restoring = true;
+    /// Re-add every persisted transfer/seed. Downloads resume from on-disk
+    /// pieces; seeds re-hash their file. SLOW for anonymized routes (each i2p
+    /// SAM SESSION CREATE / Tor hidden service blocks), so the daemon runs this
+    /// on a background thread (see main.zig) — it's mutex-safe against the
+    /// serving handlers, and `persist` no-ops (atomic `restoring`) until the end
+    /// so a partial replay can never rewrite the DB with fewer transfers.
+    pub fn restoreTransfers(self: *Manager) void {
+        const st = (state_mod.load(self.allocator) catch |e| {
+            log.warn("failed to load daemon state: {}", .{e});
+            return;
+        }) orelse return;
+        defer st.deinit(self.allocator);
+
+        self.restoring.store(true, .release);
         var restored: usize = 0;
         var retained: usize = 0;
         for (st.transfers) |t| {
@@ -718,13 +801,20 @@ pub const Manager = struct {
                 }
             }
         }
-        self.restoring = false;
+        self.restoring.store(false, .release);
         // Persisting here is safe even after failures: every failed spec was just
         // retained, and `persist` re-includes `retained_specs` alongside the live
         // set, so nothing is erased.
         self.persist();
         if (restored > 0) log.info("restored {d} transfer(s) from saved state", .{restored});
         if (retained > 0) log.info("kept {d} saved transfer(s) that could not be re-added", .{retained});
+    }
+
+    /// Full synchronous restore (settings + transfers). Kept for tests and the
+    /// inline fallback when the background restore thread can't be spawned.
+    pub fn restore(self: *Manager) void {
+        self.restoreSettings();
+        self.restoreTransfers();
     }
 
     /// Remove every retained spec whose source matches (the spec became live
@@ -747,6 +837,12 @@ pub const Manager = struct {
     /// the caller drops the spec — there's no safe way to retain it.
     fn retainSpec(self: *Manager, t: state_mod.TransferSpec) bool {
         const src = self.allocator.dupe(u8, t.source) catch return false;
+        // `restoreTransfers` now runs on a background thread while the daemon
+        // serves, so this can race a concurrent add's `dropRetained` (and
+        // `persist`'s read) — all of which touch `retained_specs` under the
+        // mutex. Take the lock here too.
+        self.mutex.lock();
+        defer self.mutex.unlock();
         self.retained_specs.append(self.allocator, .{
             .kind = t.kind,
             .source = src,
@@ -842,7 +938,7 @@ pub const Manager = struct {
         errdefer mi.deinit(self.allocator);
         const session = self.allocator.create(session_mod.Session) catch return error.OutOfMemory;
         errdefer self.allocator.destroy(session);
-        session.* = session_mod.Session.init(self.allocator, mi, self.cfg.download_dir, .download, self.cfg.listen_port, proxy, .any, false, i2p) catch {
+        session.* = session_mod.Session.init(self.allocator, mi, self.cfg.download_dir, .download, self.cfg.listen_port, proxy, .any, false, i2p, false) catch {
             return error.SessionInitFailed;
         };
         // Daemon downloads keep seeding once complete — the GUI lists them
@@ -864,7 +960,7 @@ pub const Manager = struct {
 
         const session = a.create(session_mod.Session) catch return error.OutOfMemory;
         errdefer a.destroy(session);
-        session.* = session_mod.Session.init(a, mi, self.cfg.download_dir, .download, self.cfg.listen_port, proxy, .any, false, i2p) catch {
+        session.* = session_mod.Session.init(a, mi, self.cfg.download_dir, .download, self.cfg.listen_port, proxy, .any, false, i2p, false) catch {
             return error.SessionInitFailed;
         };
         session.info_hash = ml.info_hash; // use the magnet's hash, not SHA1("")
@@ -1130,6 +1226,10 @@ fn runThread(mt: *ManagedTransfer) void {
 fn publishSeedNostr(mt: *ManagedTransfer) void {
     const ann: seeding.Announce = if (mt.hidden) |h|
         .{ .onion = .{ .host = h.onion_host, .port = h.onion_port } }
+    else if (mt.i2p_host) |host|
+        // Port 0 = the destination's default I2CP port; our STREAM FORWARD
+        // delivers every inbound stream for the session regardless of TO_PORT.
+        .{ .i2p = .{ .host = host, .port = 0 } }
     else
         .none;
     seeding.publish(mt.allocator, mt.meta, mt.info_hash, ann, "", mt.proxy) catch |err| {
@@ -1171,7 +1271,12 @@ fn collectNostrPeers(mt: *ManagedTransfer) void {
             a.free(events);
         }
         for (events) |ev| {
-            const ann = peer_announce.parse(ev) catch continue;
+            // Other clients' announces may not parse (different schema); that's
+            // not an error, just skip them (debug-only so it can't spam).
+            const ann = peer_announce.parse(ev) catch |e| {
+                log.debug("nostr discovery {s}: skipping unparsable announce: {}", .{ url, e });
+                continue;
+            };
             if (!std.mem.eql(u8, &ann.info_hash, &mt.info_hash)) continue;
             if (added >= 50) break;
             switch (ann.endpoint) {

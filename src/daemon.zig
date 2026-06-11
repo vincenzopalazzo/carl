@@ -20,6 +20,7 @@ const metainfo = @import("metainfo.zig");
 const api = @import("api.zig");
 const nostr_config = @import("nostr_config.zig");
 const proxy_mod = @import("proxy.zig");
+const i2p_sam = @import("i2p_sam.zig");
 const relay_mod = @import("relay.zig");
 const nip35 = @import("nip35.zig");
 const nostr_mod = @import("nostr.zig");
@@ -148,18 +149,24 @@ pub const Daemon = struct {
         return out;
     }
 
-    /// Snapshot proxy health for the API. `endpoint` is duped into `arena`.
+    /// Snapshot transport health for the API. `endpoint` is duped into `arena`.
     /// Maps the direct route to "disabled" and the pre-first-probe window to
-    /// "checking"; otherwise reflects the last `classifySocks5` result.
+    /// "checking"; otherwise reflects the last probe. The same `proxy` health
+    /// shape carries both the SOCKS health (proxy/tor) and the SAM-bridge health
+    /// (i2p), so the GUI shows live transport status on every anonymized route.
     fn proxyHealthSnapshot(self: *Daemon, arena: Allocator) !api.ProxyHealth {
-        // Mask any SOCKS auth credentials before exposing the endpoint.
-        const raw = self.manager.cfg.socks;
-        const rbuf = try arena.alloc(u8, raw.len + 4);
-        const endpoint = try arena.dupe(u8, proxy_mod.redactUrl(raw, rbuf));
-        // direct doesn't use the SOCKS endpoint and neither does i2p (SAM
-        // bridge): reporting SOCKS state on those routes would show a bogus
-        // proxy error in the GUI.
-        if (!self.manager.cfg.route.usesSocks())
+        const route = self.manager.cfg.route;
+        // The i2p route's endpoint is the SAM bridge, not the SOCKS URL.
+        const endpoint = if (route == .i2p)
+            try arena.dupe(u8, self.manager.cfg.i2p_sam)
+        else blk: {
+            // Mask any SOCKS auth credentials before exposing the endpoint.
+            const raw = self.manager.cfg.socks;
+            const rbuf = try arena.alloc(u8, raw.len + 4);
+            break :blk try arena.dupe(u8, proxy_mod.redactUrl(raw, rbuf));
+        };
+        // Only the direct route has no transport to probe.
+        if (route == .direct)
             return .{ .state = "disabled", .endpoint = endpoint };
 
         self.health_mutex.lock();
@@ -172,25 +179,46 @@ pub const Daemon = struct {
 
         var detail: []const u8 = "";
         if (st == .rejected) {
-            if (reply) |b| {
-                detail = std.fmt.allocPrint(arena, "SOCKS5 replied 0x{x:0>2}", .{b}) catch "";
-            }
+            detail = if (route == .i2p)
+                "not a SAM bridge (no HELLO REPLY)"
+            else if (reply) |b|
+                std.fmt.allocPrint(arena, "SOCKS5 replied 0x{x:0>2}", .{b}) catch ""
+            else
+                "";
         }
         return .{ .state = st.jsonName(), .endpoint = endpoint, .detail = detail };
     }
 
-    /// Probe the SOCKS proxy once (proxy/tor route only) and cache the result.
-    /// Never opens an upstream connection (greeting only) — see classifySocks5.
+    /// Probe the active transport once and cache the result: the SOCKS proxy on
+    /// the proxy/tor route, or the SAM bridge on the i2p route. Greeting only —
+    /// never opens an upstream connection or creates a session.
     fn probeProxy(self: *Daemon) void {
-        if (!self.manager.cfg.route.usesSocks()) {
+        const route = self.manager.cfg.route;
+        if (route == .direct) {
             // Don't fabricate an "ok": mark unprobed so that if the route later
-            // switches to proxy/tor, the snapshot shows an honest "checking"
-            // until a real probe lands (rather than a stale/false "ok"). The
-            // direct and i2p routes are reported as "disabled" by the snapshot
-            // regardless (i2p talks to the SAM bridge, not the SOCKS endpoint).
+            // switches to an anonymized one, the snapshot shows an honest
+            // "checking" until a real probe lands. The direct route is reported
+            // as "disabled" by the snapshot regardless.
             self.health_mutex.lock();
             self.proxy_probed = false;
             self.health_mutex.unlock();
+            return;
+        }
+        if (route == .i2p) {
+            const bridge = i2p_sam.parseUrl(self.manager.cfg.i2p_sam) catch {
+                // Malformed SAM address is a config error; surface it as
+                // "rejected" so the route doesn't silently look healthy.
+                self.publishProxy(.rejected, null);
+                return;
+            };
+            // Map SAM health onto the shared ProxyState shape.
+            const state: proxy_mod.ProxyState = switch (i2p_sam.classifyBridge(self.allocator, bridge, 5)) {
+                .ok => .ok,
+                .not_running => .not_running,
+                .timeout => .timeout,
+                .handshake_failed => .rejected,
+            };
+            self.publishProxy(state, null);
             return;
         }
         const proxy = proxy_mod.parseUrl(self.manager.cfg.socks) catch {
@@ -481,7 +509,7 @@ const Conn = struct {
 
     /// POST /api/seeds — body is the raw file content (so a browser drag-drop or
     /// the Tauri shell can upload directly). Headers: X-Carl-Filename (required),
-    /// X-Carl-Route (direct|proxy|tor, default tor), X-Carl-Nostr (true|false).
+    /// X-Carl-Route (direct|proxy|tor|i2p, default tor), X-Carl-Nostr (true|false).
     /// Writes the file into the download dir, creates a torrent in-process, and
     /// starts seeding it; returns { id }.
     fn createSeed(self: *Conn, req: *const http.Request, body: []const u8) !void {

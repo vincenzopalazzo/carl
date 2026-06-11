@@ -78,7 +78,7 @@ pub fn main() !void {
         try cmdDownload(allocator, source, output_dir, port, parseProxy(args[3..]), want_nostr, want_seed);
     } else if (std.mem.eql(u8, command, "seed")) {
         if (args.len < 3) {
-            log.err("usage: carl seed <file.torrent> [data-dir] [--port p] [--nostr] [--external-ip ip] [--tor-seed] [--tor-control addr] [--tor-cookie path] [--tor-onion-port p] [--tor-socks url] [--description \"...\"]", .{});
+            log.err("usage: carl seed <file.torrent> [data-dir] [--port p] [--nostr] [--external-ip ip] [--tor-seed] [--tor-control addr] [--tor-cookie path] [--tor-onion-port p] [--tor-socks url] [--i2p-seed] [--i2p-sam host:port] [--description \"...\"]", .{});
             std.process.exit(1);
         }
         // data-dir is optional: when omitted (next arg is a flag or absent),
@@ -101,7 +101,9 @@ pub fn main() !void {
         const tor_cookie = parseFlag(flag_args, "--tor-cookie");
         const tor_onion_port: u16 = parsePortFlag(flag_args, "--tor-onion-port", 80);
         const tor_socks_url = parseFlag(flag_args, "--tor-socks") orelse "socks5h://127.0.0.1:9050";
-        try cmdSeed(allocator, args[2], data_dir, port, parseProxy(flag_args), want_nostr, tor_seed, external_ip, description, .{
+        const i2p_seed = parseFlagPresent(flag_args, "--i2p-seed");
+        const i2p_sam_addr = parseFlag(flag_args, "--i2p-sam") orelse "127.0.0.1:7656";
+        try cmdSeed(allocator, args[2], data_dir, port, parseProxy(flag_args), want_nostr, tor_seed, i2p_seed, i2p_sam_addr, external_ip, description, .{
             .control_addr = tor_control,
             .cookie_path = tor_cookie,
             .onion_port = tor_onion_port,
@@ -147,11 +149,14 @@ fn printUsage() void {
         \\                   (default: exit once the download is done)
         \\  seed <file.torrent> [data-dir] [--port p] [--proxy url] [--nostr] [--external-ip <ip>]
         \\           [--tor-seed] [--tor-control host:port] [--tor-cookie path]
-        \\           [--tor-onion-port p] [--tor-socks url] [--description "..."]
+        \\           [--tor-onion-port p] [--tor-socks url]
+        \\           [--i2p-seed] [--i2p-sam host:port] [--description "..."]
         \\           data-dir: defaults to the carl work dir (see below)
         \\           --nostr: publish NIP-35 torrent event + peer-announce
         \\           --external-ip: public IPv4 for peer-announce (classic seeding)
         \\           --tor-seed: hidden service via Tor ControlPort; requires --nostr
+        \\           --i2p-seed: inbound I2P seed via SAM (stable .b32.i2p); requires
+        \\                       --nostr. SAM bridge from --i2p-sam (default 127.0.0.1:7656)
         \\  create <file-or-dir> [-o out.torrent] [-t tracker]... [--comment "..."] [--piece-length bytes]
         \\           build a .torrent from a file or directory (multi-file).
         \\           -t may repeat; trackers are optional (Nostr/DHT discovery).
@@ -395,7 +400,7 @@ fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []c
         defer mi.deinit(allocator);
 
         std.fs.cwd().makePath(output_dir) catch {};
-        var session = carl.session.Session.init(allocator, mi, output_dir, .download, port, proxy, .any, false, null) catch |err| {
+        var session = carl.session.Session.init(allocator, mi, output_dir, .download, port, proxy, .any, false, null, false) catch |err| {
             log.err("failed to initialize session: {}", .{err});
             std.process.exit(1);
         };
@@ -436,7 +441,7 @@ fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []c
 
 fn startDownload(allocator: std.mem.Allocator, mi: carl.metainfo.Metainfo, output_dir: []const u8, port: u16, proxy: ?carl.proxy.Proxy, want_nostr: bool, want_seed: bool) void {
     std.fs.cwd().makePath(output_dir) catch {};
-    var session = carl.session.Session.init(allocator, mi, output_dir, .download, port, proxy, .any, false, null) catch |err| {
+    var session = carl.session.Session.init(allocator, mi, output_dir, .download, port, proxy, .any, false, null, false) catch |err| {
         log.err("failed to initialize session: {}", .{err});
         std.process.exit(1);
     };
@@ -503,24 +508,31 @@ fn cmdSeed(
     proxy: ?carl.proxy.Proxy,
     want_nostr: bool,
     tor_seed: bool,
+    i2p_seed: bool,
+    i2p_sam_addr: []const u8,
     external_ip: ?[]const u8,
     description: []const u8,
     tor_opts: TorSeedOptions,
 ) !void {
-    if (tor_seed and proxy != null) {
-        log.err("--tor-seed and --proxy are mutually exclusive on seed", .{});
+    if (tor_seed and i2p_seed) {
+        log.err("--tor-seed and --i2p-seed are mutually exclusive", .{});
         std.process.exit(1);
     }
-    if (tor_seed and !want_nostr) {
-        log.err("--tor-seed requires --nostr", .{});
+    const hidden_seed = tor_seed or i2p_seed; // an anonymity-network seed
+    if (hidden_seed and proxy != null) {
+        log.err("--tor-seed/--i2p-seed and --proxy are mutually exclusive on seed", .{});
         std.process.exit(1);
     }
-    if (tor_seed and external_ip != null) {
-        log.err("--tor-seed uses a Tor hidden service; do not pass --external-ip", .{});
+    if (hidden_seed and !want_nostr) {
+        log.err("--tor-seed/--i2p-seed requires --nostr (the address is published over Nostr)", .{});
         std.process.exit(1);
     }
-    if (want_nostr and !tor_seed and external_ip == null) {
-        log.err("--nostr requires --external-ip <ip> or --tor-seed", .{});
+    if (hidden_seed and external_ip != null) {
+        log.err("--tor-seed/--i2p-seed advertise a hidden address; do not pass --external-ip", .{});
+        std.process.exit(1);
+    }
+    if (want_nostr and !hidden_seed and external_ip == null) {
+        log.err("--nostr requires --external-ip <ip>, --tor-seed, or --i2p-seed", .{});
         std.process.exit(1);
     }
 
@@ -529,6 +541,36 @@ fn cmdSeed(
 
     var hidden: ?carl.tor_control.HiddenService = null;
     defer if (hidden) |*h| h.deinit();
+
+    // I2P seed: open a SAM session with a stable (persisted) destination, derive
+    // the `.b32.i2p`, publish it, and run the session as a loopback seed fed by
+    // a SAM STREAM FORWARD — the I2P analog of the Tor hidden-service seed.
+    var i2p_session: ?carl.i2p_sam.Session = null;
+    defer if (i2p_session) |*s| s.deinit();
+    var i2p_host_buf: [carl.i2p_sam.b32_host_len]u8 = undefined;
+    if (i2p_seed) {
+        const bridge = carl.i2p_sam.parseUrl(i2p_sam_addr) catch {
+            log.err("invalid --i2p-sam '{s}'", .{i2p_sam_addr});
+            std.process.exit(1);
+        };
+        var hex: [40]u8 = undefined;
+        carl.secp.toHex(&carl.metainfo.infoHash(mi.raw_info), &hex);
+        const persisted = carl.i2p_seed.load(allocator, &hex) catch null;
+        defer if (persisted) |p| allocator.free(p);
+        const dest: carl.i2p_sam.Session.Dest = if (persisted) |p| .{ .priv = p } else .transient;
+        i2p_session = carl.i2p_sam.Session.createWithDest(allocator, bridge, "carl-seed", dest) catch |err| {
+            log.err("i2p SAM session setup failed: {} (is the router running with SAM?)", .{err});
+            std.process.exit(1);
+        };
+        if (persisted == null) carl.i2p_seed.save(allocator, &hex, i2p_session.?.destination);
+        const host = carl.i2p_sam.b32Address(allocator, i2p_session.?.destination) catch {
+            log.err("could not derive the .b32.i2p address", .{});
+            std.process.exit(1);
+        };
+        defer allocator.free(host);
+        @memcpy(&i2p_host_buf, host);
+        log.info("i2p seed address: {s}", .{host});
+    }
 
     const nostr_proxy: ?carl.proxy.Proxy = if (tor_seed)
         parseTorSocksProxy(tor_opts.socks_url)
@@ -551,6 +593,14 @@ fn cmdSeed(
             }, description, nostr_proxy) catch |err| {
                 log.warn("nostr publish failed: {} (continuing seed)", .{err});
             };
+        } else if (i2p_seed) {
+            // Port 0 = the destination's default I2CP port; the STREAM FORWARD
+            // delivers every inbound stream for the session regardless.
+            carl.seeding.publish(allocator, mi, carl.metainfo.infoHash(mi.raw_info), .{
+                .i2p = .{ .host = &i2p_host_buf, .port = 0 },
+            }, description, null) catch |err| {
+                log.warn("nostr publish failed: {} (continuing seed)", .{err});
+            };
         } else {
             const ip = parseIpv4(external_ip.?) orelse {
                 log.err("invalid --external-ip: {s}", .{external_ip.?});
@@ -571,12 +621,26 @@ fn cmdSeed(
         }
     }
 
-    const listen_bind: carl.session.ListenBind = if (tor_seed) .loopback else .any;
-    var session = carl.session.Session.init(allocator, mi, data_dir, .seed, port, null, listen_bind, tor_seed, null) catch |err| {
+    const listen_bind: carl.session.ListenBind = if (hidden_seed) .loopback else .any;
+    const i2p_ptr: ?*carl.i2p_sam.Session = if (i2p_session) |*s| s else null;
+    var session = carl.session.Session.init(allocator, mi, data_dir, .seed, port, null, listen_bind, tor_seed, i2p_ptr, i2p_seed) catch |err| {
         log.err("failed to initialize session: {}", .{err});
         std.process.exit(1);
     };
     defer session.deinit();
+
+    // I2P seed: register inbound forwarding now that the loopback listener is up.
+    if (i2p_seed) {
+        if (session.listener == null) {
+            log.err("i2p seed: loopback listener failed to bind on port {d}; the address would be unreachable", .{port});
+            std.process.exit(1);
+        }
+        i2p_session.?.forward(port) catch |err| {
+            log.err("i2p seed: STREAM FORWARD failed: {}; the .b32.i2p would be unreachable", .{err});
+            std.process.exit(1);
+        };
+        log.info("i2p seed: forwarding {s} -> 127.0.0.1:{d}", .{ &i2p_host_buf, port });
+    }
 
     session.run() catch |err| {
         log.err("session failed: {}", .{err});
@@ -863,6 +927,12 @@ fn parentWatchdog(parent_pid: std.posix.pid_t) void {
     }
 }
 
+/// Replay persisted transfers off the serve path so a slow anonymized re-add
+/// (i2p SAM session / Tor hidden service) can't delay the daemon's HTTP bind.
+fn restoreInBackground(mgr: *carl.manager.Manager) void {
+    mgr.restoreTransfers();
+}
+
 fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u8) !void {
     const port = parsePortFlag(extra, "--port", 8088);
     const bt_port = parsePortFlag(extra, "--bt-port", 6881);
@@ -949,8 +1019,22 @@ fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u
         } else |_| log.warn("invalid --parent-pid '{s}', ignoring", .{pid_str});
     }
 
-    // Restore persisted transfers/seeds + settings so a restart loses nothing.
-    mgr.restore();
+    // Restore persisted transfers/seeds + settings in the BACKGROUND so the
+    // daemon binds and answers the GUI immediately. Re-adding an anonymized
+    // transfer does a slow blocking setup (an i2p SAM SESSION CREATE, a Tor
+    // hidden service) — doing that inline froze startup for minutes with the
+    // HTTP port unbound, so the app looked empty/stateless on restart. Now the
+    // transfers re-appear in the UI as they come back. restore() is mutex-safe
+    // against the concurrently-serving handlers (it goes through the same
+    // add/persist locks). settings (route/download dir) are applied up front by
+    // restoreSettings so the very first snapshot already reflects them.
+    mgr.restoreSettings();
+    if (std.Thread.spawn(.{}, restoreInBackground, .{&mgr})) |t| {
+        t.detach();
+    } else |e| {
+        log.warn("restore thread failed to start ({}); restoring inline", .{e});
+        mgr.restore();
+    }
 
     // The token line is machine-readable (the GUI parses it); keep the format
     // stable: "token: <hex>".

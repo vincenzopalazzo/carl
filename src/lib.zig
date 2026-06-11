@@ -20,6 +20,7 @@ pub const peer_announce = @import("peer_announce.zig");
 pub const seeding = @import("seeding.zig");
 pub const tor_control = @import("tor_control.zig");
 pub const i2p_sam = @import("i2p_sam.zig");
+pub const i2p_seed = @import("i2p_seed.zig");
 pub const relay = @import("relay.zig");
 pub const nostr_config = @import("nostr_config.zig");
 pub const api = @import("api.zig");
@@ -51,6 +52,7 @@ test {
     _ = peer_announce;
     _ = tor_control;
     _ = i2p_sam;
+    _ = i2p_seed;
     _ = relay;
     _ = nostr_config;
     _ = api;

@@ -254,6 +254,7 @@ fn seederThread(args: SeederArgs) void {
         .any,
         false,
         null,
+        false,
     ) catch return;
     defer sess.deinit();
 
@@ -332,6 +333,7 @@ test "full session seed and download over loopback" {
         .any,
         false,
         null,
+        false,
     ) catch {
         session_mod.shutdown_requested.store(true, .release);
         seeder_handle.join();
@@ -430,6 +432,7 @@ test "magnet metadata exchange then download over loopback" {
         .loopback,
         false,
         null,
+        false,
     ) catch return;
     defer seeder.deinit();
     // init opens the inbound listener for seed mode; read back the real port.
@@ -471,6 +474,7 @@ test "magnet metadata exchange then download over loopback" {
         .loopback,
         false,
         null,
+        false,
     ) catch return;
     defer dl.deinit();
     dl.info_hash = info_hash;
@@ -542,6 +546,7 @@ test "connectOnionPeer cleans up exactly once when the dial fails" {
         .any,
         false,
         null,
+        false,
     );
     defer sess.deinit();
 
@@ -593,6 +598,7 @@ test "connectI2pPeer cleans up exactly once when the SAM dial fails" {
         .any,
         false,
         &sam,
+        false,
     );
     defer sess.deinit();
 

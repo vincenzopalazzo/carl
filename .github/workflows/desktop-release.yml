@@ -1,0 +1,95 @@
+name: Desktop Release
+
+# Builds the carl desktop app (Tauri) into distributable bundles.
+# Linux must be built on Linux and macOS on macOS — Tauri does not
+# cross-compile the GUI bundle — so each target runs on its own runner.
+# Trigger manually from the Actions tab, or automatically on pushes to a
+# `build/**` branch (so a packaging branch produces artifacts without needing
+# the workflow on the default branch first).
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "build/**"
+
+jobs:
+  linux-x86_64:
+    name: Linux x86_64 (.deb + .AppImage)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tauri v2 Linux system dependencies (webkit2gtk 4.1, appindicator, rsvg).
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            build-essential \
+            file \
+            wget
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install desktop deps
+        working-directory: desktop
+        run: npm ci
+
+      # stage-sidecar.sh builds a ReleaseSafe `carl` for the host triple
+      # (x86_64-unknown-linux-gnu here) and stages it as the Tauri sidecar.
+      - name: Build bundle
+        working-directory: desktop
+        run: npx tauri build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: carl-linux-x86_64
+          path: |
+            desktop/src-tauri/target/release/bundle/deb/*.deb
+            desktop/src-tauri/target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+
+  macos:
+    name: macOS (.dmg + .app)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install desktop deps
+        working-directory: desktop
+        run: npm ci
+
+      - name: Build bundle
+        working-directory: desktop
+        run: npx tauri build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: carl-macos-aarch64
+          path: |
+            desktop/src-tauri/target/release/bundle/dmg/*.dmg
+          if-no-files-found: error

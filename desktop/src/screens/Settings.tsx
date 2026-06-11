@@ -164,6 +164,39 @@ function LeakCheck({ route, proxy }: { route: Route; proxy: ProxyHealth }) {
     );
   }
 
+  // I2P uses the SAM bridge, not SOCKS — the daemon probes it and reports its
+  // health through the same `proxy` field, so show live SAM status (the parity
+  // of the Tor SOCKS leak check).
+  if (route === "i2p") {
+    const sam = proxy.endpoint || "127.0.0.1:7656";
+    const I2P_TITLE: Record<ProxyHealth["state"], string> = {
+      ok: "SAM bridge reachable — I2P transport up",
+      checking: "Checking SAM bridge…",
+      not_running: "SAM bridge not running",
+      timeout: "SAM bridge connection timed out",
+      rejected: "Not a SAM bridge",
+      disabled: "",
+    };
+    const I2P_DETAIL: Record<ProxyHealth["state"], string> = {
+      ok: `peers dialed via ${sam} · transport fail-closed · Nostr discovery is clearnet`,
+      checking: `probing ${sam}…`,
+      not_running: `${sam} refused the connection — is your I2P router running with SAM enabled?`,
+      timeout: `${sam} timed out — check the address and that SAM is enabled`,
+      rejected: `${sam} did not speak SAM${proxy.detail ? ` · ${proxy.detail}` : ""} — is this the SAM port?`,
+      disabled: "",
+    };
+    const ok = proxy.state === "ok";
+    return (
+      <div className={"leak-check " + (ok ? "lc-safe" : "lc-warn")}>
+        <span className="lc-dot" />
+        <div className="lc-body">
+          <div className="lc-title">{I2P_TITLE[proxy.state]}</div>
+          <div className="lc-detail mono">{I2P_DETAIL[proxy.state]}</div>
+        </div>
+      </div>
+    );
+  }
+
   const ep = proxy.endpoint || "the proxy";
   const TITLE: Record<ProxyHealth["state"], string> = {
     ok: "Proxy reachable — leak check passed",
@@ -193,16 +226,16 @@ function LeakCheck({ route, proxy }: { route: Route; proxy: ProxyHealth }) {
   );
 }
 
-// Routes the GUI can select as its global anonymity setting. I2P is deliberately
-// absent: desktop downloads are Tor-only (see AddModal/Discover) and i2p seeding
-// is rejected by the daemon, so selecting i2p here would have no usable effect.
-// I2P is a daemon/CLI route (`carl daemon --route i2p`, see docs/i2p.md); the
-// Route type, ROUTE_META, badges and VIS_LABEL still carry i2p so a transfer
-// surfaced by a CLI-run daemon renders correctly.
+// Routes the GUI can select as its global anonymity setting. Selecting I2P
+// makes Discover one-click downloads dial peers as `.b32.i2p` destinations
+// over the SAM bridge (default 127.0.0.1:7656); the Add modal also offers
+// Tor/I2P per transfer, and "Seed a file" can seed over I2P (inbound via a
+// SAM STREAM FORWARD to a stable `.b32.i2p`).
 const ROUTES: [Route, string, string, string][] = [
   ["direct", "Direct", "Connect straight to peers. Fastest, no privacy.", "globe"],
   ["proxy", "SOCKS5 proxy", "Tunnel all traffic through a SOCKS5 proxy.", "shield"],
   ["tor", "Tor", "Route through the Tor network. Seed as a hidden service.", "onion"],
+  ["i2p", "I2P", "Native I2P (SAM v3). Download and seed over .b32.i2p destinations.", "shield"],
 ];
 
 export function SettingsScreen() {

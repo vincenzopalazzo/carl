@@ -15,8 +15,9 @@
 //!      for the BitTorrent handshake — the same "connected stream" contract as
 //!      `proxy.zig`.
 //!
-//! Inbound (`STREAM ACCEPT`/`FORWARD` for seeding), I2P trackers, and I2P DHT
-//! are follow-up phases; this module covers session setup + outbound dial.
+//! This module covers session setup, outbound dial (`STREAM CONNECT`), inbound
+//! seeding (`STREAM FORWARD`), bridge health probing, and `.b32.i2p` address
+//! derivation. I2P trackers and the I2P DHT are follow-up phases.
 //!
 //! Requires a running I2P router (i2pd or Java I2P) with the SAM bridge enabled.
 //! See docs/i2p.md. The handshake is synchronous and blocking (bounded by
@@ -181,6 +182,149 @@ fn hello(stream: std.net.Stream) SamError!Version {
     return parseVersion(samField(line, "VERSION") orelse "3.0");
 }
 
+// --- bridge health probe -----------------------------------------------------
+
+/// Health of the SAM bridge, the I2P analog of `proxy.ProxyState`. Lets the
+/// daemon/GUI say *why* the i2p route isn't working, the same way the Tor route
+/// reports SOCKS health, instead of failing silently.
+pub const Health = enum {
+    /// Reachable and speaks SAM v3 (`HELLO REPLY RESULT=OK`).
+    ok,
+    /// Nothing is listening on the SAM port (connection refused) — the I2P
+    /// router isn't running, or the SAM bridge is disabled.
+    not_running,
+    /// The connect or the `HELLO` handshake timed out.
+    timeout,
+    /// Reachable but did not speak SAM (no `HELLO REPLY RESULT=OK`) — e.g. the
+    /// port points at something that isn't a SAM bridge.
+    handshake_failed,
+
+    pub fn jsonName(self: Health) []const u8 {
+        return @tagName(self);
+    }
+};
+
+/// Probe the SAM bridge once: non-blocking connect (so a filtered/dead host
+/// yields a real timeout and a refused port is distinguished from a timeout —
+/// `SO_SNDTIMEO` does not bound `connect()` on macOS), then a `HELLO VERSION`
+/// handshake. Never creates a session or leaks; greeting only. Mirrors
+/// `proxy.classifySocks5`.
+pub fn classifyBridge(allocator: Allocator, bridge: Bridge, timeout_s: u32) Health {
+    const list = std.net.getAddressList(allocator, bridge.host, bridge.port) catch
+        return .not_running;
+    defer list.deinit();
+    var target: ?std.net.Address = null;
+    for (list.addrs) |a| {
+        if (a.any.family == posix.AF.INET) {
+            target = a;
+            break;
+        }
+    }
+    const addr = target orelse return .not_running;
+
+    const timeout_ms: i32 = if (timeout_s > 600) 600_000 else @intCast(timeout_s * 1000);
+    const sock = posix.socket(
+        posix.AF.INET,
+        posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
+        posix.IPPROTO.TCP,
+    ) catch return .timeout;
+    defer posix.close(sock);
+
+    const flags = posix.fcntl(sock, posix.F.GETFL, 0) catch return .timeout;
+    var o: posix.O = @bitCast(@as(u32, @truncate(flags)));
+    o.NONBLOCK = true;
+    _ = posix.fcntl(sock, posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
+
+    posix.connect(sock, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
+        error.WouldBlock => {
+            var pfd = [_]posix.pollfd{.{ .fd = sock, .events = posix.POLL.OUT, .revents = 0 }};
+            const ready = posix.poll(&pfd, timeout_ms) catch return .timeout;
+            if (ready == 0) return .timeout;
+            posix.getsockoptError(sock) catch |e| return if (e == error.ConnectionRefused) .not_running else .timeout;
+        },
+        error.ConnectionRefused => return .not_running,
+        else => return .timeout,
+    };
+
+    // Connected. Back to blocking with bounded reads/writes for the handshake.
+    o.NONBLOCK = false;
+    _ = posix.fcntl(sock, posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
+    const tv = posix.timeval{ .sec = @intCast(timeout_s), .usec = 0 };
+    posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
+    posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+
+    const stream = std.net.Stream{ .handle = sock };
+    _ = hello(stream) catch return .handshake_failed;
+    return .ok;
+}
+
+// --- destination address derivation -----------------------------------------
+
+/// I2P's base64 alphabet: standard base64 with `-` and `~` replacing `+`/`/`.
+const i2p_b64 = std.base64.Base64Decoder.init(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-~".*,
+    '=',
+);
+
+/// RFC 4648 base32 alphabet, lowercase — the form used in `.b32.i2p` hostnames.
+const b32_alphabet = "abcdefghijklmnopqrstuvwxyz234567";
+
+/// Encode `in` as unpadded lowercase base32 into `out`. Returns the slice
+/// written. `out` must hold ceil(in.len * 8 / 5) bytes (52 for a SHA-256).
+fn base32Encode(out: []u8, in: []const u8) []const u8 {
+    var acc: u32 = 0;
+    var bits: u5 = 0;
+    var n: usize = 0;
+    for (in) |b| {
+        acc = (acc << 8) | b;
+        bits += 8;
+        while (bits >= 5) {
+            bits -= 5;
+            out[n] = b32_alphabet[@as(u5, @truncate(acc >> bits))];
+            n += 1;
+        }
+    }
+    if (bits > 0) {
+        out[n] = b32_alphabet[@as(u5, @truncate(acc << (5 - bits)))];
+        n += 1;
+    }
+    return out[0..n];
+}
+
+/// Length of a `.b32.i2p` hostname: 52 base32 chars + the suffix.
+pub const b32_host_len: usize = 52 + ".b32.i2p".len;
+
+/// Derive the public `.b32.i2p` hostname from a destination in I2P base64 —
+/// either the full private key a SESSION CREATE returns (the public
+/// destination is its prefix) or a bare public destination. The address is
+/// `base32(SHA-256(destination bytes))`; the destination length is
+/// 387 + cert-length (384 key bytes, then a 3-byte certificate header whose
+/// last two bytes are the big-endian payload length).
+pub fn b32Address(allocator: Allocator, dest_b64: []const u8) SamError![]u8 {
+    const max = i2p_b64.calcSizeUpperBound(dest_b64.len) catch return error.InvalidResponse;
+    const blob = allocator.alloc(u8, max) catch return error.OutOfMemory;
+    defer allocator.free(blob);
+    const n = blk: {
+        i2p_b64.decode(blob, dest_b64) catch return error.InvalidResponse;
+        break :blk i2p_b64.calcSizeForSlice(dest_b64) catch return error.InvalidResponse;
+    };
+    if (n < 387) return error.InvalidResponse;
+    const cert_len = std.mem.readInt(u16, blob[385..387], .big);
+    const dest_len = 387 + @as(usize, cert_len);
+    if (n < dest_len) return error.InvalidResponse;
+
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(blob[0..dest_len], &digest, .{});
+
+    const host = allocator.alloc(u8, b32_host_len) catch return error.OutOfMemory;
+    errdefer allocator.free(host);
+    var b32buf: [52]u8 = undefined;
+    const enc = base32Encode(&b32buf, &digest);
+    @memcpy(host[0..enc.len], enc);
+    @memcpy(host[enc.len..], ".b32.i2p");
+    return host;
+}
+
 // --- public API ---
 
 /// A live SAM STREAM session. Owns the control connection that keeps the I2P
@@ -189,14 +333,40 @@ pub const Session = struct {
     allocator: Allocator,
     bridge: Bridge,
     id: []u8,
-    /// Our private destination (base64). Kept for P2 (seeding/announce); the
-    /// public `.b32.i2p` address is derived from it in a later phase.
+    /// Our private destination (base64). The SESSION CREATE reply always echoes
+    /// the full private key, so persisting this value and passing it back as
+    /// `.{ .priv = ... }` recreates the same destination (stable `.b32.i2p`).
     destination: []u8,
     control: std.net.Stream,
+    /// Open `STREAM FORWARD` registration (inbound). The bridge cancels the
+    /// forward when this socket closes, so it lives as long as the session.
+    forward_conn: ?std.net.Stream = null,
+
+    /// Which destination keys back the session: a fresh transient one (the
+    /// bridge generates Ed25519 keys and returns the private key), or a
+    /// previously-persisted private key, giving a stable `.b32.i2p` address.
+    pub const Dest = union(enum) {
+        transient,
+        priv: []const u8,
+    };
 
     /// Create a SAM STREAM session with a transient destination. `id_prefix` is
     /// a human label; a random suffix makes the SAM session id unique.
     pub fn create(allocator: Allocator, bridge: Bridge, id_prefix: []const u8) SamError!Session {
+        return createWithDest(allocator, bridge, id_prefix, .transient);
+    }
+
+    /// Create a SAM STREAM session backed by `dest`. With `.transient` the
+    /// bridge generates new Ed25519 keys (`SIGNATURE_TYPE=7` — the SAM default
+    /// for transient destinations is the legacy DSA-SHA1 on some routers);
+    /// with `.priv` the session reuses persisted keys and is reachable at the
+    /// same `.b32.i2p` address across restarts.
+    pub fn createWithDest(
+        allocator: Allocator,
+        bridge: Bridge,
+        id_prefix: []const u8,
+        dest: Dest,
+    ) SamError!Session {
         var control = try dial(allocator, bridge);
         errdefer control.close();
         _ = try hello(control); // control connection sends no version-gated commands
@@ -208,13 +378,21 @@ pub const Session = struct {
             return error.OutOfMemory;
         errdefer allocator.free(id);
 
-        const cmd = std.fmt.allocPrint(
-            allocator,
-            "SESSION CREATE STYLE=STREAM ID={s} DESTINATION=TRANSIENT\n",
-            .{id},
-        ) catch return error.OutOfMemory;
-        defer allocator.free(cmd);
-        try writeAll(control, cmd);
+        const cmd = switch (dest) {
+            .transient => std.fmt.allocPrint(
+                allocator,
+                "SESSION CREATE STYLE=STREAM ID={s} DESTINATION=TRANSIENT SIGNATURE_TYPE=7\n",
+                .{id},
+            ),
+            .priv => |p| std.fmt.allocPrint(
+                allocator,
+                "SESSION CREATE STYLE=STREAM ID={s} DESTINATION={s}\n",
+                .{ id, p },
+            ),
+        };
+        const cmd_buf = cmd catch return error.OutOfMemory;
+        defer allocator.free(cmd_buf);
+        try writeAll(control, cmd_buf);
 
         var buf: [4096]u8 = undefined; // destination keys are long
         const line = try readLine(control, &buf);
@@ -233,9 +411,38 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: *Session) void {
+        if (self.forward_conn) |f| f.close();
         self.control.close();
         self.allocator.free(self.id);
         self.allocator.free(self.destination);
+    }
+
+    /// Register inbound forwarding: every stream a remote peer opens to our
+    /// destination is delivered by the bridge as a fresh TCP connection to
+    /// `127.0.0.1:port` (`SILENT=true` → no SAM header line, the socket starts
+    /// directly with peer data — so a plain loopback listener, like the Tor
+    /// hidden-service seed's, can accept BitTorrent handshakes unmodified).
+    /// The registration socket is owned by the session and held open until
+    /// `deinit`; closing it cancels the forward. One forward per session.
+    pub fn forward(self: *Session, port: u16) SamError!void {
+        if (self.forward_conn != null) return error.StreamFailed; // already armed
+        var stream = try dial(self.allocator, self.bridge);
+        errdefer stream.close();
+        _ = try hello(stream);
+
+        const cmd = std.fmt.allocPrint(
+            self.allocator,
+            "STREAM FORWARD ID={s} PORT={d} HOST=127.0.0.1 SILENT=true\n",
+            .{ self.id, port },
+        ) catch return error.OutOfMemory;
+        defer self.allocator.free(cmd);
+        try writeAll(stream, cmd);
+
+        var buf: [512]u8 = undefined;
+        const line = try readLine(stream, &buf);
+        if (!std.mem.startsWith(u8, line, "STREAM STATUS") or !samOk(line))
+            return error.StreamFailed;
+        self.forward_conn = stream;
     }
 
     /// Open a stream to a remote destination (`*.b32.i2p` or a full base64
@@ -333,7 +540,22 @@ fn mockHandleConn(stream: std.net.Stream, version: []const u8) void {
     writeAll(stream, hello_reply) catch return;
     const cmd = readLine(stream, &buf) catch return;
     if (std.mem.startsWith(u8, cmd, "SESSION CREATE")) {
+        // Echo a persisted private key back verbatim so the stable-destination
+        // round-trip is exercised; otherwise hand out a canned transient dest.
+        if (samField(cmd, "DESTINATION")) |d| {
+            if (!std.mem.eql(u8, d, "TRANSIENT")) {
+                var rbuf: [256]u8 = undefined;
+                const reply = std.fmt.bufPrint(&rbuf, "SESSION STATUS RESULT=OK DESTINATION={s}\n", .{d}) catch return;
+                writeAll(stream, reply) catch return;
+                return;
+            }
+        }
         writeAll(stream, "SESSION STATUS RESULT=OK DESTINATION=ZmFrZWRlc3Q=\n") catch return;
+    } else if (std.mem.startsWith(u8, cmd, "STREAM FORWARD")) {
+        // A real bridge requires ID + PORT; assert both are present.
+        const ok = std.mem.indexOf(u8, cmd, "ID=") != null and
+            std.mem.indexOf(u8, cmd, "PORT=") != null;
+        writeAll(stream, if (ok) "STREAM STATUS RESULT=OK\n" else "STREAM STATUS RESULT=I2P_ERROR\n") catch return;
     } else if (std.mem.startsWith(u8, cmd, "STREAM CONNECT")) {
         // Reject any destination containing "bad" to exercise the error path.
         if (std.mem.indexOf(u8, cmd, "bad") != null) {
@@ -416,6 +638,62 @@ test "i2p_sam: session create + stream connect against a mock SAM bridge" {
     try testing.expectError(error.StreamFailed, sess.connect("bad.b32.i2p", 0));
 }
 
+test "i2p_sam: base32Encode matches a known vector" {
+    // base32(SHA-256("")) — RFC 4648 lowercase, unpadded.
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("", &digest, .{});
+    var buf: [52]u8 = undefined;
+    const enc = base32Encode(&buf, &digest);
+    try testing.expectEqual(@as(usize, 52), enc.len);
+    try testing.expectEqualStrings("4oymiquy7qobjgx36tejs35zeqt24qpemsnzgtfeswmrw6csxbkq", enc);
+}
+
+test "i2p_sam: b32Address derives base32(sha256(dest)) over the full dest" {
+    const allocator = testing.allocator;
+    // 387 zero bytes (384-byte key block + 3-byte null certificate, cert_len=0)
+    // encoded in I2P base64. SHA-256 of those 387 zeros base32s to this host.
+    var dest_bytes: [387]u8 = .{0} ** 387;
+    var b64buf: [516]u8 = undefined;
+    const enc = std.base64.Base64Encoder.init(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-~".*,
+        '=',
+    );
+    const dest_b64 = enc.encode(&b64buf, &dest_bytes);
+
+    const host = try b32Address(allocator, dest_b64);
+    defer allocator.free(host);
+    try testing.expectEqual(b32_host_len, host.len);
+    try testing.expect(std.mem.endsWith(u8, host, ".b32.i2p"));
+    try testing.expectEqualStrings("gem7z2yovuoqqbg3sd5qzb5dhaiit6osezfdo3cbuonanzjsuzaq.b32.i2p", host);
+    // A derived host must be a valid `.b32.i2p` per peer_announce's validator.
+    const pa = @import("peer_announce.zig");
+    try testing.expect(pa.isValidI2pB32Host(host));
+}
+
+test "i2p_sam: b32Address honors a non-zero certificate length" {
+    const allocator = testing.allocator;
+    // 387 base bytes but cert_len=5 -> the real destination is 392 bytes, so
+    // five extra payload bytes must be hashed too. A truncated read (387) would
+    // produce a different address; assert the longer one is used.
+    var dest_bytes: [392]u8 = .{0} ** 392;
+    std.mem.writeInt(u16, dest_bytes[385..387], 5, .big);
+    dest_bytes[387] = 0xAB; // cert payload (arbitrary, just must be hashed)
+    var full_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&dest_bytes, &full_digest, .{});
+    var want: [52]u8 = undefined;
+    const want_label = base32Encode(&want, &full_digest);
+
+    var b64buf: [536]u8 = undefined;
+    const benc = std.base64.Base64Encoder.init(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-~".*,
+        '=',
+    );
+    const dest_b64 = benc.encode(&b64buf, &dest_bytes);
+    const host = try b32Address(allocator, dest_b64);
+    defer allocator.free(host);
+    try testing.expectEqualStrings(want_label, host[0..52]);
+}
+
 test "i2p_sam: parseVersion + atLeast" {
     try testing.expectEqual(@as(u16, 3), parseVersion("3.2").major);
     try testing.expectEqual(@as(u16, 2), parseVersion("3.2").minor);
@@ -453,4 +731,79 @@ test "i2p_sam: TO_PORT omitted on a pre-3.2 bridge (best-effort default port)" {
     // TO_PORT omitted.
     var peer = try sess.connect("examplepeer.b32.i2p", 6881);
     peer.close();
+}
+
+test "i2p_sam: classifyBridge reports ok against a SAM bridge, not_running on a dead port" {
+    const allocator = testing.allocator;
+    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var server = try addr.listen(.{ .reuse_address = true });
+    const port = server.listen_address.getPort();
+    var ctx = MockCtx{ .server = &server, .stop = std.atomic.Value(bool).init(false) };
+    const t = try std.Thread.spawn(.{}, mockRun, .{&ctx});
+    defer {
+        ctx.stop.store(true, .release);
+        t.join();
+        server.deinit();
+    }
+
+    // Live mock bridge → ok (it answers HELLO with RESULT=OK).
+    try testing.expectEqual(Health.ok, classifyBridge(allocator, .{ .host = "127.0.0.1", .port = port }, 3));
+
+    // A port with nothing listening → not_running (connection refused). Bind and
+    // immediately release a port to get one that's almost certainly free.
+    const probe_port = blk: {
+        var s = try addr.listen(.{ .reuse_address = true });
+        const p = s.listen_address.getPort();
+        s.deinit();
+        break :blk p;
+    };
+    try testing.expectEqual(Health.not_running, classifyBridge(allocator, .{ .host = "127.0.0.1", .port = probe_port }, 2));
+}
+
+test "i2p_sam: STREAM FORWARD arms inbound and is idempotent-guarded" {
+    const allocator = testing.allocator;
+    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var server = try addr.listen(.{ .reuse_address = true });
+    const port = server.listen_address.getPort();
+    var ctx = MockCtx{ .server = &server, .stop = std.atomic.Value(bool).init(false) };
+    const t = try std.Thread.spawn(.{}, mockRun, .{&ctx});
+    defer {
+        ctx.stop.store(true, .release);
+        t.join();
+        server.deinit();
+    }
+
+    const bridge = Bridge{ .host = "127.0.0.1", .port = port };
+    var sess = try Session.create(allocator, bridge, "carlseed");
+    defer sess.deinit();
+
+    // First FORWARD succeeds and the registration socket is retained.
+    try sess.forward(6881);
+    try testing.expect(sess.forward_conn != null);
+    // A second FORWARD is rejected (one forward per session) without clobbering
+    // the live registration.
+    try testing.expectError(error.StreamFailed, sess.forward(6882));
+    try testing.expect(sess.forward_conn != null);
+}
+
+test "i2p_sam: createWithDest reuses a persisted private key (stable address)" {
+    const allocator = testing.allocator;
+    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var server = try addr.listen(.{ .reuse_address = true });
+    const port = server.listen_address.getPort();
+    var ctx = MockCtx{ .server = &server, .stop = std.atomic.Value(bool).init(false) };
+    const t = try std.Thread.spawn(.{}, mockRun, .{&ctx});
+    defer {
+        ctx.stop.store(true, .release);
+        t.join();
+        server.deinit();
+    }
+
+    const bridge = Bridge{ .host = "127.0.0.1", .port = port };
+    // The mock echoes a persisted DESTINATION back verbatim, so the session's
+    // stored destination must equal what we passed in (proving the key is
+    // threaded into SESSION CREATE rather than ignored).
+    var sess = try Session.createWithDest(allocator, bridge, "carlseed", .{ .priv = "cGVyc2lzdGVk" });
+    defer sess.deinit();
+    try testing.expectEqualStrings("cGVyc2lzdGVk", sess.destination);
 }
