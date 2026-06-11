@@ -1433,13 +1433,15 @@ pub const Session = struct {
             }
         }
 
-        // Nostr: when stuck at zero peers, periodically re-query the relays for
-        // fresh peer-announces — a seed may have appeared or come back. Runs on
-        // this (the session) thread, so the callback adds peers safely. Gated on
-        // zero peers so it never duplicates a live connection or competes with an
-        // active download, and rate-limited because relay queries are slow.
+        // Nostr: while DOWNLOADING with zero peers, periodically re-query the
+        // relays for fresh peer-announces — a seed may have appeared or come
+        // back. Runs on this (the session) thread, so the callback adds peers
+        // safely. Gated on download mode + zero peers so it never duplicates a
+        // live connection, competes with an active download, or fires once the
+        // transfer has completed and is only seeding (dialing out is pointless
+        // then); rate-limited because relay queries are slow.
         if (self.peer_discovery) |pd| {
-            if (self.peers.items.len == 0 and now - self.last_peer_discovery_s > peer_rediscovery_interval_secs) {
+            if (self.mode == .download and self.peers.items.len == 0 and now - self.last_peer_discovery_s > peer_rediscovery_interval_secs) {
                 self.last_peer_discovery_s = now;
                 pd.run(pd.ctx);
             }

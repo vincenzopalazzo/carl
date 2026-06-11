@@ -1170,6 +1170,10 @@ fn collectNostrPeers(
 
     var added: usize = 0;
     for (relay_urls) |url| {
+        // Bail promptly on shutdown: this also runs as the periodic re-discovery
+        // callback inside the session loop, so a Ctrl-C mid-query must be honored
+        // without waiting out every relay's timeout.
+        if (!session.running) return;
         var r = carl.relay.Relay.connect(allocator, url, session.proxy) catch |err| {
             log.debug("nostr peer-discover: {s}: {}", .{ url, err });
             continue;
