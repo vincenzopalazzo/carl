@@ -803,7 +803,11 @@ pub const Session = struct {
         if (req.length > piece_mod.block_size) return;
 
         const plen = piece_mod.pieceLength(req.index, self.piece_len, self.total_length);
-        if (req.begin + req.length > plen) return;
+        // Non-wrapping bounds check: both fields are attacker-controlled u32s,
+        // and `begin + length` could overflow — a panic in ReleaseSafe (remote
+        // DoS) or a wrap past the guard in ReleaseFast.
+        if (req.length == 0) return;
+        if (req.begin >= plen or req.length > plen - req.begin) return;
 
         const block = self.store.readRange(self.allocator, req.index, req.begin, req.length) catch return;
         defer self.allocator.free(block);

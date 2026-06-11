@@ -272,6 +272,11 @@ pub const Storage = struct {
             buf_pos += chunk_len;
         }
 
+        // A range past the torrent's end maps to fewer bytes than requested;
+        // the unfilled allocation must never escape (it would leak heap
+        // contents to the peer being served).
+        if (buf_pos != length) return error.ReadFailed;
+
         return buf;
     }
 };
@@ -443,6 +448,12 @@ test "readRange reads a mid-piece block spanning a file boundary" {
     const got2 = try store.readRange(allocator, 0, 12000, 1000);
     defer allocator.free(got2);
     try std.testing.expectEqualSlices(u8, data[12000..13000], got2);
+
+    // A range past the torrent's end maps to fewer bytes than requested and
+    // must fail rather than return a partially-uninitialized buffer (which
+    // would leak heap contents to the requesting peer).
+    try std.testing.expectError(error.ReadFailed, store.readRange(allocator, 0, 16000, 1000));
+    try std.testing.expectError(error.ReadFailed, store.readRange(allocator, 9, 0, 16384));
 }
 
 fn testMeta(files: []const metainfo.FileInfo) metainfo.Metainfo {
