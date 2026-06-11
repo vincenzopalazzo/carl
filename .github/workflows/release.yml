@@ -78,14 +78,6 @@ jobs:
   macos:
     name: macOS (aarch64)
     runs-on: macos-latest
-    env:
-      # Tauri reads these and signs + notarizes the .app/.dmg when present.
-      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
@@ -101,11 +93,37 @@ jobs:
           zig build -Doptimize=ReleaseSafe
           install -m755 zig-out/bin/carl carl-aarch64-apple-darwin
 
-      - name: Build desktop bundle (signed + notarized when secrets are set)
+      - name: Install desktop deps
         working-directory: desktop
+        run: npm ci
+
+      # Decide whether to sign: secrets can't be used in `if:` directly, so read
+      # the cert into an env in a step and emit a flag. When absent we must NOT
+      # pass the APPLE_* env at all — Tauri treats an *empty* APPLE_CERTIFICATE as
+      # "sign" and then fails importing an empty cert (the rc1 failure).
+      - name: Detect signing config
+        id: sign
+        env:
+          CERT: ${{ secrets.APPLE_CERTIFICATE }}
         run: |
-          npm ci
-          npx tauri build
+          if [ -n "$CERT" ]; then echo "enabled=true" >> "$GITHUB_OUTPUT"; else echo "enabled=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Build desktop bundle (signed + notarized)
+        if: steps.sign.outputs.enabled == 'true'
+        working-directory: desktop
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npx tauri build
+
+      - name: Build desktop bundle (unsigned)
+        if: steps.sign.outputs.enabled != 'true'
+        working-directory: desktop
+        run: npx tauri build
 
       - name: Stage artifacts
         run: |
