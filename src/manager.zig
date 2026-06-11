@@ -1211,11 +1211,28 @@ pub fn formatEta(buf: []u8, status: api.Status, remaining_bytes: u64, rate_bps: 
 
 fn runThread(mt: *ManagedTransfer) void {
     if (mt.want_nostr) {
-        if (mt.is_seed) publishSeedNostr(mt) else collectNostrPeers(mt);
+        if (mt.is_seed) {
+            publishSeedNostr(mt);
+        } else {
+            // Retry discovery while the download has zero peers: the run loop
+            // calls this back on its own thread (safe to add peers) so a seed
+            // that appears/returns later is still picked up — one-shot discovery
+            // left such a download stuck at no_peers.
+            mt.session.setPeerDiscovery(mt, rediscoverPeersCb);
+            collectNostrPeers(mt); // initial pass before the loop starts
+        }
     }
     mt.session.run() catch |err| {
         log.err("transfer {s}: session error: {}", .{ mt.id, err });
     };
+}
+
+/// `Session.PeerDiscovery` callback: re-run Nostr peer discovery for `ctx`
+/// (a `*ManagedTransfer`). Invoked on the session thread by the run loop.
+fn rediscoverPeersCb(ctx: *anyopaque) void {
+    const mt: *ManagedTransfer = @ptrCast(@alignCast(ctx));
+    log.info("transfer {s}: no peers, re-querying nostr for peers", .{mt.id});
+    collectNostrPeers(mt);
 }
 
 /// Publish a seed's Nostr events via the shared `seeding.publish` (the same path

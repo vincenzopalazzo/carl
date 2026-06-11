@@ -410,6 +410,7 @@ fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []c
         session.metadata_only = true;
         session.seed_after_complete = want_seed;
         if (want_nostr) {
+            session.setPeerDiscovery(&session, cliRediscoverPeersCb);
             collectNostrPeers(allocator, ml.info_hash, &session);
         }
         session.run() catch |err| {
@@ -449,6 +450,7 @@ fn startDownload(allocator: std.mem.Allocator, mi: carl.metainfo.Metainfo, outpu
     defer session.deinit();
     if (want_nostr) {
         const info_hash = carl.metainfo.infoHash(mi.raw_info);
+        session.setPeerDiscovery(&session, cliRediscoverPeersCb);
         collectNostrPeers(allocator, info_hash, &session);
     }
     session.run() catch |err| {
@@ -1137,6 +1139,14 @@ fn fetchNip35Entry(
         }
     }
     return best;
+}
+
+/// `Session.PeerDiscovery` callback: re-run Nostr discovery when the download
+/// has zero peers. The session carries everything we need (allocator +
+/// info_hash), so the loop can keep retrying without extra state.
+fn cliRediscoverPeersCb(ctx: *anyopaque) void {
+    const session: *carl.session.Session = @ptrCast(@alignCast(ctx));
+    collectNostrPeers(session.allocator, session.info_hash, session);
 }
 
 fn collectNostrPeers(
