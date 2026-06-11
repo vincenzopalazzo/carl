@@ -1,0 +1,154 @@
+name: Release
+
+# Cut a release: push a `v*` tag (e.g. v0.1.0-rc1, v0.1.0). Builds the desktop
+# app (Tauri) and the standalone `carl` CLI/daemon binary on each native runner
+# — Tauri can't cross-compile the GUI bundle — then publishes a GitHub Release
+# with every artifact and a SHA256SUMS. Tags containing `-` (e.g. -rc1) are
+# published as prereleases.
+#
+# macOS signing + notarization is enabled when these repo secrets are set
+# (otherwise the bundle builds unsigned):
+#   APPLE_CERTIFICATE            base64 of the Developer ID Application .p12
+#   APPLE_CERTIFICATE_PASSWORD   the .p12 export password
+#   APPLE_SIGNING_IDENTITY       e.g. "Developer ID Application: Name (TEAMID)"
+#   APPLE_ID                     Apple ID email (for notarytool)
+#   APPLE_PASSWORD               app-specific password for that Apple ID
+#   APPLE_TEAM_ID                Apple Developer Team ID
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build/publish (e.g. v0.1.0-rc1)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x86_64:
+    name: Linux x86_64
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf build-essential file wget
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Standalone CLI/daemon binary (also what the desktop sidecar is built from).
+      - name: Build CLI
+        run: |
+          zig build -Doptimize=ReleaseSafe
+          install -m755 zig-out/bin/carl carl-x86_64-unknown-linux-gnu
+
+      - name: Build desktop bundle
+        working-directory: desktop
+        run: |
+          npm ci
+          npx tauri build
+
+      - name: Stage artifacts
+        run: |
+          mkdir -p dist
+          cp carl-x86_64-unknown-linux-gnu dist/
+          cp desktop/src-tauri/target/release/bundle/deb/*.deb dist/
+          cp desktop/src-tauri/target/release/bundle/appimage/*.AppImage dist/
+          ls -la dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: dist/*
+          if-no-files-found: error
+
+  macos:
+    name: macOS (aarch64)
+    runs-on: macos-latest
+    env:
+      # Tauri reads these and signs + notarizes the .app/.dmg when present.
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build CLI
+        run: |
+          zig build -Doptimize=ReleaseSafe
+          install -m755 zig-out/bin/carl carl-aarch64-apple-darwin
+
+      - name: Build desktop bundle (signed + notarized when secrets are set)
+        working-directory: desktop
+        run: |
+          npm ci
+          npx tauri build
+
+      - name: Stage artifacts
+        run: |
+          mkdir -p dist
+          cp carl-aarch64-apple-darwin dist/
+          cp desktop/src-tauri/target/release/bundle/dmg/*.dmg dist/
+          ls -la dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-aarch64
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: [linux-x86_64, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect + checksum
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+          cd release
+          sha256sum -- * > SHA256SUMS
+          echo "=== release contents ==="; ls -la
+      - name: Resolve tag
+        id: tag
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then TAG="${{ inputs.tag }}"; fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          # Prerelease if the tag has a pre-release suffix (e.g. -rc1, -beta).
+          case "$TAG" in *-*) echo "prerelease=true" >> "$GITHUB_OUTPUT";; *) echo "prerelease=false" >> "$GITHUB_OUTPUT";; esac
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          prerelease: ${{ steps.tag.outputs.prerelease }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: release/*
