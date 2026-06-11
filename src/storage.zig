@@ -250,7 +250,14 @@ pub const Storage = struct {
 
     /// Read a piece from disk. Caller owns the returned slice.
     pub fn readPiece(self: *Storage, allocator: Allocator, index: u32, length: u32) IoError![]u8 {
-        const torrent_offset = @as(u64, index) * self.piece_len;
+        return self.readRange(allocator, index, 0, length);
+    }
+
+    /// Read `length` bytes starting at `begin` within piece `index`. Caller
+    /// owns the returned slice. Serving a 16 KiB block request must not read
+    /// (and allocate) the whole piece — that is a 16-64x overhead per block.
+    pub fn readRange(self: *Storage, allocator: Allocator, index: u32, begin: u32, length: u32) IoError![]u8 {
+        const torrent_offset = @as(u64, index) * self.piece_len + begin;
         const buf = allocator.alloc(u8, length) catch return error.OutOfMemory;
         errdefer allocator.free(buf);
 

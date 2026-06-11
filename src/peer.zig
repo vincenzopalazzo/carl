@@ -14,7 +14,25 @@ pub const PeerState = enum {
     disconnected,
 };
 
-pub const max_pipeline: u32 = 5;
+/// Request-pipeline sizing. The pipeline must hold roughly
+/// `rate * RTT / block_size` outstanding requests to keep the link full
+/// (bandwidth-delay product); a fixed small depth caps throughput at
+/// `depth * 16 KiB / RTT` — e.g. 5 blocks over a 2 s I2P round trip is
+/// only 40 KiB/s. The session resizes `pipeline_limit` once a second from
+/// the peer's measured download rate, targeting `pipeline_queue_secs` of
+/// data in flight, clamped to [`min_pipeline`, `max_pipeline`].
+pub const min_pipeline: u32 = 16;
+pub const max_pipeline: u32 = 512;
+pub const pipeline_queue_secs: u32 = 4;
+
+/// An outstanding block request, stamped so the session can expire requests
+/// a connected-but-silent peer never answers.
+pub const PendingRequest = struct {
+    index: u32,
+    begin: u32,
+    length: u32,
+    requested_at: i64,
+};
 
 /// Per-peer connection state.
 pub const PeerConnection = struct {
@@ -56,11 +74,23 @@ pub const PeerConnection = struct {
 
     // Buffers
     recv_buf: std.ArrayList(u8),
+    /// Parse offset into `recv_buf`. Consumed messages advance this instead
+    /// of memmoving the remainder per message (compaction is amortized, like
+    /// the send side). Defaulted so the init struct literals need not set it.
+    recv_pos: usize = 0,
     send_buf: std.ArrayList(u8),
     send_pos: usize,
 
     // Request pipeline
-    pending_requests: std.ArrayList(wire.Message.BlockRequest),
+    pending_requests: std.ArrayList(PendingRequest),
+    /// Current pipeline depth, resized once a second by the session from the
+    /// measured download rate (see `updatePipelineLimit`). Defaulted so the
+    /// init struct literals need not set it.
+    pipeline_limit: u32 = min_pipeline,
+    /// EWMA download rate (bytes/s) and the `bytes_downloaded` value at the
+    /// last sample, both owned by `updatePipelineLimit`.
+    down_rate: u64 = 0,
+    rate_last_bytes: u64 = 0,
 
     // Stats for choking algorithm
     bytes_downloaded: u64,
@@ -151,6 +181,20 @@ pub const PeerConnection = struct {
     /// Connect timeout in seconds.
     pub const connect_timeout_secs: u32 = 5;
 
+    /// Disable Nagle on a peer socket (best-effort). Wire requests are tiny
+    /// and latency-sensitive; letting the kernel coalesce them behind delayed
+    /// ACKs stalls the request pipeline. Also applied to proxy/SAM bridge
+    /// sockets — those are local TCP connections where Nagle only adds delay.
+    pub fn setNoDelay(stream: std.net.Stream) void {
+        const one: c_int = 1;
+        std.posix.setsockopt(
+            stream.handle,
+            std.posix.IPPROTO.TCP,
+            std.posix.TCP.NODELAY,
+            std.mem.asBytes(&one),
+        ) catch {};
+    }
+
     /// Initiate TCP connection with a timeout.
     pub fn connect(self: *PeerConnection) !void {
         // Native I2P: open a SAM stream to the destination. Synchronous, so on
@@ -164,6 +208,7 @@ pub const PeerConnection = struct {
                 self.state = .disconnected;
                 return error.ConnectionFailed;
             };
+            setNoDelay(self.stream.?);
             self.state = .handshaking;
             return;
         }
@@ -183,6 +228,7 @@ pub const PeerConnection = struct {
                     return error.ConnectionFailed;
                 };
             }
+            setNoDelay(self.stream.?);
             self.state = .handshaking;
             return;
         }
@@ -248,6 +294,7 @@ pub const PeerConnection = struct {
         _ = std.posix.fcntl(sock, std.posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
 
         self.stream = .{ .handle = sock };
+        setNoDelay(self.stream.?);
         self.state = .handshaking;
     }
 
@@ -295,10 +342,12 @@ pub const PeerConnection = struct {
         return written;
     }
 
-    /// Read available data from socket into recv_buf.
+    /// Read available data from socket into recv_buf. The buffer is sized to
+    /// drain several piece messages per poll wake — a 16 KiB read forced one
+    /// syscall + poll round per block.
     pub fn readIncoming(self: *PeerConnection) !usize {
         const s = self.stream orelse return 0;
-        var buf: [16384]u8 = undefined;
+        var buf: [65536]u8 = undefined;
         const n = s.read(&buf) catch {
             self.state = .disconnected;
             return error.IoError;
@@ -312,30 +361,44 @@ pub const PeerConnection = struct {
         return n;
     }
 
+    /// Drop consumed bytes from the front of recv_buf. Amortized: a no-op
+    /// until everything is consumed or the consumed prefix dominates.
+    fn compactRecv(self: *PeerConnection) void {
+        if (self.recv_pos == 0) return;
+        if (self.recv_pos == self.recv_buf.items.len) {
+            self.recv_buf.clearRetainingCapacity();
+            self.recv_pos = 0;
+            return;
+        }
+        if (self.recv_pos > self.recv_buf.items.len / 2) {
+            const leftover = self.recv_buf.items[self.recv_pos..];
+            std.mem.copyForwards(u8, self.recv_buf.items[0..leftover.len], leftover);
+            self.recv_buf.shrinkRetainingCapacity(leftover.len);
+            self.recv_pos = 0;
+        }
+    }
+
     /// Try to parse the handshake from recv_buf. Returns the parsed handshake or null.
     pub fn tryParseHandshake(self: *PeerConnection) ?wire.Handshake {
-        if (self.recv_buf.items.len < wire.handshake_len) return null;
-        const hs = wire.Handshake.parse(self.recv_buf.items[0..wire.handshake_len]) catch return null;
+        const avail = self.recv_buf.items[self.recv_pos..];
+        if (avail.len < wire.handshake_len) return null;
+        const hs = wire.Handshake.parse(avail[0..wire.handshake_len]) catch return null;
 
-        // Consume handshake bytes
-        const leftover = self.recv_buf.items[wire.handshake_len..];
-        std.mem.copyForwards(u8, self.recv_buf.items[0..leftover.len], leftover);
-        self.recv_buf.shrinkRetainingCapacity(leftover.len);
+        self.recv_pos += wire.handshake_len;
+        self.compactRecv();
 
         return hs;
     }
 
     /// Parse and return the next complete message, or null if incomplete.
     pub fn nextMessage(self: *PeerConnection) !?wire.Message {
-        const result = wire.parseMessage(self.allocator, self.recv_buf.items) catch |err| {
+        const result = wire.parseMessage(self.allocator, self.recv_buf.items[self.recv_pos..]) catch |err| {
             self.state = .disconnected;
             return err;
         };
         if (result) |r| {
-            // Consume parsed bytes
-            const leftover = self.recv_buf.items[r.consumed..];
-            std.mem.copyForwards(u8, self.recv_buf.items[0..leftover.len], leftover);
-            self.recv_buf.shrinkRetainingCapacity(leftover.len);
+            self.recv_pos += r.consumed;
+            self.compactRecv();
             return r.msg;
         }
         return null;
@@ -350,24 +413,50 @@ pub const PeerConnection = struct {
     }
 
     pub fn canRequest(self: PeerConnection) bool {
-        return !self.peer_choking and self.pending_requests.items.len < max_pipeline;
+        return !self.peer_choking and self.pending_requests.items.len < self.pipeline_limit;
     }
 
     pub fn addPendingRequest(self: *PeerConnection, req: wire.Message.BlockRequest) !void {
-        self.pending_requests.append(self.allocator, req) catch return error.OutOfMemory;
+        self.pending_requests.append(self.allocator, .{
+            .index = req.index,
+            .begin = req.begin,
+            .length = req.length,
+            .requested_at = std.time.timestamp(),
+        }) catch return error.OutOfMemory;
     }
 
     pub fn completePendingRequest(self: *PeerConnection, index: u32, begin: u32) void {
         for (self.pending_requests.items, 0..) |r, i| {
             if (r.index == index and r.begin == begin) {
-                _ = self.pending_requests.orderedRemove(i);
+                _ = self.pending_requests.swapRemove(i);
                 return;
             }
         }
     }
 
+    pub fn hasPendingRequest(self: PeerConnection, index: u32, begin: u32) bool {
+        for (self.pending_requests.items) |r| {
+            if (r.index == index and r.begin == begin) return true;
+        }
+        return false;
+    }
+
     pub fn clearPendingRequests(self: *PeerConnection) void {
         self.pending_requests.clearRetainingCapacity();
+    }
+
+    /// Resample this peer's download rate (EWMA, alpha 1/4) and resize the
+    /// request pipeline to hold `pipeline_queue_secs` of data in flight.
+    /// Called once a second by the session's maintenance tick.
+    pub fn updatePipelineLimit(self: *PeerConnection, dt: i64) void {
+        if (dt <= 0) return;
+        const delta = self.bytes_downloaded -| self.rate_last_bytes;
+        self.rate_last_bytes = self.bytes_downloaded;
+        const inst = delta / @as(u64, @intCast(dt));
+        self.down_rate = (self.down_rate * 3 + inst) / 4;
+
+        const target = self.down_rate * pipeline_queue_secs / piece_mod.block_size;
+        self.pipeline_limit = @intCast(std.math.clamp(target, min_pipeline, max_pipeline));
     }
 
     pub fn hasPiece(self: PeerConnection, index: u32) bool {
@@ -419,8 +508,8 @@ test "peer request pipeline" {
     peer.peer_choking = false;
     try std.testing.expect(peer.canRequest());
 
-    // Fill pipeline
-    for (0..max_pipeline) |i| {
+    // Fill pipeline up to the current (initial) limit
+    for (0..min_pipeline) |i| {
         try peer.addPendingRequest(.{ .index = @intCast(i), .begin = 0, .length = 16384 });
     }
     try std.testing.expect(!peer.canRequest());
@@ -428,7 +517,31 @@ test "peer request pipeline" {
     // Complete one
     peer.completePendingRequest(2, 0);
     try std.testing.expect(peer.canRequest());
-    try std.testing.expectEqual(@as(usize, max_pipeline - 1), peer.pending_requests.items.len);
+    try std.testing.expectEqual(@as(usize, min_pipeline - 1), peer.pending_requests.items.len);
+    try std.testing.expect(peer.hasPendingRequest(3, 0));
+    try std.testing.expect(!peer.hasPendingRequest(2, 0));
+}
+
+test "peer pipeline limit scales with measured rate" {
+    const allocator = std.testing.allocator;
+    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6881);
+    var peer = PeerConnection.init(allocator, addr);
+    defer peer.deinit();
+
+    try std.testing.expectEqual(min_pipeline, peer.pipeline_limit);
+
+    // A fast peer grows the pipeline toward rate * queue_secs / block_size.
+    // Feed a steady 8 MiB/s until the EWMA converges.
+    for (0..16) |_| {
+        peer.bytes_downloaded += 8 * 1024 * 1024;
+        peer.updatePipelineLimit(1);
+    }
+    try std.testing.expect(peer.pipeline_limit > min_pipeline);
+    try std.testing.expect(peer.pipeline_limit <= max_pipeline);
+
+    // A stalled peer decays back to the floor (never below it).
+    for (0..64) |_| peer.updatePipelineLimit(1);
+    try std.testing.expectEqual(min_pipeline, peer.pipeline_limit);
 }
 
 test "peer enqueue and send buffer" {
