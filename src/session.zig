@@ -129,6 +129,13 @@ pub const Session = struct {
     // rate (and progress timestamp) so the metadata-fetch phase shows real speed
     // even though piece `downloaded` is still 0 then.
     meta_bytes_in: u64 = 0,
+    // Piece payload bytes received off the wire this session, counted per
+    // block before hash verification. Drives the download rate and progress
+    // timestamp instead of `downloaded` (which only advances on verified
+    // pieces): on slow links (e.g. a single I2P peer) one piece can take far
+    // longer than the stall threshold to assemble, and counting only verified
+    // pieces flaps the status between downloading and stalled.
+    block_bytes_in: u64 = 0,
 
     // Choking state
     last_unchoke_time: i64,
@@ -400,12 +407,14 @@ pub const Session = struct {
     }
 
     /// Resample the download/upload rate. Called once per second from the
-    /// session thread (`maintenance`). Counts piece bytes (`downloaded`) plus
-    /// received metadata bytes, applies an EWMA (alpha 1/4) for a stable display
-    /// value, and stamps `last_progress_s` whenever real bytes arrived so the
-    /// snapshot can tell "downloading" from "stalled".
+    /// session thread (`maintenance`). Counts payload block bytes
+    /// (`block_bytes_in`, stamped before verification so mid-piece progress on
+    /// slow links registers) plus received metadata bytes, applies an EWMA
+    /// (alpha 1/4) for a stable display value, and stamps `last_progress_s`
+    /// whenever real bytes arrived so the snapshot can tell "downloading"
+    /// from "stalled".
     fn sampleRate(self: *Session, now_s: i64) void {
-        const in_bytes = self.downloaded + self.meta_bytes_in;
+        const in_bytes = self.block_bytes_in + self.meta_bytes_in;
         const out_bytes = self.uploaded;
         if (self.rate_last_s == 0) {
             self.rate_last_s = now_s;
@@ -741,6 +750,7 @@ pub const Session = struct {
     fn onBlockReceived(self: *Session, p: *peer_mod.PeerConnection, pd: wire.Message.PieceData) !void {
         p.completePendingRequest(pd.index, pd.begin);
         p.bytes_downloaded += pd.block.len;
+        self.block_bytes_in += pd.block.len;
 
         const pp_ptr = self.active_pieces.get(pd.index) orelse return;
         const complete = pp_ptr.addBlock(pd.begin, pd.block);
@@ -1826,6 +1836,7 @@ pub const Session = struct {
         self.store.writePiece(piece_idx, data) catch return false;
         self.our_bitfield.setPiece(piece_idx);
         self.downloaded += plen;
+        self.block_bytes_in += plen;
         self.have_pieces.store(self.our_bitfield.count(), .monotonic);
 
         self.printProgress() catch {};
@@ -1892,6 +1903,34 @@ pub const Session = struct {
         }
     }
 };
+
+test "sampleRate counts block bytes as progress before a piece verifies" {
+    // Regression: on a slow link (single I2P peer) a piece can take far longer
+    // than the stall threshold to complete. Blocks received mid-piece must
+    // stamp `last_progress_s`, or the status flaps downloading <-> stalled.
+    var s: Session = undefined;
+    s.downloaded = 0; // no piece verified yet
+    s.meta_bytes_in = 0;
+    s.block_bytes_in = 0;
+    s.uploaded = 0;
+    s.rate_last_s = 100;
+    s.rate_last_in = 0;
+    s.rate_last_out = 0;
+    s.down_rate = std.atomic.Value(u64).init(0);
+    s.up_rate = std.atomic.Value(u64).init(0);
+    s.last_progress_s = std.atomic.Value(i64).init(100);
+
+    // Two 16 KiB blocks arrived off the wire; the piece is still incomplete.
+    s.block_bytes_in = 32 * 1024;
+    s.sampleRate(104);
+
+    try std.testing.expectEqual(@as(i64, 104), s.last_progress_s.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 32 * 1024 / 4 / 4), s.down_rate.load(.monotonic));
+
+    // No new bytes: the progress stamp must not advance.
+    s.sampleRate(110);
+    try std.testing.expectEqual(@as(i64, 104), s.last_progress_s.load(.monotonic));
+}
 
 /// Re-encode a resolved Metainfo into full `.torrent` bytes: a top-level dict
 /// `{ "announce", "info" }`. The info dict is decoded from `raw_info` and
