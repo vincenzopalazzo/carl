@@ -250,7 +250,14 @@ pub const Storage = struct {
 
     /// Read a piece from disk. Caller owns the returned slice.
     pub fn readPiece(self: *Storage, allocator: Allocator, index: u32, length: u32) IoError![]u8 {
-        const torrent_offset = @as(u64, index) * self.piece_len;
+        return self.readRange(allocator, index, 0, length);
+    }
+
+    /// Read `length` bytes starting at `begin` within piece `index`. Caller
+    /// owns the returned slice. Serving a 16 KiB block request must not read
+    /// (and allocate) the whole piece — that is a 16-64x overhead per block.
+    pub fn readRange(self: *Storage, allocator: Allocator, index: u32, begin: u32, length: u32) IoError![]u8 {
+        const torrent_offset = @as(u64, index) * self.piece_len + begin;
         const buf = allocator.alloc(u8, length) catch return error.OutOfMemory;
         errdefer allocator.free(buf);
 
@@ -264,6 +271,11 @@ pub const Storage = struct {
             if (bytes_read != chunk_len) return error.ReadFailed;
             buf_pos += chunk_len;
         }
+
+        // A range past the torrent's end maps to fewer bytes than requested;
+        // the unfilled allocation must never escape (it would leak heap
+        // contents to the peer being served).
+        if (buf_pos != length) return error.ReadFailed;
 
         return buf;
     }
@@ -399,6 +411,49 @@ test "storage write and read roundtrip" {
     const read1 = try store.readPiece(allocator, 1, 16384);
     defer allocator.free(read1);
     try std.testing.expectEqual(@as(u8, 0xBB), read1[0]);
+}
+
+test "readRange reads a mid-piece block spanning a file boundary" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = tmp_dir.dir.realpathAlloc(allocator, ".") catch return;
+    defer allocator.free(tmp_path);
+
+    // One 16 KiB piece split across two files (10000 + 6384 bytes), so a
+    // mid-piece range crosses the file boundary.
+    const files = [_]metainfo.FileInfo{
+        .{ .length = 10000, .path = &.{"a.bin"} },
+        .{ .length = 6384, .path = &.{"b.bin"} },
+    };
+
+    var store = Storage.init(allocator, testMeta(&files), tmp_path, true) catch return;
+    defer store.deinit();
+
+    var data: [16384]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @truncate(i);
+    try store.writePiece(0, &data);
+
+    // Serve a block-request-sized range straddling the boundary: the offset
+    // math (`index * piece_len + begin`) must hold for a non-zero `begin`.
+    const begin: u32 = 9000;
+    const length: u32 = 2000;
+    const got = try store.readRange(allocator, 0, begin, length);
+    defer allocator.free(got);
+    try std.testing.expectEqualSlices(u8, data[begin .. begin + length], got);
+
+    // And a range entirely inside the second file.
+    const got2 = try store.readRange(allocator, 0, 12000, 1000);
+    defer allocator.free(got2);
+    try std.testing.expectEqualSlices(u8, data[12000..13000], got2);
+
+    // A range past the torrent's end maps to fewer bytes than requested and
+    // must fail rather than return a partially-uninitialized buffer (which
+    // would leak heap contents to the requesting peer).
+    try std.testing.expectError(error.ReadFailed, store.readRange(allocator, 0, 16000, 1000));
+    try std.testing.expectError(error.ReadFailed, store.readRange(allocator, 9, 0, 16384));
 }
 
 fn testMeta(files: []const metainfo.FileInfo) metainfo.Metainfo {

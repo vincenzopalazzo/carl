@@ -29,6 +29,12 @@ const optimistic_interval_secs: i64 = 30;
 /// no_peers forever. Re-querying relays is slow (~seconds per relay), so only
 /// retry when stuck at zero peers and not more often than this.
 const peer_rediscovery_interval_secs: i64 = 45;
+/// How long an outstanding block request may go unanswered before it is
+/// cancelled and released back to the scheduler. Long enough that a slow
+/// anonymized route (I2P round trips run seconds) is never penalized; short
+/// enough that one silent peer can't hold blocks hostage while others could
+/// fetch them.
+const request_timeout_secs: i64 = 60;
 
 /// Periodic peer re-discovery hook. The session run loop calls `run(ctx)` on
 /// its own thread when the transfer has zero peers, so the callback can safely
@@ -125,6 +131,9 @@ pub const Session = struct {
     rate_last_s: i64 = 0,
     rate_last_in: u64 = 0,
     rate_last_out: u64 = 0,
+    // Last second `maintenance` ran the per-peer tick (pipeline resize +
+    // request expiry). Gates that work to 1 Hz like `sampleRate`.
+    peer_tick_last_s: i64 = 0,
     // BEP 9 metadata bytes received this session. Counted toward the download
     // rate (and progress timestamp) so the metadata-fetch phase shows real speed
     // even though piece `downloaded` is still 0 then.
@@ -675,7 +684,7 @@ pub const Session = struct {
         switch (msg) {
             .choke => {
                 p.peer_choking = true;
-                p.clearPendingRequests();
+                self.releasePeerRequests(p);
             },
             .unchoke => {
                 p.peer_choking = false;
@@ -774,6 +783,7 @@ pub const Session = struct {
                 for (self.peers.items) |peer| {
                     if (peer.state == .active) {
                         peer.enqueueMessage(.{ .have = pd.index }) catch {};
+                        cancelPieceRequests(peer, pd.index);
                     }
                 }
             } else {
@@ -793,12 +803,15 @@ pub const Session = struct {
         if (req.length > piece_mod.block_size) return;
 
         const plen = piece_mod.pieceLength(req.index, self.piece_len, self.total_length);
-        if (req.begin + req.length > plen) return;
+        // Non-wrapping bounds check: both fields are attacker-controlled u32s,
+        // and `begin + length` could overflow — a panic in ReleaseSafe (remote
+        // DoS) or a wrap past the guard in ReleaseFast.
+        if (req.length == 0) return;
+        if (req.begin >= plen or req.length > plen - req.begin) return;
 
-        const data = self.store.readPiece(self.allocator, req.index, plen) catch return;
-        defer self.allocator.free(data);
+        const block = self.store.readRange(self.allocator, req.index, req.begin, req.length) catch return;
+        defer self.allocator.free(block);
 
-        const block = data[req.begin .. req.begin + req.length];
         p.enqueueMessage(.{ .piece = .{
             .index = req.index,
             .begin = req.begin,
@@ -1151,13 +1164,13 @@ pub const Session = struct {
         for (self.peers.items) |p| {
             if (p.state != .active) continue;
 
-            while (p.canRequest()) {
-                const piece_idx = if (self.endgame_active)
-                    self.pickEndgamePiece(p)
-                else
-                    self.pickRarestPiece(p);
+            if (self.endgame_active) {
+                self.scheduleEndgameRequests(p);
+                continue;
+            }
 
-                const idx = piece_idx orelse break;
+            outer: while (p.canRequest()) {
+                const idx = self.pickRarestPiece(p) orelse break;
 
                 const pp_ptr = self.active_pieces.get(idx) orelse blk: {
                     const plen = piece_mod.pieceLength(idx, self.piece_len, self.total_length);
@@ -1174,17 +1187,104 @@ pub const Session = struct {
                     break :blk pp;
                 };
 
-                const block_idx = pp_ptr.nextMissingBlock() orelse break;
-                const spec = pp_ptr.blockSpec(block_idx);
+                // Fill the pipeline from this piece before picking another:
+                // picking is O(num_pieces), the blocks within are O(1). Each
+                // scheduled block is marked in flight so neither this loop nor
+                // another peer re-requests it (the marks are released on
+                // choke, disconnect, and timeout).
+                while (p.canRequest()) {
+                    const block_idx = pp_ptr.nextUnrequestedBlock() orelse continue :outer;
+                    const spec = pp_ptr.blockSpec(block_idx);
+
+                    const req = wire.Message.BlockRequest{
+                        .index = idx,
+                        .begin = spec.begin,
+                        .length = spec.length,
+                    };
+
+                    p.enqueueMessage(.{ .request = req }) catch break :outer;
+                    p.addPendingRequest(req) catch break :outer;
+                    pp_ptr.markRequested(block_idx);
+                }
+            }
+        }
+    }
+
+    /// Endgame: request every still-missing block from every peer that has
+    /// it. Duplicates across peers are intentional (first response wins, the
+    /// completion path cancels the rest), but a peer never duplicates a block
+    /// within its own pipeline.
+    fn scheduleEndgameRequests(self: *Session, p: *peer_mod.PeerConnection) void {
+        for (0..self.num_pieces) |i| {
+            if (!p.canRequest()) return;
+            const idx: u32 = @intCast(i);
+            if (self.our_bitfield.hasPiece(idx)) continue;
+            if (!p.hasPiece(idx)) continue;
+            const pp = self.active_pieces.get(idx) orelse continue;
+
+            for (0..pp.num_blocks) |b| {
+                if (!p.canRequest()) return;
+                const block_idx: u32 = @intCast(b);
+                if (pp.hasBlock(block_idx)) continue;
+                const spec = pp.blockSpec(block_idx);
+                if (p.hasPendingRequest(idx, spec.begin)) continue;
 
                 const req = wire.Message.BlockRequest{
                     .index = idx,
                     .begin = spec.begin,
                     .length = spec.length,
                 };
+                p.enqueueMessage(.{ .request = req }) catch return;
+                p.addPendingRequest(req) catch return;
+                pp.markRequested(block_idx);
+            }
+        }
+    }
 
-                p.enqueueMessage(.{ .request = req }) catch break;
-                p.addPendingRequest(req) catch break;
+    /// Release every in-flight request this peer holds back to the scheduler
+    /// (clearing the per-piece `requested` marks) and drop them from the
+    /// peer's pipeline. Used on choke and disconnect — a leaked mark would
+    /// make its block permanently unschedulable.
+    fn releasePeerRequests(self: *Session, p: *peer_mod.PeerConnection) void {
+        for (p.pending_requests.items) |r| {
+            if (self.active_pieces.get(r.index)) |pp| {
+                pp.clearRequested(r.begin / piece_mod.block_size);
+            }
+        }
+        p.clearPendingRequests();
+    }
+
+    /// Release (and cancel) requests the peer has sat on longer than
+    /// `request_timeout_secs`, so a connected-but-unresponsive peer can't
+    /// hold blocks hostage while other peers could fetch them.
+    fn expireStaleRequests(self: *Session, p: *peer_mod.PeerConnection, now: i64) void {
+        var i: usize = 0;
+        while (i < p.pending_requests.items.len) {
+            const r = p.pending_requests.items[i];
+            if (now - r.requested_at > request_timeout_secs) {
+                if (self.active_pieces.get(r.index)) |pp| {
+                    pp.clearRequested(r.begin / piece_mod.block_size);
+                }
+                p.enqueueMessage(.{ .cancel = .{ .index = r.index, .begin = r.begin, .length = r.length } }) catch {};
+                _ = p.pending_requests.swapRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Cancel a peer's outstanding requests for a piece that just completed
+    /// (endgame requests the same block from several peers; without a cancel
+    /// every one of them answers with redundant data).
+    fn cancelPieceRequests(p: *peer_mod.PeerConnection, index: u32) void {
+        var i: usize = 0;
+        while (i < p.pending_requests.items.len) {
+            const r = p.pending_requests.items[i];
+            if (r.index == index) {
+                p.enqueueMessage(.{ .cancel = .{ .index = r.index, .begin = r.begin, .length = r.length } }) catch {};
+                _ = p.pending_requests.swapRemove(i);
+            } else {
+                i += 1;
             }
         }
     }
@@ -1199,9 +1299,9 @@ pub const Session = struct {
             if (self.our_bitfield.hasPiece(idx)) continue;
             if (!p.hasPiece(idx)) continue;
 
-            // Skip if already active and fully requested
+            // Skip if already active with every block received or in flight
             if (self.active_pieces.get(idx)) |pp| {
-                if (pp.nextMissingBlock() == null) continue;
+                if (pp.nextUnrequestedBlock() == null) continue;
             }
 
             const avail = if (idx < self.piece_availability.len) self.piece_availability[idx] else 0;
@@ -1232,23 +1332,6 @@ pub const Session = struct {
             const stderr = std.fs.File.stderr().deprecatedWriter();
             stderr.print("endgame mode: {d} pieces remaining\n", .{missing}) catch {};
         }
-    }
-
-    /// In endgame mode, request remaining blocks from ALL peers that have them.
-    fn pickEndgamePiece(self: *Session, p: *peer_mod.PeerConnection) ?u32 {
-        for (0..self.num_pieces) |i| {
-            const idx: u32 = @intCast(i);
-            if (self.our_bitfield.hasPiece(idx)) continue;
-            if (!p.hasPiece(idx)) continue;
-
-            if (self.active_pieces.get(idx)) |pp| {
-                if (pp.nextMissingBlock() != null) return idx;
-                // In endgame, also re-request blocks from other peers
-                // (the first response wins, duplicates are ignored)
-                return idx;
-            }
-        }
-        return null;
     }
 
     // --- Choking algorithm (BEP 3) ---
@@ -1379,6 +1462,7 @@ pub const Session = struct {
         };
         p.* = peer_mod.PeerConnection.init(self.allocator, conn.address);
         p.stream = conn.stream;
+        peer_mod.PeerConnection.setNoDelay(conn.stream);
         p.state = .handshaking;
 
         p.sendHandshake(self.info_hash, self.peer_id) catch {
@@ -1413,6 +1497,7 @@ pub const Session = struct {
                 if (p.peer_bitfield) |*bf| {
                     self.removeAvailability(bf);
                 }
+                self.releasePeerRequests(p);
                 p.deinit();
                 self.allocator.destroy(p);
                 _ = self.peers.orderedRemove(i);
@@ -1424,6 +1509,18 @@ pub const Session = struct {
                     p.disconnect();
                 }
                 i += 1;
+            }
+        }
+
+        // Once a second: resize each peer's request pipeline from its
+        // measured rate and release requests the peer has sat on too long.
+        const peer_dt = now - self.peer_tick_last_s;
+        if (peer_dt >= 1) {
+            self.peer_tick_last_s = now;
+            for (self.peers.items) |p| {
+                if (p.state != .active) continue;
+                p.updatePipelineLimit(peer_dt);
+                self.expireStaleRequests(p, now);
             }
         }
 

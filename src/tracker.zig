@@ -220,6 +220,14 @@ pub fn announce(
 
     if (result.status != .ok) return error.HttpError;
 
+    // Flush the adapter's buffered tail: a response smaller than the adapter
+    // buffer (announce responses almost always are) would otherwise never
+    // reach `response_body` and parse as empty.
+    const buffered = adapter.new_interface.buffered();
+    if (buffered.len > 0) {
+        response_body.appendSlice(allocator, buffered) catch return error.OutOfMemory;
+    }
+
     return parseAnnounceResponse(allocator, response_body.items);
 }
 
