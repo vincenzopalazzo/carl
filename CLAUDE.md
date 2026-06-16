@@ -34,3 +34,23 @@ cp zig-out/bin/carl ~/.local/bin/carl   # the binary `carl` on $PATH resolves to
 
 Prefer invoking the freshly built `./zig-out/bin/carl` directly in scripts, and
 keep the installed `~/.local/bin/carl` in sync after every change.
+
+## UI / design fidelity
+
+The `design/` directory is the **design source of truth** — the high-fidelity
+prototype handed off from Claude Design (`carl.html`, `landing.html`, the `*.jsx`
+mockups, and the `:root` design tokens at the top of `carl.html`).
+
+Every UI change MUST match the design 1-1 with the code. Before and after touching
+any UI (the `desktop/` app or the `site/` landing page):
+
+- Open the relevant prototype in `design/` and match it exactly — layout, spacing,
+  colors, typography, component structure, and states.
+- Use the design tokens verbatim (colors, fonts, radii, the route/privacy system:
+  `clearnet`/`proxied`/`tor` and `tracker`/`dht`/`nostr`). Do not invent new
+  values, components, or visual treatments that aren't in `design/`.
+- If a needed UI is not covered by the design, update `design/` first (keep it in
+  sync), then implement the code to match — never let the code drift from `design/`.
+
+The implementation tech may differ (Tauri/React vs. the prototype's Babel-in-browser
+setup), but the rendered result must be pixel-perfect against `design/`.
