@@ -7,9 +7,12 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const tracker = @import("tracker.zig");
 
+const log = std.log.scoped(.udp_tracker);
+
 const protocol_id: u64 = 0x41727101980; // magic constant per BEP 15
 const action_connect: u32 = 0;
 const action_announce: u32 = 1;
+const action_error: u32 = 3;
 const timeout_ms: u32 = 5000;
 
 pub const UdpTrackerError = error{
@@ -71,10 +74,15 @@ pub fn announce(
     var recv_buf: [8192]u8 = undefined; // 8KB: holds ~1360 peers in compact format
     const connect_len = recvWithTimeout(sock, &recv_buf) catch return error.Timeout;
 
-    if (connect_len < 16) return error.InvalidResponse;
+    if (connect_len < 8) return error.InvalidResponse;
     const resp_action = std.mem.readInt(u32, recv_buf[0..4], .big);
     const resp_txn = std.mem.readInt(u32, recv_buf[4..8], .big);
-    if (resp_action != action_connect or resp_txn != txn_id1) return error.InvalidResponse;
+    if (resp_txn != txn_id1) return error.InvalidResponse;
+    if (resp_action == action_error) {
+        if (connect_len > 8) log.warn("tracker error: {s}", .{recv_buf[8..connect_len]});
+        return error.InvalidResponse;
+    }
+    if (resp_action != action_connect or connect_len < 16) return error.InvalidResponse;
 
     const connection_id = std.mem.readInt(u64, recv_buf[8..16], .big);
 
@@ -100,10 +108,15 @@ pub fn announce(
 
     const ann_len = recvWithTimeout(sock, &recv_buf) catch return error.Timeout;
 
-    if (ann_len < 20) return error.InvalidResponse;
+    if (ann_len < 8) return error.InvalidResponse;
     const ann_action = std.mem.readInt(u32, recv_buf[0..4], .big);
     const ann_txn = std.mem.readInt(u32, recv_buf[4..8], .big);
-    if (ann_action != action_announce or ann_txn != txn_id2) return error.InvalidResponse;
+    if (ann_txn != txn_id2) return error.InvalidResponse;
+    if (ann_action == action_error) {
+        if (ann_len > 8) log.warn("tracker announce error: {s}", .{recv_buf[8..ann_len]});
+        return error.InvalidResponse;
+    }
+    if (ann_action != action_announce or ann_len < 20) return error.InvalidResponse;
 
     const interval = std.mem.readInt(u32, recv_buf[8..12], .big);
     const leechers = std.mem.readInt(u32, recv_buf[12..16], .big);

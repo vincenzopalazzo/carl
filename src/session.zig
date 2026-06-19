@@ -1569,29 +1569,39 @@ pub const Session = struct {
             .event = event,
         };
 
-        // Try announce-list tiers first (BEP 12)
+        // Terminal events (completed/stopped) just need one tracker ack;
+        // discovery events (started/none) need actual peers.
+        const wants_peers = event != .completed and event != .stopped;
+
+        // Try announce-list tiers first (BEP 12).
+        // Standard BEP 12 stops at the first successful response in a tier,
+        // but a 0-peer response is useless for discovery — keep trying the
+        // next tracker in the tier until peers appear.  Terminal events
+        // return after any successful ack.
         if (self.meta.announce_list) |tiers| {
             for (tiers) |tier| {
                 for (tier) |url| {
                     if (self.tryAnnounceUrl(url, req)) |resp| {
                         self.handleAnnounceResponse(resp);
-                        return;
+                        if (!wants_peers or self.peers.items.len > 0) return;
                     }
                 }
             }
         }
 
         // Fall back to primary announce URL
-        if (self.meta.announce.len > 0) {
+        if (self.peers.items.len == 0 and self.meta.announce.len > 0) {
             if (self.tryAnnounceUrl(self.meta.announce, req)) |resp| {
                 self.handleAnnounceResponse(resp);
-                return;
+                if (!wants_peers or self.peers.items.len > 0) return;
             }
         }
 
-        // Fall back to DHT (BEP 5)
-        self.tryDhtPeerDiscovery() catch {};
-        if (self.peers.items.len > 0) return;
+        // Fall back to DHT (BEP 5) — only for discovery, not terminal events
+        if (wants_peers and self.peers.items.len == 0) {
+            self.tryDhtPeerDiscovery() catch {};
+            if (self.peers.items.len > 0) return;
+        }
 
         return error.TrackerFailed;
     }
@@ -1660,6 +1670,9 @@ pub const Session = struct {
     }
 
     fn computeLeft(self: *Session) u64 {
+        // Before metadata is known (magnet link), report non-zero so trackers
+        // treat us as a leecher and return all peer types.
+        if (self.metadata_only and self.num_pieces == 0) return 16384;
         var remaining: u64 = 0;
         for (0..self.num_pieces) |i| {
             if (!self.our_bitfield.hasPiece(@intCast(i))) {
