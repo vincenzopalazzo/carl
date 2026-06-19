@@ -1619,10 +1619,6 @@ pub const Session = struct {
         return false;
     }
 
-    fn isHttpTracker(url: []const u8) bool {
-        return std.mem.startsWith(u8, url, "http://") or std.mem.startsWith(u8, url, "https://");
-    }
-
     fn tryAnnounceUrl(self: *Session, url: []const u8, req: tracker_mod.AnnounceRequest) ?tracker_mod.AnnounceResponse {
         // I2P (anonymized with no SOCKS/HTTP proxy) can't reach clearnet
         // trackers, and announcing over them directly would leak the real IP.

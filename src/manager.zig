@@ -113,7 +113,6 @@ const ManagedTransfer = struct {
     /// snapshots needn't read the session's `meta` across threads — which the
     /// magnet path replaces on metadata completion.
     has_tracker: bool,
-    has_http_tracker: bool,
     /// Owned copy of the socks URL the proxy slices borrow from.
     socks_owned: ?[]u8,
     proxy: ?proxy_mod.Proxy,
@@ -598,7 +597,6 @@ pub const Manager = struct {
             .want_nostr = want_nostr,
             .is_seed = is_seed,
             .has_tracker = built.meta.announce.len > 0 or built.meta.announce_list != null,
-            .has_http_tracker = std.mem.startsWith(u8, built.meta.announce, "http"),
             .socks_owned = socks_owned,
             .proxy = resolved_proxy,
             .i2p_session = i2p_session,
@@ -1373,7 +1371,7 @@ fn snapshotTransfer(mt: *ManagedTransfer, arena: Allocator, now: i64) Allocator.
     const pct = pctFromCounts(p.have, p.num_pieces);
 
     var src_buf: [3]api.SourceKind = undefined;
-    const src = deriveSources(&src_buf, mt.route, mt.has_tracker, mt.has_http_tracker, mt.want_nostr);
+    const src = deriveSources(&src_buf, mt.route, mt.has_tracker, mt.want_nostr);
     const sources = try arena.dupe(api.SourceKind, src);
 
     var eta_buf: [24]u8 = undefined;
@@ -1460,7 +1458,6 @@ pub fn deriveSources(
     out: *[3]api.SourceKind,
     route: api.Route,
     has_tracker: bool,
-    _: bool,
     want_nostr: bool,
 ) []api.SourceKind {
     var n: usize = 0;
@@ -1697,7 +1694,7 @@ test "deriveStatus" {
 
 test "deriveSources: direct uses tracker+dht+nostr" {
     var buf: [3]api.SourceKind = undefined;
-    const s = deriveSources(&buf, .direct, true, true, true);
+    const s = deriveSources(&buf, .direct, true, true);
     try testing.expectEqual(@as(usize, 3), s.len);
     try testing.expectEqual(api.SourceKind.tracker, s[0]);
     try testing.expectEqual(api.SourceKind.dht, s[1]);
@@ -1706,23 +1703,23 @@ test "deriveSources: direct uses tracker+dht+nostr" {
 
 test "deriveSources: direct without tracker drops tracker" {
     var buf: [3]api.SourceKind = undefined;
-    const s = deriveSources(&buf, .direct, false, false, false);
+    const s = deriveSources(&buf, .direct, false, false);
     try testing.expectEqual(@as(usize, 1), s.len);
     try testing.expectEqual(api.SourceKind.dht, s[0]);
 }
 
 test "deriveSources: tor with udp-only trackers still shows tracker" {
     var buf: [3]api.SourceKind = undefined;
-    const s = deriveSources(&buf, .tor, true, false, false);
+    const s = deriveSources(&buf, .tor, true, false);
     // UDP trackers are rewritten to HTTP through the proxy, so tracker
     // is a valid source even without explicit HTTP tracker URLs.
     try testing.expectEqual(@as(usize, 1), s.len);
     try testing.expectEqual(api.SourceKind.tracker, s[0]);
 }
 
-test "deriveSources: proxy with http tracker keeps tracker + nostr" {
+test "deriveSources: proxy with tracker keeps tracker + nostr" {
     var buf: [3]api.SourceKind = undefined;
-    const s = deriveSources(&buf, .proxy, true, true, true);
+    const s = deriveSources(&buf, .proxy, true, true);
     try testing.expectEqual(@as(usize, 2), s.len);
     try testing.expectEqual(api.SourceKind.tracker, s[0]);
     try testing.expectEqual(api.SourceKind.nostr, s[1]);
@@ -1732,13 +1729,13 @@ test "deriveSources: i2p reports nostr only when opted in (never tracker)" {
     var buf: [3]api.SourceKind = undefined;
     // HTTP tracker present but never contacted on i2p, and nostr opted in:
     // report nostr only, not tracker.
-    const with_nostr = deriveSources(&buf, .i2p, true, true, true);
+    const with_nostr = deriveSources(&buf, .i2p, true, true);
     try testing.expectEqual(@as(usize, 1), with_nostr.len);
     try testing.expectEqual(api.SourceKind.nostr, with_nostr[0]);
 
     // Without nostr there is no peer discovery at all on i2p: report nothing
     // rather than implying a tracker is being used.
-    const no_nostr = deriveSources(&buf, .i2p, true, true, false);
+    const no_nostr = deriveSources(&buf, .i2p, true, false);
     try testing.expectEqual(@as(usize, 0), no_nostr.len);
 }
 
