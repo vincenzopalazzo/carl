@@ -1569,16 +1569,21 @@ pub const Session = struct {
             .event = event,
         };
 
+        // Terminal events (completed/stopped) just need one tracker ack;
+        // discovery events (started/none) need actual peers.
+        const wants_peers = event != .completed and event != .stopped;
+
         // Try announce-list tiers first (BEP 12).
         // Standard BEP 12 stops at the first successful response in a tier,
-        // but a 0-peer response is useless — keep trying the next tracker in
-        // the tier so we don't give up when only the first tracker is empty.
+        // but a 0-peer response is useless for discovery — keep trying the
+        // next tracker in the tier until peers appear.  Terminal events
+        // return after any successful ack.
         if (self.meta.announce_list) |tiers| {
             for (tiers) |tier| {
                 for (tier) |url| {
                     if (self.tryAnnounceUrl(url, req)) |resp| {
                         self.handleAnnounceResponse(resp);
-                        if (self.peers.items.len > 0) return;
+                        if (!wants_peers or self.peers.items.len > 0) return;
                     }
                 }
             }
@@ -1588,17 +1593,16 @@ pub const Session = struct {
         if (self.peers.items.len == 0 and self.meta.announce.len > 0) {
             if (self.tryAnnounceUrl(self.meta.announce, req)) |resp| {
                 self.handleAnnounceResponse(resp);
-                if (self.peers.items.len > 0) return;
+                if (!wants_peers or self.peers.items.len > 0) return;
             }
         }
 
-        // Fall back to DHT (BEP 5)
-        if (self.peers.items.len == 0) {
+        // Fall back to DHT (BEP 5) — only for discovery, not terminal events
+        if (wants_peers and self.peers.items.len == 0) {
             self.tryDhtPeerDiscovery() catch {};
             if (self.peers.items.len > 0) return;
         }
 
-        if (self.peers.items.len > 0) return;
         return error.TrackerFailed;
     }
 
