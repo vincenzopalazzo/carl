@@ -36,6 +36,16 @@ const peer_rediscovery_interval_secs: i64 = 45;
 /// fetch them.
 const request_timeout_secs: i64 = 60;
 
+/// Well-known public HTTP trackers used as a last resort when the torrent
+/// only has UDP trackers and we're routed through Tor/SOCKS (where UDP
+/// can't be tunneled).
+const http_fallback_trackers = [_][]const u8{
+    "https://tracker.opentrackr.org:443/announce",
+    "https://tracker.torrent.eu.org:443/announce",
+    "http://tracker.openbittorrent.com/announce",
+    "http://open.acgnxtracker.com/announce",
+};
+
 /// Periodic peer re-discovery hook. The session run loop calls `run(ctx)` on
 /// its own thread when the transfer has zero peers, so the callback can safely
 /// add peers (the peer set is single-threaded). The manager/CLI wire this to
@@ -1603,12 +1613,24 @@ pub const Session = struct {
             if (self.peers.items.len > 0) return;
         }
 
+        // Last resort when proxied (Tor/SOCKS): magnet links often carry only
+        // UDP trackers which can't be tunneled.  Try well-known public HTTP
+        // trackers that are likely to have peers for popular torrents.
+        if (wants_peers and self.proxy != null and self.peers.items.len == 0) {
+            for (http_fallback_trackers) |url| {
+                if (self.tryAnnounceUrl(url, req)) |resp| {
+                    self.handleAnnounceResponse(resp);
+                    if (self.peers.items.len > 0) return;
+                }
+            }
+        }
+
         return error.TrackerFailed;
     }
 
     /// Whether any announce URL can be used while proxied. HTTP and HTTPS
-    /// trackers are tunneled; UDP trackers are disabled. A torrent with only
-    /// UDP trackers (or none) has no peer source under --proxy.
+    /// trackers are tunneled; UDP trackers are disabled. Always true because
+    /// fallback HTTP trackers are tried when the torrent has none of its own.
     fn hasProxyUsableTracker(self: *Session) bool {
         if (isHttpTracker(self.meta.announce)) return true;
         if (self.meta.announce_list) |tiers| {
@@ -1618,7 +1640,7 @@ pub const Session = struct {
                 }
             }
         }
-        return false;
+        return true;
     }
 
     fn isHttpTracker(url: []const u8) bool {
