@@ -45,6 +45,14 @@ pub const PeerDiscovery = struct {
     run: *const fn (ctx: *anyopaque) void,
 };
 
+/// Fired once when a download completes (all pieces verified). Runs on the
+/// session thread, so it can read session state safely. The manager wires
+/// this to publish the torrent on Nostr (NIP-35) if not already present.
+pub const OnComplete = struct {
+    ctx: *anyopaque,
+    run: *const fn (ctx: *anyopaque) void,
+};
+
 /// Global flag for graceful shutdown on SIGINT. Atomic because it's
 /// written from a signal handler and read from event loop / test threads.
 pub var shutdown_requested = std.atomic.Value(bool).init(false);
@@ -199,6 +207,9 @@ pub const Session = struct {
     peer_discovery: ?PeerDiscovery = null,
     /// Timestamp of the last peer re-discovery, to rate-limit retries.
     last_peer_discovery_s: i64 = 0,
+    /// Fired once when a download completes. The manager uses this to broadcast
+    /// the torrent on Nostr (NIP-35) if not already present on relays.
+    on_complete: ?OnComplete = null,
 
     // Progress tracking
     start_time: i64,
@@ -455,6 +466,10 @@ pub const Session = struct {
         self.peer_discovery = .{ .ctx = ctx, .run = run_fn };
     }
 
+    pub fn setOnComplete(self: *Session, ctx: *anyopaque, run_fn: *const fn (ctx: *anyopaque) void) void {
+        self.on_complete = .{ .ctx = ctx, .run = run_fn };
+    }
+
     pub fn run(self: *Session) !void {
         const stdout = std.fs.File.stdout().deprecatedWriter();
         const stderr = std.fs.File.stderr().deprecatedWriter();
@@ -493,7 +508,7 @@ pub const Session = struct {
             }
             self.doMultiTrackerAnnounce(.started) catch |err| {
                 if (has_trackers) {
-                    stderr.print("all trackers failed: {}\n", .{err}) catch {};
+                    log.debug("all trackers failed: {}", .{err});
                 }
             };
         } else {
@@ -506,6 +521,7 @@ pub const Session = struct {
             if (self.mode == .download and !self.metadata_only and self.num_pieces > 0 and self.our_bitfield.isComplete()) {
                 stdout.print("\ndownload complete!\n", .{}) catch {};
                 self.doMultiTrackerAnnounce(.completed) catch {};
+                if (self.on_complete) |cb| cb.run(cb.ctx);
 
                 // By default `download` is done now -- stop the loop and let the
                 // process exit instead of lingering as a seeder forever (which,
@@ -1011,11 +1027,49 @@ pub const Session = struct {
         const pieces_val = info_val.dictGet("pieces") orelse return error.InvalidMetadata;
         const pieces_str = pieces_val.asString() orelse return error.InvalidMetadata;
 
-        // Build file list
-        const files = if (info_val.dictGet("files")) |_|
-            // Multi-file magnet torrents not yet supported
-            return error.InvalidMetadata
-        else blk: {
+        // Build file list (single-file or multi-file)
+        const files = if (info_val.dictGet("files")) |files_val| blk: {
+            const file_list = files_val.asList() orelse return error.InvalidMetadata;
+            var files_arr: std.ArrayList(metainfo.FileInfo) = .empty;
+            errdefer {
+                for (files_arr.items) |fi| {
+                    for (fi.path) |comp| self.allocator.free(comp);
+                    self.allocator.free(fi.path);
+                }
+                files_arr.deinit(self.allocator);
+            }
+            for (file_list) |file_val| {
+                const fl_val = file_val.dictGet("length") orelse continue;
+                const fl: u64 = std.math.cast(u64, fl_val.asInt() orelse continue) orelse continue;
+                const fp_val = file_val.dictGet("path") orelse continue;
+                const fp_list = fp_val.asList() orelse continue;
+                var path_arr: std.ArrayList([]const u8) = .empty;
+                errdefer {
+                    for (path_arr.items) |comp| self.allocator.free(comp);
+                    path_arr.deinit(self.allocator);
+                }
+                for (fp_list) |comp_val| {
+                    const cs = comp_val.asString() orelse continue;
+                    const comp = self.allocator.dupe(u8, cs) catch return error.OutOfMemory;
+                    path_arr.append(self.allocator, comp) catch {
+                        self.allocator.free(comp);
+                        return error.OutOfMemory;
+                    };
+                }
+                if (path_arr.items.len == 0) {
+                    path_arr.deinit(self.allocator);
+                    continue;
+                }
+                const fi_path = path_arr.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
+                files_arr.append(self.allocator, .{ .length = fl, .path = fi_path }) catch {
+                    for (fi_path) |comp| self.allocator.free(comp);
+                    self.allocator.free(fi_path);
+                    return error.OutOfMemory;
+                };
+            }
+            if (files_arr.items.len == 0) return error.InvalidMetadata;
+            break :blk @as([]const metainfo.FileInfo, files_arr.toOwnedSlice(self.allocator) catch return error.OutOfMemory);
+        } else blk: {
             const length_val = info_val.dictGet("length") orelse return error.InvalidMetadata;
             const length = std.math.cast(u64, length_val.asInt() orelse return error.InvalidMetadata) orelse return error.InvalidMetadata;
 
@@ -1660,11 +1714,12 @@ pub const Session = struct {
         var buf: [256]u8 = undefined;
         const http_url = std.fmt.bufPrint(&buf, "http://{s}/announce", .{host_port}) catch return null;
 
-        log.info("proxied: rewriting {s} → {s}", .{ udp_url, http_url });
-        return tracker_mod.announce(self.allocator, http_url, req, self.proxy) catch |err| {
+        const resp = tracker_mod.announce(self.allocator, http_url, req, self.proxy) catch |err| {
             log.debug("HTTP rewrite of UDP tracker {s} failed: {}", .{ udp_url, err });
             return null;
         };
+        log.info("proxied: rewriting {s} → {s}", .{ udp_url, http_url });
+        return resp;
     }
 
     fn handleAnnounceResponse(self: *Session, resp: tracker_mod.AnnounceResponse) void {
@@ -1702,8 +1757,24 @@ pub const Session = struct {
     }
 
     fn connectToPeers(self: *Session, peer_list: []const tracker_mod.Peer) !void {
-        for (peer_list) |tracker_peer| {
+        // Each proxied connection attempt takes ~10s through Tor (SOCKS
+        // handshake + circuit). Trying all 50 peers serially would block
+        // the session thread for minutes. Cap attempts per call; the
+        // tracker re-announce cycle gradually fills the peer pool.
+        const max_attempts: usize = if (self.proxy != null) 10 else 50;
+        var attempts: usize = 0;
+
+        // Rotate start offset so repeated announces don't always retry
+        // the same failing peers at the front of the list.
+        const offset = if (peer_list.len > 0)
+            std.crypto.random.intRangeAtMost(usize, 0, peer_list.len - 1)
+        else
+            0;
+
+        for (0..peer_list.len) |i| {
+            const tracker_peer = peer_list[(i + offset) % peer_list.len];
             if (self.peers.items.len >= max_peers) break;
+            if (attempts >= max_attempts) break;
 
             const addr = std.net.Address.initIp4(tracker_peer.ip, tracker_peer.port);
             var already = false;
@@ -1714,6 +1785,8 @@ pub const Session = struct {
                 }
             }
             if (already) continue;
+
+            attempts += 1;
 
             const p = self.allocator.create(peer_mod.PeerConnection) catch continue;
             p.* = peer_mod.PeerConnection.init(self.allocator, addr);

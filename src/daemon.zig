@@ -49,6 +49,13 @@ const max_body: usize = 256 * 1024 * 1024;
 /// ever show relays as "configured" (never connected).
 const probe_interval_ns: u64 = 30 * std.time.ns_per_s;
 
+/// After this many consecutive all-unreachable probe cycles, the prober
+/// backs off to `backoff_interval_ns` to stop flooding the logs and
+/// wasting Tor circuits. Resets to the normal interval on the first
+/// successful probe.
+const max_consecutive_failures: u8 = 3;
+const backoff_interval_ns: u64 = 5 * 60 * std.time.ns_per_s;
+
 pub const Daemon = struct {
     allocator: Allocator,
     manager: *manager_mod.Manager,
@@ -63,6 +70,8 @@ pub const Daemon = struct {
     proxy_state: proxy_mod.ProxyState = .ok,
     proxy_reply: ?u8 = null,
     proxy_probed: bool = false,
+    /// Consecutive probe cycles where every relay was unreachable.
+    relay_fail_streak: u8 = 0,
 
     /// Bind to 127.0.0.1:`port` and serve until `running` is cleared. Blocking.
     pub fn serve(self: *Daemon, port: u16) !void {
@@ -251,8 +260,12 @@ pub const Daemon = struct {
             // down) so they come back within a tick instead of after the next
             // restart — until now they existed only as invisible DB rows.
             self.manager.retryRetained();
+            const interval = if (self.relay_fail_streak >= max_consecutive_failures)
+                backoff_interval_ns
+            else
+                probe_interval_ns;
             var slept: u64 = 0;
-            while (slept < probe_interval_ns and
+            while (slept < interval and
                 self.running.load(.acquire) and
                 !session_mod.shutdown_requested.load(.acquire)) : (slept += 250 * std.time.ns_per_ms)
             {
@@ -278,6 +291,7 @@ pub const Daemon = struct {
         }
 
         var list: std.ArrayList(api.Relay) = .empty;
+        var any_connected = false;
         for (urls) |url| {
             const onion = std.mem.indexOf(u8, url, ".onion") != null;
             var state: []const u8 = "configured";
@@ -286,6 +300,7 @@ pub const Daemon = struct {
                     var rc = r;
                     rc.deinit();
                     state = "connected";
+                    any_connected = true;
                 } else |_| {
                     state = "unreachable";
                 }
@@ -305,6 +320,17 @@ pub const Daemon = struct {
             list.deinit(a);
             return;
         };
+
+        if (any_connected) {
+            self.relay_fail_streak = 0;
+        } else if (urls.len > 0) {
+            self.relay_fail_streak +|= 1;
+            if (self.relay_fail_streak == max_consecutive_failures) {
+                log.warn("all relays unreachable {d}x in a row, backing off to {d}s interval", .{
+                    max_consecutive_failures, backoff_interval_ns / std.time.ns_per_s,
+                });
+            }
+        }
 
         self.health_mutex.lock();
         const old = self.health;

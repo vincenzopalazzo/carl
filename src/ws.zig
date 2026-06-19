@@ -166,7 +166,7 @@ pub const Conn = struct {
             // never learns our IP -- the whole connection rides the proxy/Tor.
             if (options.proxy) |px| {
                 const stream = proxy_mod.connectThroughProxyHost(allocator, px, url.host, url.port) catch |err| {
-                    log.warn("wss proxy tunnel to {s}:{d} failed: {}", .{ url.host, url.port, err });
+                    log.debug("wss proxy tunnel to {s}:{d} failed: {}", .{ url.host, url.port, err });
                     return error.ConnectFailed;
                 };
                 var conn = Conn{
@@ -229,7 +229,7 @@ pub const Conn = struct {
         // top -- no redundant TLS layer needed.
         const stream = if (options.proxy) |px|
             proxy_mod.connectThroughProxyHost(allocator, px, url.host, url.port) catch |err| {
-                log.warn("ws proxy tunnel to {s}:{d} failed: {}", .{ url.host, url.port, err });
+                log.debug("ws proxy tunnel to {s}:{d} failed: {}", .{ url.host, url.port, err });
                 return error.ConnectFailed;
             }
         else

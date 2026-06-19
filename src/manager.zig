@@ -27,6 +27,7 @@ const i2p_sam = @import("i2p_sam.zig");
 const i2p_seed = @import("i2p_seed.zig");
 const extension = @import("extension.zig");
 const relay_mod = @import("relay.zig");
+const nip35 = @import("nip35.zig");
 const peer_announce = @import("peer_announce.zig");
 const seeding = @import("seeding.zig");
 const tor_control = @import("tor_control.zig");
@@ -1526,16 +1527,67 @@ fn runThread(mt: *ManagedTransfer) void {
         if (mt.is_seed) {
             publishSeedNostr(mt);
         } else {
-            // Retry discovery while the download has zero peers: the run loop
-            // calls this back on its own thread (safe to add peers) so a seed
-            // that appears/returns later is still picked up — one-shot discovery
-            // left such a download stuck at no_peers.
             mt.session.setPeerDiscovery(mt, rediscoverPeersCb);
-            collectNostrPeers(mt); // initial pass before the loop starts
+            mt.session.setOnComplete(mt, onDownloadCompleteCb);
+            collectNostrPeers(mt);
         }
     }
     mt.session.run() catch |err| {
         log.err("transfer {s}: session error: {}", .{ mt.id, err });
+    };
+}
+
+/// `Session.OnComplete` callback: broadcast the completed torrent on Nostr
+/// (NIP-35 kind-2003) if no event for this info-hash exists on the configured
+/// relays yet. Runs on the session thread after all pieces are verified.
+fn onDownloadCompleteCb(ctx: *anyopaque) void {
+    const mt: *ManagedTransfer = @ptrCast(@alignCast(ctx));
+    broadcastIfNew(mt);
+}
+
+/// Query relays for existing kind-2003 events matching this info-hash. If none
+/// are found, publish a new NIP-35 torrent event so the Nostr collection grows
+/// organically as users complete downloads.
+fn broadcastIfNew(mt: *ManagedTransfer) void {
+    const a = mt.allocator;
+    const relay_urls = nostr_config.readRelays(a) catch return;
+    defer nostr_config.freeRelays(a, relay_urls);
+
+    var ih_hex: [40]u8 = undefined;
+    secp.toHex(&mt.info_hash, &ih_hex);
+
+    const filter: nostr_mod.Filter = .{
+        .kinds = &.{nip35.kind_torrent},
+        .tags = &.{.{ .letter = 'x', .values = &.{&ih_hex} }},
+        .limit = 1,
+    };
+
+    for (relay_urls) |url| {
+        var r = relay_mod.Relay.connect(a, url, mt.proxy) catch continue;
+        defer r.deinit();
+        const events = relay_mod.subscribeAndCollect(a, &r, filter, .{
+            .timeout_ms = 8_000,
+            .max_events = 1,
+        }) catch continue;
+        defer {
+            for (events) |e| e.deinit(a);
+            a.free(events);
+        }
+        if (events.len > 0) {
+            log.info("transfer {s}: torrent already on nostr, skipping broadcast", .{mt.id});
+            return;
+        }
+    }
+
+    log.info("transfer {s}: broadcasting torrent to nostr (NIP-35)", .{mt.id});
+    const ann: seeding.Announce = if (mt.hidden) |h|
+        .{ .onion = .{ .host = h.onion_host, .port = h.onion_port } }
+    else if (mt.i2p_host) |host|
+        .{ .i2p = .{ .host = host, .port = 0 } }
+    else
+        .none;
+    seeding.publish(a, mt.meta, mt.info_hash, ann, "", mt.proxy) catch |err| {
+        log.warn("transfer {s}: nostr broadcast failed: {}", .{ mt.id, err });
     };
 }
 
