@@ -1,6 +1,6 @@
 [package]
 name = "carl-desktop"
-version = "0.2.0"
+version = "0.3.0"
 description = "Desktop GUI for carl — privacy-first BitTorrent client"
 edition = "2021"
 rust-version = "1.77"
