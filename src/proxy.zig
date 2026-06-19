@@ -567,7 +567,7 @@ fn readSocks5Reply(stream: std.net.Stream) ProxyError!void {
     if (head[1] != 0x00) {
         // REP != succeeded: log the reason (0x05 refused, 0x04 host unreachable,
         // 0x02 not allowed by ruleset, ...) so proxy failures are debuggable.
-        log.warn("SOCKS5 CONNECT rejected: REP=0x{x:0>2}", .{head[1]});
+        log.debug("SOCKS5 CONNECT rejected: REP=0x{x:0>2}", .{head[1]});
         return error.HandshakeFailed;
     }
 

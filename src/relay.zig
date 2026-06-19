@@ -34,7 +34,7 @@ pub const Relay = struct {
         // relay; Tor secures it), `wss://` runs cert-verified TLS on top of the
         // proxied stream (the proxy only ever sees ciphertext).
         const conn = ws.Conn.connect(allocator, url, .{ .proxy = proxy }) catch |err| {
-            log.warn("relay connect to {s} failed: {}", .{ url, err });
+            log.debug("relay connect to {s} failed: {}", .{ url, err });
             return error.ConnectFailed;
         };
         return .{ .allocator = allocator, .url = url, .conn = conn };

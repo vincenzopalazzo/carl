@@ -236,7 +236,7 @@ pub fn announce(
 /// nothing is ever sent directly.
 fn announceThroughProxy(allocator: Allocator, proxy: proxy_mod.Proxy, url: []const u8) TrackerError!AnnounceResponse {
     const body = proxy_mod.httpGet(allocator, proxy, url, null) catch |err| {
-        log.warn("proxied tracker announce failed: {}", .{err});
+        log.debug("proxied tracker announce failed: {}", .{err});
         return error.HttpError;
     };
     defer allocator.free(body);
