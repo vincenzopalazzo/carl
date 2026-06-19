@@ -1606,17 +1606,14 @@ pub const Session = struct {
         return error.TrackerFailed;
     }
 
-    /// Whether any announce URL can be used while proxied. HTTP and HTTPS
-    /// trackers are tunneled; UDP trackers are disabled. A torrent with only
-    /// UDP trackers (or none) has no tracker peer source under --proxy, but
-    /// Nostr discovery (NIP-35) still works over Tor.
+    /// Whether any announce URL can be used while proxied. HTTP/HTTPS
+    /// trackers are tunneled directly; UDP trackers are rewritten to HTTP
+    /// and tunneled (most public trackers serve both protocols).
     fn hasProxyUsableTracker(self: *Session) bool {
-        if (isHttpTracker(self.meta.announce)) return true;
+        if (self.meta.announce.len > 0) return true;
         if (self.meta.announce_list) |tiers| {
             for (tiers) |tier| {
-                for (tier) |url| {
-                    if (isHttpTracker(url)) return true;
-                }
+                if (tier.len > 0) return true;
             }
         }
         return false;
@@ -1632,9 +1629,13 @@ pub const Session = struct {
         // (I2P-native trackers are a follow-up.) Skip all clearnet trackers.
         if (self.anonymized() and self.proxy == null) return null;
         if (std.mem.startsWith(u8, url, "udp://")) {
-            // UDP cannot be carried over an HTTP/SOCKS CONNECT tunnel; disable
-            // when proxied so we never leak the real IP via a raw datagram.
-            if (self.proxy != null) return null;
+            if (self.proxy != null) {
+                // UDP can't be tunneled through SOCKS/Tor.  Most public
+                // trackers serve both UDP and HTTP on the same host, so
+                // rewrite udp://host:port → http://host:port/announce and
+                // try through the proxy.
+                return self.tryUdpAsHttp(url, req);
+            }
             return udp_tracker.announce(self.allocator, url, req) catch |err| {
                 log.warn("UDP tracker {s} failed: {}", .{ url, err });
                 return null;
@@ -1647,6 +1648,27 @@ pub const Session = struct {
         } else {
             return null;
         }
+    }
+
+    /// Rewrite a udp:// tracker URL to http:// and try an HTTP announce
+    /// through the proxy.  Many public trackers (opentrackr, openbittorrent,
+    /// torrent.eu.org, …) serve both protocols on the same host:port.
+    fn tryUdpAsHttp(self: *Session, udp_url: []const u8, req: tracker_mod.AnnounceRequest) ?tracker_mod.AnnounceResponse {
+        // udp://host:port[/anything] → http://host:port/announce
+        const host_start = "udp://".len;
+        const rest = udp_url[host_start..];
+        // Find end of host:port (first '/' or end of string)
+        const slash_pos = std.mem.indexOfScalar(u8, rest, '/');
+        const host_port = rest[0..(slash_pos orelse rest.len)];
+
+        var buf: [256]u8 = undefined;
+        const http_url = std.fmt.bufPrint(&buf, "http://{s}/announce", .{host_port}) catch return null;
+
+        log.info("proxied: rewriting {s} → {s}", .{ udp_url, http_url });
+        return tracker_mod.announce(self.allocator, http_url, req, self.proxy) catch |err| {
+            log.debug("HTTP rewrite of UDP tracker {s} failed: {}", .{ udp_url, err });
+            return null;
+        };
     }
 
     fn handleAnnounceResponse(self: *Session, resp: tracker_mod.AnnounceResponse) void {

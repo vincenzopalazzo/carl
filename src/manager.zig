@@ -1460,7 +1460,7 @@ pub fn deriveSources(
     out: *[3]api.SourceKind,
     route: api.Route,
     has_tracker: bool,
-    has_http_tracker: bool,
+    _: bool,
     want_nostr: bool,
 ) []api.SourceKind {
     var n: usize = 0;
@@ -1478,16 +1478,13 @@ pub fn deriveSources(
             }
         },
         .proxy, .tor => {
-            // Tunneled via SOCKS: clearnet DHT and UDP trackers are disabled to
-            // avoid leaks, but HTTP-tracker announces are routed through the
-            // proxy, so peers come from HTTP trackers and Nostr.
-            if (has_http_tracker) {
+            // Tunneled via SOCKS: UDP trackers are rewritten to HTTP and
+            // tunneled through the proxy, so trackers are always usable.
+            if (has_tracker) {
                 out[n] = .tracker;
                 n += 1;
             }
-            // Nostr is always shown when explicitly requested, or implicitly
-            // when there are no HTTP trackers (UDP can't tunnel through SOCKS).
-            if (want_nostr or !has_http_tracker) {
+            if (want_nostr or n == 0) {
                 out[n] = .nostr;
                 n += 1;
             }
@@ -1528,17 +1525,16 @@ pub fn formatEta(buf: []u8, status: api.Status, remaining_bytes: u64, rate_bps: 
 // ---------------------------------------------------------------------------
 
 fn runThread(mt: *ManagedTransfer) void {
-    // Enable Nostr peer discovery when explicitly requested, or implicitly
-    // when proxied (Tor/SOCKS) and no HTTP trackers are available — UDP
-    // trackers can't be tunneled, so Nostr is the only viable peer source.
-    const needs_nostr = mt.want_nostr or
-        (mt.proxy != null and !mt.has_http_tracker);
-    if (needs_nostr) {
+    if (mt.want_nostr) {
         if (mt.is_seed) {
             publishSeedNostr(mt);
         } else {
+            // Retry discovery while the download has zero peers: the run loop
+            // calls this back on its own thread (safe to add peers) so a seed
+            // that appears/returns later is still picked up — one-shot discovery
+            // left such a download stuck at no_peers.
             mt.session.setPeerDiscovery(mt, rediscoverPeersCb);
-            collectNostrPeers(mt);
+            collectNostrPeers(mt); // initial pass before the loop starts
         }
     }
     mt.session.run() catch |err| {
@@ -1715,12 +1711,13 @@ test "deriveSources: direct without tracker drops tracker" {
     try testing.expectEqual(api.SourceKind.dht, s[0]);
 }
 
-test "deriveSources: tor falls back to nostr only" {
+test "deriveSources: tor with udp-only trackers still shows tracker" {
     var buf: [3]api.SourceKind = undefined;
     const s = deriveSources(&buf, .tor, true, false, false);
-    // http tracker absent + want_nostr false => nostr fallback (n==0 branch)
+    // UDP trackers are rewritten to HTTP through the proxy, so tracker
+    // is a valid source even without explicit HTTP tracker URLs.
     try testing.expectEqual(@as(usize, 1), s.len);
-    try testing.expectEqual(api.SourceKind.nostr, s[0]);
+    try testing.expectEqual(api.SourceKind.tracker, s[0]);
 }
 
 test "deriveSources: proxy with http tracker keeps tracker + nostr" {
