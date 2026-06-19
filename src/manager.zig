@@ -1485,7 +1485,9 @@ pub fn deriveSources(
                 out[n] = .tracker;
                 n += 1;
             }
-            if (want_nostr or n == 0) {
+            // Nostr is always shown when explicitly requested, or implicitly
+            // when there are no HTTP trackers (UDP can't tunnel through SOCKS).
+            if (want_nostr or !has_http_tracker) {
                 out[n] = .nostr;
                 n += 1;
             }
@@ -1526,16 +1528,17 @@ pub fn formatEta(buf: []u8, status: api.Status, remaining_bytes: u64, rate_bps: 
 // ---------------------------------------------------------------------------
 
 fn runThread(mt: *ManagedTransfer) void {
-    if (mt.want_nostr) {
+    // Enable Nostr peer discovery when explicitly requested, or implicitly
+    // when proxied (Tor/SOCKS) and no HTTP trackers are available — UDP
+    // trackers can't be tunneled, so Nostr is the only viable peer source.
+    const needs_nostr = mt.want_nostr or
+        (mt.proxy != null and !mt.has_http_tracker);
+    if (needs_nostr) {
         if (mt.is_seed) {
             publishSeedNostr(mt);
         } else {
-            // Retry discovery while the download has zero peers: the run loop
-            // calls this back on its own thread (safe to add peers) so a seed
-            // that appears/returns later is still picked up — one-shot discovery
-            // left such a download stuck at no_peers.
             mt.session.setPeerDiscovery(mt, rediscoverPeersCb);
-            collectNostrPeers(mt); // initial pass before the loop starts
+            collectNostrPeers(mt);
         }
     }
     mt.session.run() catch |err| {
