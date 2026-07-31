@@ -13,7 +13,7 @@ identity/relays/settings read the real config. See **Not yet wired** at the end.
 ## Running
 
 ```sh
-carl daemon [--port p] [--bt-port p] [--route direct|proxy|tor] [--socks url] \
+carl daemon [--port p] [--bt-port p] [--route direct|proxy|tor|i2p] [--socks url] \
             [--download-dir d] [--token tok] [--parent-pid pid] \
             [--tor-control host:port] [--tor-cookie path] [--tor-onion-port p]
 ```
@@ -124,7 +124,7 @@ greeting only — no CONNECT, so it opens no upstream connection) and publishes
 
 ### `POST /api/transfers`
 
-Body: `{ "source": "<magnet|.torrent path|http(s) url>", "route": "direct|proxy|tor", "nostr": bool }`.
+Body: `{ "source": "<magnet|.torrent path|http(s) url>", "route": "direct|proxy|tor|i2p", "nostr": bool }`.
 Adds and starts a transfer. Returns `{ "id": "t<N>" }`. `400` on a bad source.
 
 **Long-running POSTs (`/api/transfers`, `/api/seeds`, `/api/torrents`)** may
@@ -148,7 +148,7 @@ directly); metadata rides in headers:
 
 - `X-Carl-Filename` (required) — the file name (basename only; path components
   are stripped).
-- `X-Carl-Route` — `direct|proxy|tor` (default `tor`).
+- `X-Carl-Route` — `direct|proxy|tor|i2p` (default `tor`).
 - `X-Carl-Nostr` — `true|false`; when true, publishes a NIP-35 torrent event so
   it's discoverable.
 
@@ -199,7 +199,7 @@ Returns `[DiscoverResult]`. Routed through the proxy when the route isn't direct
 
 Body may contain any subset of:
 
-- `"route": "direct|proxy|tor"` — default route for new transfers.
+- `"route": "direct|proxy|tor|i2p"` — default route for new transfers.
 - `"downloadDir": "<path>"` — where new transfers download (created if needed;
   existing transfers keep their directory).
 - `"relays": ["wss://…", "ws://…onion"]` — replaces the relay list, persisted to
@@ -224,7 +224,7 @@ daemon does not read client frames; closing the socket ends the push.
 {
   "id": "t1", "name": "...", "hash": "<40-hex|''>", "magnet": "magnet:?...|''",
   "status": "downloading|seeding|complete|metadata|stalled|connecting|no_peers",
-  "route": "direct|proxy|tor",
+  "route": "direct|proxy|tor|i2p",
   "sources": ["tracker"|"dht"|"nostr", ...],
   "pct": 0-100, "size": <bytes>|null,
   "down": <bytes/s>, "up": <bytes/s>, "eta": "1m 48s|—|stalled",

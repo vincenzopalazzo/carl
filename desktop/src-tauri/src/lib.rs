@@ -250,13 +250,18 @@ fn open_daemon_log() -> SharedLog {
 }
 
 /// Drain one daemon output stream to EOF, teeing lines into the log file.
+///
+/// Byte-oriented on purpose: `read_line` into a String fails the whole drain
+/// loop on the first non-UTF-8 byte (a torrent/peer name logged raw), the
+/// pipe then fills, and the daemon blocks forever on its next stderr write —
+/// the exact "offline daemon" hang this log exists to diagnose.
 fn drain_to_log<R: std::io::Read>(mut reader: BufReader<R>, log: SharedLog) {
-    let mut buf = String::new();
-    while reader.read_line(&mut buf).unwrap_or(0) > 0 {
+    let mut buf: Vec<u8> = Vec::new();
+    while reader.read_until(b'\n', &mut buf).unwrap_or(0) > 0 {
         if let Ok(mut guard) = log.lock() {
             if let Some(f) = guard.as_mut() {
                 use std::io::Write;
-                let _ = f.write_all(buf.as_bytes());
+                let _ = f.write_all(&buf);
             }
         }
         buf.clear();
@@ -314,11 +319,23 @@ fn spawn_daemon(port: u16) -> Result<(Child, DaemonConfig), String> {
         // (not crashed) daemon still reaches stderr EOF and can't leak.
         let _ = child.kill();
         let mut tail = String::new();
-        if let Some(mut err) = child.stderr.take() {
+        if let Some(err) = child.stderr.take() {
             use std::io::Read;
-            let mut all = String::new();
-            let _ = err.read_to_string(&mut all);
-            tail = all.chars().rev().take(2048).collect::<String>().chars().rev().collect();
+            // Cap the read: read_to_end would block until stderr EOF, which a
+            // inherited-fd grandchild could withhold forever. Bytes + lossy
+            // because the daemon's log is not guaranteed UTF-8, and
+            // read_to_string would then discard the tail we came for.
+            let mut all = Vec::new();
+            let _ = err.take(8192).read_to_end(&mut all);
+            let lossy = String::from_utf8_lossy(&all);
+            tail = lossy
+                .chars()
+                .rev()
+                .take(2048)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
         }
         return Err(format!(
             "daemon did not report a token within 10s. daemon log tail:\n{tail}"

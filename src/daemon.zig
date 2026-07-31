@@ -962,6 +962,11 @@ const Conn = struct {
     fn sendAll(self: *Conn, buf: []const u8) !void {
         self.write_mutex.lock();
         defer self.write_mutex.unlock();
+        try self.sendAllLocked(buf);
+    }
+
+    /// Caller must hold `write_mutex` (see `keepaliveLoop`).
+    fn sendAllLocked(self: *Conn, buf: []const u8) !void {
         var off: usize = 0;
         while (off < buf.len) {
             const n = posix.send(self.stream.handle, buf[off..], 0) catch return error.SendFailed;
@@ -1014,7 +1019,12 @@ const Conn = struct {
             waited += 100 * std.time.ns_per_ms;
             if (waited < interval_ns) continue;
             waited = 0;
-            self.sendAll("HTTP/1.1 102 Processing\r\n\r\n") catch return;
+            // Hold the mutex across the done re-check so a tick queued behind
+            // the handler's final response can't emit a trailing 102 after it.
+            self.write_mutex.lock();
+            defer self.write_mutex.unlock();
+            if (done.load(.acquire)) return;
+            self.sendAllLocked("HTTP/1.1 102 Processing\r\n\r\n") catch return;
         }
     }
 
