@@ -1020,7 +1020,12 @@ const Conn = struct {
             if (waited < interval_ns) continue;
             waited = 0;
             // Hold the mutex across the done re-check so a tick queued behind
-            // the handler's final response can't emit a trailing 102 after it.
+            // the handler's final response almost never emits a trailing 102
+            // after it. A residual window remains (tick acquiring the mutex in
+            // the handoff between the final sendAll's unlock and the defer's
+            // done store); it is harmless because the connection closes right
+            // after a complete, Content-Length-delimited response, and clients
+            // discard trailing bytes on a closing connection.
             self.write_mutex.lock();
             defer self.write_mutex.unlock();
             if (done.load(.acquire)) return;

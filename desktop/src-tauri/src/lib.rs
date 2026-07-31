@@ -321,12 +321,19 @@ fn spawn_daemon(port: u16) -> Result<(Child, DaemonConfig), String> {
         let mut tail = String::new();
         if let Some(err) = child.stderr.take() {
             use std::io::Read;
-            // Cap the read: read_to_end would block until stderr EOF, which a
-            // inherited-fd grandchild could withhold forever. Bytes + lossy
-            // because the daemon's log is not guaranteed UTF-8, and
-            // read_to_string would then discard the tail we came for.
-            let mut all = Vec::new();
-            let _ = err.take(8192).read_to_end(&mut all);
+            // Read on a helper thread with a deadline: a blocking read here
+            // only ends at stderr EOF, which a future grandchild inheriting
+            // the pipe could withhold forever. Bytes + lossy because the
+            // daemon's log is not guaranteed UTF-8, and read_to_string would
+            // then discard the tail we came for. A timed-out read just means
+            // no tail — the kill above already guarantees the daemon is gone.
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut all = Vec::new();
+                let _ = err.take(8192).read_to_end(&mut all);
+                let _ = tx.send(all);
+            });
+            let all = rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
             let lossy = String::from_utf8_lossy(&all);
             tail = lossy
                 .chars()
