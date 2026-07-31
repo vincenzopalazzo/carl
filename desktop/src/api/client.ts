@@ -28,7 +28,13 @@ const REQUEST_TIMEOUT_MS = 8000;
  *  daemon's 60s SAM timeout). The 8s read timeout would abort that mid-build —
  *  the transfer/seed never registers and the UI looks like "i2p doesn't work" —
  *  so add/seed get a timeout that comfortably covers session setup. (A bridge
- *  that's actually down still fails fast: connection refused is instant.) */
+ *  that's actually down still fails fast: connection refused is instant.)
+ *
+ *  Note WKWebView itself kills any request idle for ~60s with
+ *  `TypeError: Load failed` — before the daemon sent interim `102 Processing`
+ *  keep-alives, a slow I2P session build (>60s across its SAM round-trips)
+ *  died here with exactly that error even though the daemon was still
+ *  working. The 90s cap below is still a sane upper bound on top. */
 const SESSION_SETUP_TIMEOUT_MS = 90_000;
 
 /** Matches the daemon's body cap (docs/daemon-api.md) — guard before reading the

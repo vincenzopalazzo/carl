@@ -86,7 +86,14 @@ export function Sidebar({
           </div>
           <div className="rstat-row">
             <span className="rstat-lbl">Daemon</span>
-            <span className="rstat-relays">
+            <span
+              className="rstat-relays"
+              title={
+                connected
+                  ? "connected to the carl daemon"
+                  : "daemon unreachable — its log is at ~/.config/carl/daemon.log"
+              }
+            >
               <RelayDot state={connected ? "connected" : "unreachable"} />
               <span className="mono" style={{ fontSize: 11 }}>
                 {connected ? "live" : "offline"}

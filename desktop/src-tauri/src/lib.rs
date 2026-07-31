@@ -223,6 +223,51 @@ fn uninstall_cli(system: bool) -> Result<(), String> {
     }
 }
 
+/// The daemon log file the shell tees the sidecar's output into:
+/// `<config>/carl/daemon.log`, with the same config-dir resolution the daemon
+/// itself uses (`$XDG_CONFIG_HOME/carl`, else `~/.config/carl`). Rotated to
+/// `daemon.log.old` past 2 MiB so a chatty daemon can't fill the disk.
+/// Returns a shareable handle; None if the file can't be opened (draining
+/// still happens, just discarded, so the pipe never blocks the daemon).
+type SharedLog = std::sync::Arc<std::sync::Mutex<Option<std::fs::File>>>;
+
+fn open_daemon_log() -> SharedLog {
+    let file = (|| -> Option<std::fs::File> {
+        let config = std::env::var("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|_| std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+            .ok()?;
+        let dir = config.join("carl");
+        std::fs::create_dir_all(&dir).ok()?;
+        let path = dir.join("daemon.log");
+        const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
+        if std::fs::metadata(&path).map(|m| m.len() > MAX_LOG_BYTES).unwrap_or(false) {
+            let _ = std::fs::rename(&path, dir.join("daemon.log.old"));
+        }
+        std::fs::OpenOptions::new().create(true).append(true).open(path).ok()
+    })();
+    std::sync::Arc::new(std::sync::Mutex::new(file))
+}
+
+/// Drain one daemon output stream to EOF, teeing lines into the log file.
+///
+/// Byte-oriented on purpose: `read_line` into a String fails the whole drain
+/// loop on the first non-UTF-8 byte (a torrent/peer name logged raw), the
+/// pipe then fills, and the daemon blocks forever on its next stderr write —
+/// the exact "offline daemon" hang this log exists to diagnose.
+fn drain_to_log<R: std::io::Read>(mut reader: BufReader<R>, log: SharedLog) {
+    let mut buf: Vec<u8> = Vec::new();
+    while reader.read_until(b'\n', &mut buf).unwrap_or(0) > 0 {
+        if let Ok(mut guard) = log.lock() {
+            if let Some(f) = guard.as_mut() {
+                use std::io::Write;
+                let _ = f.write_all(&buf);
+            }
+        }
+        buf.clear();
+    }
+}
+
 /// Spawn `carl daemon` and block (with a timeout) until it reports its token.
 fn spawn_daemon(port: u16) -> Result<(Child, DaemonConfig), String> {
     let bin = resolve_carl_bin();
@@ -240,6 +285,10 @@ fn spawn_daemon(port: u16) -> Result<(Child, DaemonConfig), String> {
     cmd.args(["daemon", "--port", &port_s, "--parent-pid", &pid_s]);
     let mut child = cmd
         .stdout(Stdio::piped())
+        // Pipe stderr too so the daemon's log (Zig std.log goes to stderr)
+        // lands in the log file below instead of vanishing when the app is
+        // launched from Finder (no console attached).
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("failed to spawn '{bin}': {e}"))?;
 
@@ -264,16 +313,54 @@ fn spawn_daemon(port: u16) -> Result<(Child, DaemonConfig), String> {
         }
     }
     if token.is_empty() {
-        return Err("daemon did not report a token within 10s".to_string());
+        // Surface the daemon's own log tail — a daemon that won't start is
+        // the top cause of a permanently "offline" GUI, and its reason
+        // otherwise vanishes with the discarded pipes. Kill first so a wedged
+        // (not crashed) daemon still reaches stderr EOF and can't leak.
+        let _ = child.kill();
+        let mut tail = String::new();
+        if let Some(err) = child.stderr.take() {
+            use std::io::Read;
+            // Read on a helper thread with a deadline: a blocking read here
+            // only ends at stderr EOF, which a future grandchild inheriting
+            // the pipe could withhold forever. Bytes + lossy because the
+            // daemon's log is not guaranteed UTF-8, and read_to_string would
+            // then discard the tail we came for. A timed-out read just means
+            // no tail — the kill above already guarantees the daemon is gone.
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut all = Vec::new();
+                let _ = err.take(8192).read_to_end(&mut all);
+                let _ = tx.send(all);
+            });
+            let all = rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
+            let lossy = String::from_utf8_lossy(&all);
+            tail = lossy
+                .chars()
+                .rev()
+                .take(2048)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+        }
+        return Err(format!(
+            "daemon did not report a token within 10s. daemon log tail:\n{tail}"
+        ));
     }
 
-    // Keep draining stdout so the daemon's pipe never fills and blocks it.
-    std::thread::spawn(move || {
-        let mut buf = String::new();
-        while reader.read_line(&mut buf).unwrap_or(0) > 0 {
-            buf.clear();
-        }
-    });
+    // Keep draining stdout so the daemon's pipe never fills and blocks it —
+    // and tee it (plus stderr, which carries the daemon's actual log) into
+    // `<config>/carl/daemon.log`. Without this the daemon's output is
+    // discarded entirely, so a crash/wedged daemon in the packaged app leaves
+    // no trace and the GUI's bare "offline" badge is undiagnosable.
+    let log_file = open_daemon_log();
+    let stderr = child.stderr.take();
+    let stdout_log = log_file.clone();
+    std::thread::spawn(move || drain_to_log(reader, stdout_log));
+    if let Some(stderr) = stderr {
+        std::thread::spawn(move || drain_to_log(BufReader::new(stderr), log_file));
+    }
 
     let cfg = DaemonConfig {
         base: format!("http://127.0.0.1:{port}"),
