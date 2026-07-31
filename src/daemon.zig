@@ -343,6 +343,10 @@ pub const Daemon = struct {
 const Conn = struct {
     daemon: *Daemon,
     stream: std.net.Stream,
+    /// Serializes socket writes so the keep-alive ticker (see `withKeepalive`)
+    /// can't interleave its interim 102 bytes into a response the handler is
+    /// sending. Only contended while a slow POST handler is in flight.
+    write_mutex: std.Thread.Mutex = .{},
 
     fn run(self: *Conn) void {
         const a = self.daemon.allocator;
@@ -412,9 +416,14 @@ const Conn = struct {
             return self.sendStatus(.not_found);
         }
         if (std.mem.eql(u8, req.method, "POST")) {
-            if (std.mem.eql(u8, path, "/api/transfers")) return self.addTransfer(body);
-            if (std.mem.eql(u8, path, "/api/seeds")) return self.createSeed(req, body);
-            if (std.mem.eql(u8, path, "/api/torrents")) return self.createTorrent(body);
+            // The add/seed/torrent endpoints block while the daemon builds an
+            // anonymized network session (Tor hidden service, I2P SAM tunnels)
+            // or hashes a large file — potentially minutes. Run them behind
+            // the keep-alive ticker so the webview's ~60s idle limit can't
+            // kill the request mid-setup (the "TypeError: Load failed" bug).
+            if (std.mem.eql(u8, path, "/api/transfers")) return self.withKeepalive(Conn.addTransferEntry, req, body);
+            if (std.mem.eql(u8, path, "/api/seeds")) return self.withKeepalive(Conn.createSeed, req, body);
+            if (std.mem.eql(u8, path, "/api/torrents")) return self.withKeepalive(Conn.createTorrentEntry, req, body);
             if (std.mem.eql(u8, path, "/api/search")) return self.search(req, body);
             if (std.mem.eql(u8, path, "/api/settings")) return self.updateSettings(body);
             if (std.mem.eql(u8, path, "/api/follows")) return self.addFollow(body);
@@ -951,12 +960,74 @@ const Conn = struct {
     }
 
     fn sendAll(self: *Conn, buf: []const u8) !void {
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
         var off: usize = 0;
         while (off < buf.len) {
             const n = posix.send(self.stream.handle, buf[off..], 0) catch return error.SendFailed;
             if (n == 0) return error.Closed;
             off += n;
         }
+    }
+
+    /// Interval between interim `102 Processing` keep-alives on slow POST
+    /// handlers (see `withKeepalive`). Comfortably under the ~60s idle limit
+    /// it defends against.
+    const keepalive_interval_ns = 20 * std.time.ns_per_s;
+
+    /// Run a slow POST handler with an interim-response keep-alive ticker.
+    ///
+    /// The desktop shell's webview (WKWebView / NSURLSession) aborts any
+    /// request whose response takes ~60s+ with zero bytes on the wire, and
+    /// surfaces it to the page as an opaque `TypeError: Load failed` — which
+    /// is what an I2P seed looks like when SESSION CREATE + tunnel build
+    /// outlast that on a cold router (Tor setups finish in seconds, so only
+    /// the i2p route tripped it), and what hashing a multi-GB file into a
+    /// torrent looks like regardless of route. Interim `102 Processing` bytes
+    /// reset that idle timer; every HTTP client consumes 1xx and keeps
+    /// waiting for the final response, so curl and the CLI see no difference.
+    fn withKeepalive(
+        self: *Conn,
+        comptime handler: fn (*Conn, *const http.Request, []const u8) anyerror!void,
+        req: *const http.Request,
+        body: []const u8,
+    ) !void {
+        var done = std.atomic.Value(bool).init(false);
+        const ticker = std.Thread.spawn(.{}, keepaliveLoop, .{ self, &done, keepalive_interval_ns }) catch {
+            return handler(self, req, body); // no ticker — behave as before
+        };
+        defer {
+            done.store(true, .release);
+            ticker.join();
+        }
+        try handler(self, req, body);
+    }
+
+    /// Write an interim `102 Processing` every `interval_ns` until `done`
+    /// flips. A tick racing the handler's final response is harmless: both
+    /// writes are serialized by `write_mutex`, and the connection closes right
+    /// after the response, so a trailing 1xx is never parsed as anything.
+    fn keepaliveLoop(self: *Conn, done: *std.atomic.Value(bool), interval_ns: u64) void {
+        var waited: u64 = 0;
+        while (!done.load(.acquire)) {
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+            waited += 100 * std.time.ns_per_ms;
+            if (waited < interval_ns) continue;
+            waited = 0;
+            self.sendAll("HTTP/1.1 102 Processing\r\n\r\n") catch return;
+        }
+    }
+
+    // `withKeepalive` handlers all take (req, body); these adapt the
+    // body-only endpoints to that shape.
+    fn addTransferEntry(self: *Conn, req: *const http.Request, body: []const u8) !void {
+        _ = req;
+        return self.addTransfer(body);
+    }
+
+    fn createTorrentEntry(self: *Conn, req: *const http.Request, body: []const u8) !void {
+        _ = req;
+        return self.createTorrent(body);
     }
 };
 
@@ -1277,4 +1348,50 @@ test "percentDecode: escapes and plus" {
     const r3 = try percentDecode(a, "%zz");
     defer a.free(r3);
     try testing.expectEqualStrings("%zz", r3);
+}
+
+test "keepaliveLoop: emits interim 102 until done, serialized through sendAll" {
+    // socketpair: the ticker writes on one end, the test reads the other.
+    var fds: [2]posix.fd_t = undefined;
+    {
+        const rc = std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
+        try testing.expect(rc == 0);
+    }
+    defer posix.close(fds[1]);
+
+    // The loop only touches the stream + write mutex, never the daemon.
+    var conn = Conn{ .daemon = undefined, .stream = .{ .handle = fds[0] } };
+    var done = std.atomic.Value(bool).init(false);
+    const ticker = try std.Thread.spawn(.{}, Conn.keepaliveLoop, .{ &conn, &done, 60 * std.time.ns_per_ms });
+
+    // Let a few ticks fire, then stop and join before reading (the bytes wait
+    // in the socket buffer).
+    std.Thread.sleep(250 * std.time.ns_per_ms);
+    done.store(true, .release);
+    ticker.join();
+    posix.close(fds[0]);
+
+    // Drain what the ticker sent; expect at least two interim responses and
+    // no interleaved garbage (writes go through the mutex'd sendAll).
+    var buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (true) {
+        const n = posix.read(fds[1], buf[total..]) catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+        if (n == 0) break;
+        total += n;
+        if (total == buf.len) break;
+    }
+    const got = buf[0..total];
+    const needle = "HTTP/1.1 102 Processing\r\n\r\n";
+    var count: usize = 0;
+    var it = std.mem.splitSequence(u8, got, needle);
+    while (it.next()) |seg| {
+        // Only whole interim responses on the wire — nothing interleaved.
+        try testing.expectEqual(@as(usize, 0), seg.len);
+        count += 1;
+    }
+    try testing.expect(count - 1 >= 2); // split yields one segment per copy + 1
 }

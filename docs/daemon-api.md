@@ -127,6 +127,15 @@ greeting only — no CONNECT, so it opens no upstream connection) and publishes
 Body: `{ "source": "<magnet|.torrent path|http(s) url>", "route": "direct|proxy|tor", "nostr": bool }`.
 Adds and starts a transfer. Returns `{ "id": "t<N>" }`. `400` on a bad source.
 
+**Long-running POSTs (`/api/transfers`, `/api/seeds`, `/api/torrents`)** may
+block for minutes while the daemon builds an anonymized network session (Tor
+hidden service, I2P SAM tunnels) or hashes a large file. While one is in
+flight the daemon emits interim `102 Processing` responses every ~20s before
+the final response — required so WebKit-based clients (the Tauri shell's
+WKWebView kills any request idle for ~60s with `TypeError: Load failed`)
+survive slow session setup. Any compliant HTTP client already ignores 1xx
+interims; curl and the CLI are unaffected.
+
 ### `DELETE /api/transfers/<id>`
 
 Stops and removes a transfer. `204` on success, `404` if unknown.
