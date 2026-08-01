@@ -452,30 +452,76 @@ pub const Conn = struct {
 
         req.sendBodiless() catch return error.HandshakeFailed;
 
-        var redirect_buf: [1024]u8 = undefined;
-        const response = req.receiveHead(&redirect_buf) catch return error.HandshakeFailed;
-        const head = response.head;
-
-        if (head.status != .switching_protocols) {
-            log.warn("ws handshake status {s}", .{@tagName(head.status)});
+        // Read + parse the response head ourselves instead of req.receiveHead():
+        // std's Response.Head.parse does @enumFromInt into the *exhaustive*
+        // std.http.Status enum, so a relay (or the CDN in front of it)
+        // answering with a non-standard code (Cloudflare's 52x/530, etc.)
+        // panics the whole daemon with "invalid enum value" — and the desktop
+        // app sits "offline" on its dead sidecar. Here any non-101 is a
+        // handshake failure, not a crash. (Observed in the field: a relay
+        // behind Cloudflare aborted the daemon exactly this way.)
+        //
+        // Redirects are still followed (std's default redirect_behavior allows
+        // 3): some relays/CDNs 301 the upgrade to a canonical path. Location
+        // is parsed from the raw head so the status never becomes a
+        // std.http.Status.
+        var redirects_left: u8 = 3;
+        var head: []const u8 = undefined;
+        var st: HeadStatus = undefined;
+        while (true) {
+            head = req.reader.receiveHead() catch return error.HandshakeFailed;
+            st = parseHeadStatus(head) orelse {
+                log.warn("ws handshake malformed status line", .{});
+                return error.HandshakeFailed;
+            };
+            switch (st.code) {
+                301, 302, 303, 307, 308 => {
+                    if (redirects_left == 0) {
+                        log.warn("ws handshake too many redirects", .{});
+                        return error.HandshakeFailed;
+                    }
+                    redirects_left -= 1;
+                    const location = findHeadHeader(head, "location") orelse {
+                        log.warn("ws handshake {d} without Location header", .{st.code});
+                        return error.HandshakeFailed;
+                    };
+                    // Drain the redirect body so the stream stays in sync for
+                    // the follow-up request (as std's Request.redirect does).
+                    const te: std.http.TransferEncoding = if (findHeadHeader(head, "transfer-encoding") != null) .chunked else .none;
+                    const cl: ?u64 = if (findHeadHeader(head, "content-length")) |v| std.fmt.parseInt(u64, v, 10) catch null else null;
+                    _ = req.reader.bodyReader(&.{}, te, cl).discardRemaining() catch return error.HandshakeFailed;
+                    // Resolve Location the two ways relays actually use it:
+                    // an absolute https:// URI, or an absolute path on the
+                    // same host.
+                    var new_uri_str: []u8 = undefined;
+                    if (std.mem.startsWith(u8, location, "https://")) {
+                        new_uri_str = self.allocator.dupe(u8, location) catch return error.OutOfMemory;
+                    } else if (location.len > 0 and location[0] == '/') {
+                        new_uri_str = std.fmt.allocPrint(self.allocator, "https://{s}{s}", .{ url.host, location }) catch return error.OutOfMemory;
+                    } else {
+                        log.warn("ws handshake unsupported redirect target: {s}", .{location});
+                        return error.HandshakeFailed;
+                    }
+                    defer self.allocator.free(new_uri_str);
+                    req.uri = std.Uri.parse(new_uri_str) catch return error.HandshakeFailed;
+                    req.sendBodiless() catch return error.HandshakeFailed;
+                    continue;
+                },
+                else => break,
+            }
+        }
+        if (st.code != 101) {
+            log.warn("ws handshake status {d} {s}", .{ st.code, st.reason });
             return error.HandshakeFailed;
         }
 
         const expected = expectedAccept(&key_b64);
-        var it = head.iterateHeaders();
-        var have_accept = false;
-        while (it.next()) |hdr| {
-            if (hdr.name.len != "Sec-WebSocket-Accept".len) continue;
-            if (!std.ascii.eqlIgnoreCase(hdr.name, "Sec-WebSocket-Accept")) continue;
-            if (!std.mem.eql(u8, hdr.value, &expected)) {
-                log.warn("ws handshake bad Sec-WebSocket-Accept", .{});
-                return error.HandshakeFailed;
-            }
-            have_accept = true;
-            break;
-        }
-        if (!have_accept) {
+        const accept = findHeadHeader(head, "Sec-WebSocket-Accept") orelse {
             log.warn("ws handshake missing Sec-WebSocket-Accept header", .{});
+            return error.HandshakeFailed;
+        };
+        if (!std.mem.eql(u8, accept, &expected)) {
+            log.warn("ws handshake bad Sec-WebSocket-Accept", .{});
             return error.HandshakeFailed;
         }
 
@@ -800,6 +846,40 @@ fn expectedAccept(key_b64: []const u8) [28]u8 {
     return out;
 }
 
+/// The status line of a raw HTTP response head, parsed without
+/// std.http.Status: Head.parse does @enumFromInt into the *exhaustive*
+/// std.http.Status enum, so a relay (or the CDN in front of it) answering
+/// with a non-standard code (Cloudflare's 52x/530, etc.) panics the process
+/// with "invalid enum value". For a WebSocket upgrade any non-101 is a
+/// handshake failure, not a crash — keep the code a plain integer.
+const HeadStatus = struct { code: u16, reason: []const u8 };
+
+fn parseHeadStatus(head: []const u8) ?HeadStatus {
+    var it = std.mem.splitSequence(u8, head, "\r\n");
+    const line = it.first();
+    if (line.len < 12) return null;
+    if (!std.mem.startsWith(u8, line, "HTTP/1.1 ") and
+        !std.mem.startsWith(u8, line, "HTTP/1.0 ")) return null;
+    const digits = line[9..12];
+    for (digits) |d| if (!std.ascii.isDigit(d)) return null;
+    const code = @as(u16, digits[0] - '0') * 100 + @as(u16, digits[1] - '0') * 10 + @as(u16, digits[2] - '0');
+    return .{ .code = code, .reason = std.mem.trimLeft(u8, line[12..], " ") };
+}
+
+/// Case-insensitive header lookup in a raw HTTP response head (the status
+/// line is skipped). Returns the trimmed value, or null if absent.
+fn findHeadHeader(head: []const u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.splitSequence(u8, head, "\r\n");
+    _ = it.first(); // status line
+    while (it.next()) |line| {
+        if (line.len == 0) break; // end of head
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(line[0..colon], name)) continue;
+        return std.mem.trim(u8, line[colon + 1 ..], " \t");
+    }
+    return null;
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -829,6 +909,34 @@ test "expectedAccept: RFC 6455 example" {
     // Per RFC 6455 §1.3: key "dGhlIHNhbXBsZSBub25jZQ==" produces accept "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
     const got = expectedAccept("dGhlIHNhbXBsZSBub25jZQ==");
     try std.testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", &got);
+}
+
+test "parseHeadStatus: 101 switching protocols" {
+    const st = parseHeadStatus("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n").?;
+    try std.testing.expectEqual(@as(u16, 101), st.code);
+    try std.testing.expectEqualStrings("Switching Protocols", st.reason);
+}
+
+test "parseHeadStatus: non-standard status code does not panic" {
+    // Cloudflare's 530 is not in std.http.Status; std's Head.parse panics on
+    // it (@enumFromInt into an exhaustive enum), which killed the daemon in
+    // the field and left the desktop app permanently "offline".
+    const st = parseHeadStatus("HTTP/1.1 530 \r\n\r\n").?;
+    try std.testing.expectEqual(@as(u16, 530), st.code);
+    try std.testing.expectEqual(@as(u16, 503), parseHeadStatus("HTTP/1.0 503 Service Unavailable\r\n\r\n").?.code);
+}
+
+test "parseHeadStatus: malformed status lines" {
+    try std.testing.expect(parseHeadStatus("garbage") == null);
+    try std.testing.expect(parseHeadStatus("HTTP/1.1 abc Bad\r\n\r\n") == null);
+    try std.testing.expect(parseHeadStatus("HTTP/1.1 10\r\n\r\n") == null);
+}
+
+test "findHeadHeader: lookup is case-insensitive and trims the value" {
+    const head = "HTTP/1.1 301 Moved Permanently\r\nLocation:  wss://relay.example.com/nostr \r\ncontent-length: 0\r\n\r\n";
+    try std.testing.expectEqualStrings("wss://relay.example.com/nostr", findHeadHeader(head, "location").?);
+    try std.testing.expectEqualStrings("0", findHeadHeader(head, "Content-Length").?);
+    try std.testing.expect(findHeadHeader(head, "sec-websocket-accept") == null);
 }
 
 // Frame-level tests use a fixed-buffer "byte stream" instead of real sockets,
