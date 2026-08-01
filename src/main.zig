@@ -579,7 +579,11 @@ fn cmdSeed(
         var used_persisted = persisted != null;
         const dest: carl.i2p_sam.Session.Dest = if (persisted) |p| .{ .priv = p } else .transient;
         i2p_session = carl.i2p_sam.Session.createWithDest(allocator, bridge, "carl-seed", dest) catch |err| blk: {
-            if (persisted == null) {
+            // Fall back only on a protocol-level rejection (SAM answered
+            // RESULT != OK for our key). Network failures (ConnectFailed,
+            // HandshakeFailed) say nothing about the key — retrying transient
+            // could succeed on router recovery and quarantine a good key.
+            if (persisted == null or err != error.SessionFailed) {
                 log.err("i2p SAM session setup failed: {} (is the router running with SAM?)", .{err});
                 std.process.exit(1);
             }
