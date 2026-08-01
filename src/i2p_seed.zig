@@ -22,8 +22,11 @@ const log = std.log.scoped(.i2p_seed);
 const max_dest_len: usize = 8 * 1024;
 
 /// Real SAM destination blobs are ~500-900 base64 chars; anything shorter is
-/// a truncated/corrupt write (e.g. the daemon died mid-save), not a key.
-const min_dest_len: usize = 128;
+/// a truncated/corrupt write (e.g. the daemon died mid-save), not a key. 384
+/// sits safely below the smallest valid blob (516) while catching tears a
+/// bare base64-validity check cannot (a truncation on a 4-char boundary is
+/// still decodable base64).
+const min_dest_len: usize = 384;
 
 /// True if `data` looks like a usable SAM destination private key: long
 /// enough and standard-base64 decodable.
@@ -111,8 +114,9 @@ test "i2p_seed: isValidDestBlob rejects truncated/corrupt writes" {
     try std.testing.expect(!isValidDestBlob("AAAA"));
     try std.testing.expect(!isValidDestBlob(""));
     try std.testing.expect(!isValidDestBlob("A" ** 100)); // too short
-    try std.testing.expect(!isValidDestBlob("QUJD" ** 40 ++ "!!!")); // not base64
-    try std.testing.expect(isValidDestBlob("QUJD" ** 40)); // 160 valid base64 chars
+    try std.testing.expect(!isValidDestBlob("QUJD" ** 80)); // valid base64 but truncated (<384)
+    try std.testing.expect(!isValidDestBlob("QUJD" ** 100 ++ "!!!")); // not base64
+    try std.testing.expect(isValidDestBlob("QUJD" ** 100)); // 400 valid base64 chars
 }
 
 test "i2p_seed: save then load round-trips; missing is null" {
