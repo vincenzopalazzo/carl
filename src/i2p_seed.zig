@@ -21,19 +21,18 @@ const log = std.log.scoped(.i2p_seed);
 /// headroom for other signature types without being unbounded.
 const max_dest_len: usize = 8 * 1024;
 
-/// Real SAM destination blobs are ~500-900 base64 chars; anything shorter is
-/// a truncated/corrupt write (e.g. the daemon died mid-save), not a key. 384
-/// sits safely below the smallest valid blob (516) while catching tears a
-/// bare base64-validity check cannot (a truncation on a 4-char boundary is
-/// still decodable base64).
-const min_dest_len: usize = 384;
+/// A usable blob must decode to at least the 387-byte public destination
+/// `b32Address` parses (the smallest real SAM blob is 516 base64 chars = 387
+/// bytes). Length alone cannot prove a blob is untorn — a truncation on a
+/// 4-char base64 boundary still decodes — so SAM rejection is the final
+/// arbiter and the caller falls back to a fresh destination on it.
+const min_dest_decoded_len: usize = 387;
 
-/// True if `data` looks like a usable SAM destination private key: long
-/// enough and standard-base64 decodable.
+/// True if `data` looks like a usable SAM destination private key:
+/// standard-base64 decodable to at least the minimum destination size.
 pub fn isValidDestBlob(data: []const u8) bool {
-    if (data.len < min_dest_len) return false;
-    _ = std.base64.standard.Decoder.calcSizeForSlice(data) catch return false;
-    return true;
+    const decoded = std.base64.standard.Decoder.calcSizeForSlice(data) catch return false;
+    return decoded >= min_dest_decoded_len;
 }
 
 fn destPath(allocator: Allocator, info_hash_hex: []const u8) ![]u8 {
@@ -114,9 +113,17 @@ test "i2p_seed: isValidDestBlob rejects truncated/corrupt writes" {
     try std.testing.expect(!isValidDestBlob("AAAA"));
     try std.testing.expect(!isValidDestBlob(""));
     try std.testing.expect(!isValidDestBlob("A" ** 100)); // too short
-    try std.testing.expect(!isValidDestBlob("QUJD" ** 80)); // valid base64 but truncated (<384)
-    try std.testing.expect(!isValidDestBlob("QUJD" ** 100 ++ "!!!")); // not base64
-    try std.testing.expect(isValidDestBlob("QUJD" ** 100)); // 400 valid base64 chars
+    // Valid base64 torn on a 4-char boundary but below the 387-byte minimum.
+    try std.testing.expect(!isValidDestBlob("QUJD" ** 100)); // 400 chars -> 300 bytes
+    try std.testing.expect(!isValidDestBlob("QUJD" ** 130 ++ "!!!")); // not base64
+    try std.testing.expect(isValidDestBlob("QUJD" ** 130)); // 520 chars -> 390 bytes
+}
+
+/// Delete the persisted destination for `info_hash_hex` (best-effort).
+pub fn remove(allocator: Allocator, info_hash_hex: []const u8) void {
+    const path = destPath(allocator, info_hash_hex) catch return;
+    defer allocator.free(path);
+    std.fs.cwd().deleteFile(path) catch {};
 }
 
 test "i2p_seed: save then load round-trips; missing is null" {

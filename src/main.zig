@@ -576,12 +576,26 @@ fn cmdSeed(
         carl.secp.toHex(&carl.metainfo.infoHash(mi.raw_info), &hex);
         const persisted = carl.i2p_seed.load(allocator, &hex) catch null;
         defer if (persisted) |p| allocator.free(p);
+        var used_persisted = persisted != null;
         const dest: carl.i2p_sam.Session.Dest = if (persisted) |p| .{ .priv = p } else .transient;
-        i2p_session = carl.i2p_sam.Session.createWithDest(allocator, bridge, "carl-seed", dest) catch |err| {
-            log.err("i2p SAM session setup failed: {} (is the router running with SAM?)", .{err});
-            std.process.exit(1);
+        i2p_session = carl.i2p_sam.Session.createWithDest(allocator, bridge, "carl-seed", dest) catch |err| blk: {
+            if (persisted == null) {
+                log.err("i2p SAM session setup failed: {} (is the router running with SAM?)", .{err});
+                std.process.exit(1);
+            }
+            // SAM rejected the persisted key (corrupt-but-plausible blob —
+            // length/base64 checks cannot prove a blob is untorn). Fall back
+            // to a fresh destination instead of dying in a restart loop: a
+            // new address beats no seed.
+            log.warn("SAM rejected the persisted i2p destination ({}) — generating a fresh one", .{err});
+            carl.i2p_seed.remove(allocator, &hex);
+            used_persisted = false;
+            break :blk carl.i2p_sam.Session.createWithDest(allocator, bridge, "carl-seed", .transient) catch |err2| {
+                log.err("i2p SAM session setup failed: {} (is the router running with SAM?)", .{err2});
+                std.process.exit(1);
+            };
         };
-        if (persisted == null) carl.i2p_seed.save(allocator, &hex, i2p_session.?.destination);
+        if (!used_persisted) carl.i2p_seed.save(allocator, &hex, i2p_session.?.destination);
         const host = carl.i2p_sam.b32Address(allocator, i2p_session.?.destination) catch {
             log.err("could not derive the .b32.i2p address", .{});
             std.process.exit(1);
