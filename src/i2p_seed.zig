@@ -21,6 +21,18 @@ const log = std.log.scoped(.i2p_seed);
 /// headroom for other signature types without being unbounded.
 const max_dest_len: usize = 8 * 1024;
 
+/// Real SAM destination blobs are ~500-900 base64 chars; anything shorter is
+/// a truncated/corrupt write (e.g. the daemon died mid-save), not a key.
+const min_dest_len: usize = 128;
+
+/// True if `data` looks like a usable SAM destination private key: long
+/// enough and standard-base64 decodable.
+pub fn isValidDestBlob(data: []const u8) bool {
+    if (data.len < min_dest_len) return false;
+    _ = std.base64.standard.Decoder.calcSizeForSlice(data) catch return false;
+    return true;
+}
+
 fn destPath(allocator: Allocator, info_hash_hex: []const u8) ![]u8 {
     const dir = try nostr_config.configDir(allocator);
     defer allocator.free(dir);
@@ -39,6 +51,17 @@ pub fn load(allocator: Allocator, info_hash_hex: []const u8) !?[]u8 {
     const trimmed = std.mem.trim(u8, data, " \t\r\n");
     if (trimmed.len == 0) {
         allocator.free(data);
+        return null;
+    }
+    // A truncated/corrupt blob (e.g. daemon killed mid-save before the write
+    // was atomic) would be fed to SESSION CREATE, SAM rejects it, and the
+    // seed process exits — the seed vanishes on every restart. Treat it as
+    // missing instead: quarantine the file and let the caller generate a
+    // fresh transient destination (new address beats no seed).
+    if (!isValidDestBlob(trimmed)) {
+        log.warn("ignoring corrupt i2p seed destination {s} ({d} bytes) — a fresh address will be generated", .{ path, trimmed.len });
+        allocator.free(data);
+        std.fs.cwd().deleteFile(path) catch {};
         return null;
     }
     if (trimmed.len == data.len) return data;
@@ -67,10 +90,29 @@ fn saveImpl(allocator: Allocator, info_hash_hex: []const u8, dest_priv: []const 
     };
     const path = try std.fmt.allocPrint(allocator, "{s}/{s}.dest", .{ seeds_dir, info_hash_hex });
     defer allocator.free(path);
-    var file = try std.fs.cwd().createFile(path, .{ .truncate = true, .mode = 0o600 });
-    defer file.close();
-    try file.writeAll(dest_priv);
-    try file.chmod(0o600);
+    // Write to a temp file + rename so a crash mid-write can never leave a
+    // truncated key behind — the rename is atomic, readers see either the old
+    // complete blob or the new one, never a prefix. (Observed in the field:
+    // a daemon crash left a 4-byte .dest, SAM then rejected it and the seed
+    // died on every restart.)
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    defer allocator.free(tmp_path);
+    {
+        var file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true, .mode = 0o600 });
+        defer file.close();
+        try file.writeAll(dest_priv);
+        try file.chmod(0o600);
+    }
+    try std.fs.cwd().rename(tmp_path, path);
+}
+
+test "i2p_seed: isValidDestBlob rejects truncated/corrupt writes" {
+    // The 4-byte "AAAA" file a crashed daemon left behind in the field.
+    try std.testing.expect(!isValidDestBlob("AAAA"));
+    try std.testing.expect(!isValidDestBlob(""));
+    try std.testing.expect(!isValidDestBlob("A" ** 100)); // too short
+    try std.testing.expect(!isValidDestBlob("QUJD" ** 40 ++ "!!!")); // not base64
+    try std.testing.expect(isValidDestBlob("QUJD" ** 40)); // 160 valid base64 chars
 }
 
 test "i2p_seed: save then load round-trips; missing is null" {
