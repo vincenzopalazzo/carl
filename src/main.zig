@@ -576,12 +576,33 @@ fn cmdSeed(
         carl.secp.toHex(&carl.metainfo.infoHash(mi.raw_info), &hex);
         const persisted = carl.i2p_seed.load(allocator, &hex) catch null;
         defer if (persisted) |p| allocator.free(p);
+        var used_persisted = persisted != null;
         const dest: carl.i2p_sam.Session.Dest = if (persisted) |p| .{ .priv = p } else .transient;
-        i2p_session = carl.i2p_sam.Session.createWithDest(allocator, bridge, "carl-seed", dest) catch |err| {
-            log.err("i2p SAM session setup failed: {} (is the router running with SAM?)", .{err});
-            std.process.exit(1);
+        i2p_session = carl.i2p_sam.Session.createWithDest(allocator, bridge, "carl-seed", dest) catch |err| blk: {
+            // Fall back only on a protocol-level rejection (SAM answered
+            // RESULT != OK for our key). Network failures (ConnectFailed,
+            // HandshakeFailed) say nothing about the key — retrying transient
+            // could succeed on router recovery and quarantine a good key.
+            if (persisted == null or err != error.SessionFailed) {
+                log.err("i2p SAM session setup failed: {} (is the router running with SAM?)", .{err});
+                std.process.exit(1);
+            }
+            // SAM rejected the persisted key (corrupt-but-plausible blob —
+            // length/base64 checks cannot prove a blob is untorn). Fall back
+            // to a fresh destination instead of dying in a restart loop: a
+            // new address beats no seed.
+            log.warn("SAM rejected the persisted i2p destination ({}) — generating a fresh one", .{err});
+            used_persisted = false;
+            const fresh = carl.i2p_sam.Session.createWithDest(allocator, bridge, "carl-seed", .transient) catch |err2| {
+                log.err("i2p SAM session setup failed: {} (is the router running with SAM?)", .{err2});
+                std.process.exit(1);
+            };
+            // Only quarantine once the retry succeeded — the first failure
+            // was the key, not SAM, so the persisted blob is proven bad.
+            carl.i2p_seed.remove(allocator, &hex);
+            break :blk fresh;
         };
-        if (persisted == null) carl.i2p_seed.save(allocator, &hex, i2p_session.?.destination);
+        if (!used_persisted) carl.i2p_seed.save(allocator, &hex, i2p_session.?.destination);
         const host = carl.i2p_sam.b32Address(allocator, i2p_session.?.destination) catch {
             log.err("could not derive the .b32.i2p address", .{});
             std.process.exit(1);

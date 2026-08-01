@@ -21,6 +21,25 @@ const log = std.log.scoped(.i2p_seed);
 /// headroom for other signature types without being unbounded.
 const max_dest_len: usize = 8 * 1024;
 
+/// A usable blob must decode to at least the 387-byte public destination
+/// `b32Address` parses (the smallest real SAM blob is 516 base64 chars = 387
+/// bytes). Length alone cannot prove a blob is untorn — a truncation on a
+/// 4-char base64 boundary still decodes — so SAM rejection is the final
+/// arbiter and the caller falls back to a fresh destination on it.
+const min_dest_decoded_len: usize = 387;
+
+/// I2P uses its own base64 alphabet — `-` and `~` instead of `+` and `/` —
+/// so a valid SAM blob may not decode as standard base64. Accept either.
+const i2p_decoder = std.base64.Base64Decoder.init("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-~".*, '=');
+
+/// True if `data` looks like a usable SAM destination private key: decodable
+/// (standard or I2P base64 alphabet) to at least the minimum destination size.
+pub fn isValidDestBlob(data: []const u8) bool {
+    const std_n = std.base64.standard.Decoder.calcSizeForSlice(data) catch 0;
+    const i2p_n = i2p_decoder.calcSizeForSlice(data) catch 0;
+    return @max(std_n, i2p_n) >= min_dest_decoded_len;
+}
+
 fn destPath(allocator: Allocator, info_hash_hex: []const u8) ![]u8 {
     const dir = try nostr_config.configDir(allocator);
     defer allocator.free(dir);
@@ -39,6 +58,17 @@ pub fn load(allocator: Allocator, info_hash_hex: []const u8) !?[]u8 {
     const trimmed = std.mem.trim(u8, data, " \t\r\n");
     if (trimmed.len == 0) {
         allocator.free(data);
+        return null;
+    }
+    // A truncated/corrupt blob (e.g. daemon killed mid-save before the write
+    // was atomic) would be fed to SESSION CREATE, SAM rejects it, and the
+    // seed process exits — the seed vanishes on every restart. Treat it as
+    // missing instead: quarantine the file and let the caller generate a
+    // fresh transient destination (new address beats no seed).
+    if (!isValidDestBlob(trimmed)) {
+        log.warn("ignoring corrupt i2p seed destination {s} ({d} bytes) — a fresh address will be generated", .{ path, trimmed.len });
+        allocator.free(data);
+        std.fs.cwd().deleteFile(path) catch {};
         return null;
     }
     if (trimmed.len == data.len) return data;
@@ -67,10 +97,40 @@ fn saveImpl(allocator: Allocator, info_hash_hex: []const u8, dest_priv: []const 
     };
     const path = try std.fmt.allocPrint(allocator, "{s}/{s}.dest", .{ seeds_dir, info_hash_hex });
     defer allocator.free(path);
-    var file = try std.fs.cwd().createFile(path, .{ .truncate = true, .mode = 0o600 });
-    defer file.close();
-    try file.writeAll(dest_priv);
-    try file.chmod(0o600);
+    // Write to a temp file + rename so a crash mid-write can never leave a
+    // truncated key behind — the rename is atomic, readers see either the old
+    // complete blob or the new one, never a prefix. (Observed in the field:
+    // a daemon crash left a 4-byte .dest, SAM then rejected it and the seed
+    // died on every restart.)
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    defer allocator.free(tmp_path);
+    {
+        var file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true, .mode = 0o600 });
+        defer file.close();
+        try file.writeAll(dest_priv);
+        try file.chmod(0o600);
+    }
+    try std.fs.cwd().rename(tmp_path, path);
+}
+
+test "i2p_seed: isValidDestBlob rejects truncated/corrupt writes" {
+    // The 4-byte "AAAA" file a crashed daemon left behind in the field.
+    try std.testing.expect(!isValidDestBlob("AAAA"));
+    try std.testing.expect(!isValidDestBlob(""));
+    try std.testing.expect(!isValidDestBlob("A" ** 100)); // too short
+    // Valid base64 torn on a 4-char boundary but below the 387-byte minimum.
+    try std.testing.expect(!isValidDestBlob("QUJD" ** 100)); // 400 chars -> 300 bytes
+    try std.testing.expect(!isValidDestBlob("QUJD" ** 130 ++ "!!!")); // not base64
+    try std.testing.expect(isValidDestBlob("QUJD" ** 130)); // 520 chars -> 390 bytes
+    // I2P-alphabet blob (- and ~) must not be rejected as corrupt.
+    try std.testing.expect(isValidDestBlob("QUJD" ** 129 ++ "-~JD"));
+}
+
+/// Delete the persisted destination for `info_hash_hex` (best-effort).
+pub fn remove(allocator: Allocator, info_hash_hex: []const u8) void {
+    const path = destPath(allocator, info_hash_hex) catch return;
+    defer allocator.free(path);
+    std.fs.cwd().deleteFile(path) catch {};
 }
 
 test "i2p_seed: save then load round-trips; missing is null" {
