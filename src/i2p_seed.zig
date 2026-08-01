@@ -28,11 +28,16 @@ const max_dest_len: usize = 8 * 1024;
 /// arbiter and the caller falls back to a fresh destination on it.
 const min_dest_decoded_len: usize = 387;
 
-/// True if `data` looks like a usable SAM destination private key:
-/// standard-base64 decodable to at least the minimum destination size.
+/// I2P uses its own base64 alphabet — `-` and `~` instead of `+` and `/` —
+/// so a valid SAM blob may not decode as standard base64. Accept either.
+const i2p_decoder = std.base64.Base64Decoder.init("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-~".*, '=');
+
+/// True if `data` looks like a usable SAM destination private key: decodable
+/// (standard or I2P base64 alphabet) to at least the minimum destination size.
 pub fn isValidDestBlob(data: []const u8) bool {
-    const decoded = std.base64.standard.Decoder.calcSizeForSlice(data) catch return false;
-    return decoded >= min_dest_decoded_len;
+    const std_n = std.base64.standard.Decoder.calcSizeForSlice(data) catch 0;
+    const i2p_n = i2p_decoder.calcSizeForSlice(data) catch 0;
+    return @max(std_n, i2p_n) >= min_dest_decoded_len;
 }
 
 fn destPath(allocator: Allocator, info_hash_hex: []const u8) ![]u8 {
@@ -117,6 +122,8 @@ test "i2p_seed: isValidDestBlob rejects truncated/corrupt writes" {
     try std.testing.expect(!isValidDestBlob("QUJD" ** 100)); // 400 chars -> 300 bytes
     try std.testing.expect(!isValidDestBlob("QUJD" ** 130 ++ "!!!")); // not base64
     try std.testing.expect(isValidDestBlob("QUJD" ** 130)); // 520 chars -> 390 bytes
+    // I2P-alphabet blob (- and ~) must not be rejected as corrupt.
+    try std.testing.expect(isValidDestBlob("QUJD" ** 129 ++ "-~JD"));
 }
 
 /// Delete the persisted destination for `info_hash_hex` (best-effort).

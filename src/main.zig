@@ -588,12 +588,15 @@ fn cmdSeed(
             // to a fresh destination instead of dying in a restart loop: a
             // new address beats no seed.
             log.warn("SAM rejected the persisted i2p destination ({}) — generating a fresh one", .{err});
-            carl.i2p_seed.remove(allocator, &hex);
             used_persisted = false;
-            break :blk carl.i2p_sam.Session.createWithDest(allocator, bridge, "carl-seed", .transient) catch |err2| {
+            const fresh = carl.i2p_sam.Session.createWithDest(allocator, bridge, "carl-seed", .transient) catch |err2| {
                 log.err("i2p SAM session setup failed: {} (is the router running with SAM?)", .{err2});
                 std.process.exit(1);
             };
+            // Only quarantine once the retry succeeded — the first failure
+            // was the key, not SAM, so the persisted blob is proven bad.
+            carl.i2p_seed.remove(allocator, &hex);
+            break :blk fresh;
         };
         if (!used_persisted) carl.i2p_seed.save(allocator, &hex, i2p_session.?.destination);
         const host = carl.i2p_sam.b32Address(allocator, i2p_session.?.destination) catch {
