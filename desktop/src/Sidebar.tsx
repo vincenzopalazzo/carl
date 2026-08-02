@@ -34,7 +34,7 @@ export function Sidebar({
     ).length,
     following: (state.follows ?? []).length,
     seeding: state.seeds.length,
-    drive: state.drives.length,
+    drive: state.drives?.length ?? 0,
   };
   const connectedRelays = state.relays.filter(
     (r) => r.state === "connected",
