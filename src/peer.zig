@@ -9,6 +9,7 @@ const i2p_sam = @import("i2p_sam.zig");
 
 pub const PeerState = enum {
     connecting,
+    socks_connecting,
     handshaking,
     active,
     disconnected,
@@ -328,7 +329,20 @@ pub const PeerConnection = struct {
     /// synchronously (the caller caps how many it attempts per call); the BT
     /// handshake is queued right after.
     pub fn startConnect(self: *PeerConnection, info_hash: [20]u8, peer_id: [20]u8) !void {
-        if (self.proxy != null or self.i2p != null) {
+        if (self.proxy) |px| {
+            if (px.scheme == .socks5 or px.scheme == .socks5h) {
+                // Async SOCKS5 (Tor): fast local handshake + send CONNECT, then
+                // return. The poll loop reads the reply when Tor finishes building
+                // the circuit — no blocking the event loop for 1-10s per peer.
+                try self.startProxyConnect();
+                return;
+            }
+            // HTTP CONNECT proxy: synchronous (rare, not Tor)
+            try self.connect();
+            try self.sendHandshake(info_hash, peer_id);
+            return;
+        }
+        if (self.i2p != null) {
             try self.connect();
             try self.sendHandshake(info_hash, peer_id);
             return;
@@ -394,6 +408,47 @@ pub const PeerConnection = struct {
         o.NONBLOCK = false;
         _ = std.posix.fcntl(s.handle, std.posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
         setNoDelay(s);
+        self.state = .handshaking;
+        try self.sendHandshake(info_hash, peer_id);
+    }
+
+    /// Async SOCKS5 proxy connect: TCP connect to proxy + SOCKS5 auth + send
+    /// CONNECT request (all fast/local), then return. The poll loop calls
+    /// finishProxyConnect when the socket is readable (Tor circuit built).
+    fn startProxyConnect(self: *PeerConnection) !void {
+        const px = self.proxy orelse return error.ConnectionFailed;
+        self.stream = proxy_mod.connectThroughProxyAddrStart(self.allocator, px, self.address) catch {
+            self.state = .disconnected;
+            return error.ConnectionFailed;
+        };
+        const flags = std.posix.fcntl(self.stream.?.handle, std.posix.F.GETFL, 0) catch {
+            self.state = .disconnected;
+            return error.ConnectionFailed;
+        };
+        var o: std.posix.O = @bitCast(@as(u32, @truncate(flags)));
+        o.NONBLOCK = true;
+        _ = std.posix.fcntl(self.stream.?.handle, std.posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
+        self.state = .socks_connecting;
+        self.connect_started_at = std.time.timestamp();
+    }
+
+    /// Complete an async SOCKS5 proxy connect: read the CONNECT reply (socket
+    /// is readable so this is instant), restore blocking, queue BT handshake.
+    pub fn finishProxyConnect(self: *PeerConnection, info_hash: [20]u8, peer_id: [20]u8) !void {
+        const s = self.stream orelse return error.ConnectionFailed;
+        const flags = std.posix.fcntl(s.handle, std.posix.F.GETFL, 0) catch {
+            self.state = .disconnected;
+            return error.ConnectionFailed;
+        };
+        var o: std.posix.O = @bitCast(@as(u32, @truncate(flags)));
+        o.NONBLOCK = false;
+        _ = std.posix.fcntl(s.handle, std.posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
+        proxy_mod.readSocks5ReplyPub(s) catch {
+            self.state = .disconnected;
+            return error.ConnectionFailed;
+        };
+        setNoDelay(s);
+        setSocketBuffers(s.handle);
         self.state = .handshaking;
         try self.sendHandshake(info_hash, peer_id);
     }

@@ -773,6 +773,22 @@ pub const Session = struct {
                 continue;
             }
 
+            // SOCKS5 proxy connect reply is ready (socket readable).
+            if (p.state == .socks_connecting) {
+                if (revents & std.posix.POLL.IN != 0) {
+                    p.finishProxyConnect(self.info_hash, self.peer_id) catch {
+                        p.disconnect();
+                        fd_idx += 1;
+                        continue;
+                    };
+                    _ = p.flushSend() catch {
+                        p.disconnect();
+                    };
+                }
+                fd_idx += 1;
+                continue;
+            }
+
             if (revents & std.posix.POLL.IN != 0) {
                 _ = p.readIncoming() catch {
                     if (p.state == .active) log.debug("peer read-err, idle {d}s", .{std.time.timestamp() - p.last_recv_time});
@@ -1728,7 +1744,7 @@ pub const Session = struct {
                 // A clearnet peer stuck in the non-blocking connect phase past
                 // the connect timeout is a dead host — reclaim its poll slot so
                 // it doesn't squat against the max_peers cap.
-                if (p.state == .connecting and now - p.connect_started_at > peer_mod.PeerConnection.connect_timeout_secs) {
+                if ((p.state == .connecting or p.state == .socks_connecting) and now - p.connect_started_at > peer_mod.PeerConnection.connect_timeout_secs) {
                     p.disconnect();
                     i += 1;
                     continue;

@@ -193,6 +193,42 @@ pub fn connectThroughProxyAddr(allocator: Allocator, proxy: Proxy, target: std.n
     return stream;
 }
 
+/// SOCKS5 proxy connect split: TCP connect to the proxy + SOCKS5 auth + send
+/// CONNECT request, but DON'T read the reply. The caller polls for readability
+/// and then calls `readSocks5ReplyPub`. Lets the Tor circuit-build (1-10s)
+/// happen async without blocking the event loop.
+pub fn connectThroughProxyAddrStart(allocator: Allocator, proxy: Proxy, target: std.net.Address) ProxyError!std.net.Stream {
+    if (target.any.family != std.posix.AF.INET) return error.UnsupportedAddress;
+    const ip4: [4]u8 = @bitCast(target.in.sa.addr);
+    const port = target.getPort();
+
+    var stream = try dialProxy(allocator, proxy, proxy_timeout_secs);
+    errdefer stream.close();
+
+    switch (proxy.scheme) {
+        .socks5, .socks5h => {
+            try socks5Handshake(stream, proxy);
+            const req = buildSocks5ConnectIp4(ip4, port);
+            try writeAll(stream, &req);
+        },
+        .http => {
+            var host_buf: [16]u8 = undefined;
+            const host = std.fmt.bufPrint(&host_buf, "{d}.{d}.{d}.{d}", .{
+                ip4[0], ip4[1], ip4[2], ip4[3],
+            }) catch return error.HandshakeFailed;
+            try httpConnect(allocator, stream, proxy, host, port);
+        },
+    }
+
+    return stream;
+}
+
+/// Public wrapper so the async proxy-connect path can read the SOCKS5 CONNECT
+/// reply when the socket becomes readable.
+pub fn readSocks5ReplyPub(stream: std.net.Stream) ProxyError!void {
+    return readSocks5Reply(stream);
+}
+
 /// Open a TCP tunnel through the proxy to a host:port. With socks5h the
 /// hostname is sent to the proxy to resolve (no DNS leak); with socks5 we
 /// resolve locally; with http the proxy resolves via CONNECT.
