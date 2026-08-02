@@ -765,14 +765,21 @@ const Conn = struct {
                 if (dir.len > 0) self.daemon.manager.setDownloadDir(dir) catch {};
             }
             // Relays: a JSON array of strings, persisted to the config file so
-            // the prober, search, and the CLI all pick them up.
+            // the prober, search, and the CLI all pick them up. Normalize each
+            // entry (https:// → wss://, bare host → wss://host, …) so the
+            // persisted file is canonical; entries that can't be a websocket
+            // relay are dropped rather than written for connect loops to spin
+            // on.
             if (obj.get("relays")) |v| {
                 if (v == .array) {
                     var list: std.ArrayList([]const u8) = .empty;
                     for (v.array.items) |item| {
                         if (item == .string) {
-                            const t = std.mem.trim(u8, item.string, " \t\r\n");
-                            if (t.len > 0) try list.append(aa, t);
+                            if (try nostr_config.normalizeRelayUrl(aa, item.string)) |url| {
+                                try list.append(aa, url);
+                            } else {
+                                log.warn("settings: dropping invalid relay URL '{s}'", .{item.string});
+                            }
                         }
                     }
                     nostr_config.writeRelays(a, list.items) catch {};

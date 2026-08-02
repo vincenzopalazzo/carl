@@ -29,12 +29,40 @@ const optimistic_interval_secs: i64 = 30;
 /// no_peers forever. Re-querying relays is slow (~seconds per relay), so only
 /// retry when stuck at zero peers and not more often than this.
 const peer_rediscovery_interval_secs: i64 = 45;
+/// Cap for the zero-peer Nostr re-discovery backoff (base is
+/// `peer_rediscovery_interval_secs`, doubling per consecutive empty query).
+/// Without it a seedless torrent re-queried the relays every 45s forever and
+/// got the client rate-limited (relay.damus.io). Any found peer resets it.
+const peer_rediscovery_backoff_cap_secs: i64 = 600;
+/// Backoff for failed tracker/DHT announce attempts: base doubling per
+/// consecutive fully-failed announce, capped. A total failure never stamps
+/// `last_announce_time`, so without an attempt-stamped backoff the maintenance
+/// gate re-ran the whole blocking multi-tracker announce every tick.
+const announce_backoff_base_secs: i64 = 15;
+const announce_backoff_cap_secs: i64 = 300;
 /// How long an outstanding block request may go unanswered before it is
 /// cancelled and released back to the scheduler. Long enough that a slow
 /// anonymized route (I2P round trips run seconds) is never penalized; short
 /// enough that one silent peer can't hold blocks hostage while others could
 /// fetch them.
 const request_timeout_secs: i64 = 60;
+
+/// Seconds to wait before retrying tracker/DHT discovery after `fail_streak`
+/// consecutive fully-failed announces: 15s doubling per failure, capped at
+/// 300s. Returns 0 while nothing has failed (the regular tracker-provided
+/// interval applies then).
+fn announceBackoffSecs(fail_streak: u32) i64 {
+    if (fail_streak == 0) return 0;
+    const shift: u6 = @intCast(@min(fail_streak - 1, 5));
+    return @min(announce_backoff_base_secs << shift, announce_backoff_cap_secs);
+}
+
+/// Seconds to wait before the next zero-peer Nostr re-discovery: the base
+/// 45s interval doubling per consecutive empty query, capped at 600s.
+fn rediscoveryBackoffSecs(fail_streak: u32) i64 {
+    const shift: u6 = @intCast(@min(fail_streak, 4));
+    return @min(peer_rediscovery_interval_secs << shift, peer_rediscovery_backoff_cap_secs);
+}
 
 /// Periodic peer re-discovery hook. The session run loop calls `run(ctx)` on
 /// its own thread when the transfer has zero peers, so the callback can safely
@@ -87,6 +115,14 @@ pub const Session = struct {
     // Tracker state
     tracker_interval: u64,
     last_announce_time: i64,
+    /// Stamped at the START of every tracker/DHT discovery attempt, regardless
+    /// of outcome — unlike `last_announce_time`, which only a successful
+    /// announce stamps. Gates retries so a failing announce backs off instead
+    /// of re-running every maintenance tick. Defaulted so init need not set it.
+    last_announce_attempt: i64 = 0,
+    /// Consecutive fully-failed announces; drives `announceBackoffSecs`.
+    /// Reset by any successful tracker response. Defaulted like the above.
+    announce_fail_streak: u32 = 0,
     uploaded: u64,
     downloaded: u64,
 
@@ -207,6 +243,9 @@ pub const Session = struct {
     peer_discovery: ?PeerDiscovery = null,
     /// Timestamp of the last peer re-discovery, to rate-limit retries.
     last_peer_discovery_s: i64 = 0,
+    /// Consecutive zero-peer Nostr re-discovery attempts; drives
+    /// `rediscoveryBackoffSecs`. Reset once any peer shows up.
+    rediscovery_fail_streak: u32 = 0,
     /// Fired once when a download completes. The manager uses this to broadcast
     /// the torrent on Nostr (NIP-35) if not already present on relays.
     on_complete: ?OnComplete = null,
@@ -498,6 +537,17 @@ pub const Session = struct {
                     .{},
                 );
             }
+        }
+
+        // Native I2P (no proxy): `tryAnnounceUrl` skips every clearnet tracker
+        // and DHT is off (`anonymized`), so Nostr `.b32.i2p` peer-announces are
+        // the only discovery source. Say so once, or an eternal "no peers" has
+        // no explanation.
+        if (self.i2p != null and self.proxy == null) {
+            log.warn(
+                "i2p route: peer discovery is nostr-only (clearnet trackers and DHT are disabled); torrents without i2p seeders will not find peers",
+                .{},
+            );
         }
 
         // Multi-tracker announce (BEP 12) / DHT peer discovery
@@ -1421,10 +1471,13 @@ pub const Session = struct {
             }
         }
 
-        // Sort by bytes_downloaded descending (they upload to us the most)
+        // Sort by current download rate descending (who uploads to us fastest
+        // NOW — the per-peer EWMA, not lifetime bytes, which favored old peers
+        // that have gone quiet). Tie-break by lifetime bytes_downloaded.
         const slice = interested_peers[0..count];
         std.mem.sort(*peer_mod.PeerConnection, slice, {}, struct {
             fn cmp(_: void, a: *peer_mod.PeerConnection, b: *peer_mod.PeerConnection) bool {
+                if (a.down_rate != b.down_rate) return a.down_rate > b.down_rate;
                 return a.bytes_downloaded > b.bytes_downloaded;
             }
         }.cmp);
@@ -1582,14 +1635,24 @@ pub const Session = struct {
         self.runChokingAlgorithm();
 
         if (!self.tor_hidden) {
-            // Re-announce to trackers at the tracker-provided interval
+            // Re-announce to trackers at the tracker-provided interval. After
+            // a fully-failed announce (which never stamps `last_announce_time`)
+            // retry on the exponential backoff clock instead — gating on the
+            // success stamp alone re-ran the whole blocking announce every tick.
+            // The attempt clock only applies while failing: the zero-peer DHT
+            // retry below stamps `last_announce_attempt` every ~30s, which
+            // would otherwise starve the regular interval re-announce.
             const interval_secs = std.math.cast(i64, self.tracker_interval) orelse 1800;
-            if (now - self.last_announce_time > interval_secs) {
+            const retry_ok = self.announce_fail_streak == 0 or
+                now - self.last_announce_attempt > announceBackoffSecs(self.announce_fail_streak);
+            if (now - self.last_announce_time > interval_secs and retry_ok) {
                 self.doMultiTrackerAnnounce(.none) catch {};
             }
 
-            // DHT: retry more aggressively when we have zero peers
-            if (self.peers.items.len == 0 and now - self.last_announce_time > 30) {
+            // DHT: retry more aggressively when we have zero peers — but on
+            // the same attempt-stamped backoff, never every tick.
+            if (self.peers.items.len == 0 and now - self.last_announce_attempt > @max(30, announceBackoffSecs(self.announce_fail_streak))) {
+                self.last_announce_attempt = now;
                 self.tryDhtPeerDiscovery() catch {};
             }
         }
@@ -1600,11 +1663,26 @@ pub const Session = struct {
         // safely. Gated on download mode + zero peers so it never duplicates a
         // live connection, competes with an active download, or fires once the
         // transfer has completed and is only seeding (dialing out is pointless
-        // then); rate-limited because relay queries are slow.
+        // then); rate-limited because relay queries are slow, and backed off
+        // exponentially while queries keep coming back empty so a seedless
+        // torrent can't hammer (and get rate-limited by) the relays forever.
         if (self.peer_discovery) |pd| {
-            if (self.mode == .download and self.peers.items.len == 0 and now - self.last_peer_discovery_s > peer_rediscovery_interval_secs) {
-                self.last_peer_discovery_s = now;
-                pd.run(pd.ctx);
+            if (self.mode == .download and self.peers.items.len == 0) {
+                if (now - self.last_peer_discovery_s > rediscoveryBackoffSecs(self.rediscovery_fail_streak)) {
+                    self.last_peer_discovery_s = now;
+                    pd.run(pd.ctx);
+                    // The callback adds peers synchronously (same thread): an
+                    // empty result grows the backoff, any peer resets it.
+                    if (self.peers.items.len == 0) {
+                        self.rediscovery_fail_streak +|= 1;
+                    } else {
+                        self.rediscovery_fail_streak = 0;
+                    }
+                }
+            } else if (self.rediscovery_fail_streak != 0) {
+                // Peers connected (or we're seeding): the next dry spell
+                // starts from the base interval again.
+                self.rediscovery_fail_streak = 0;
             }
         }
     }
@@ -1612,6 +1690,12 @@ pub const Session = struct {
     // --- Multi-tracker announce (BEP 12 + BEP 15) ---
 
     fn doMultiTrackerAnnounce(self: *Session, event: tracker_mod.Event) !void {
+        // Stamp the attempt up front, whatever the outcome: a total failure
+        // never reaches `handleAnnounceResponse` (which stamps
+        // `last_announce_time`), and the maintenance gates key their backoff
+        // off this stamp.
+        self.last_announce_attempt = std.time.timestamp();
+
         const req = tracker_mod.AnnounceRequest{
             .info_hash = self.info_hash,
             .peer_id = self.peer_id,
@@ -1657,6 +1741,7 @@ pub const Session = struct {
             if (self.peers.items.len > 0) return;
         }
 
+        self.announce_fail_streak +|= 1;
         return error.TrackerFailed;
     }
 
@@ -1733,6 +1818,7 @@ pub const Session = struct {
 
         self.tracker_interval = resp.interval;
         self.last_announce_time = std.time.timestamp();
+        self.announce_fail_streak = 0;
 
         const stderr = std.fs.File.stderr().deprecatedWriter();
         stderr.print("tracker: {d} peers", .{resp.peers.len}) catch {};
@@ -2105,6 +2191,27 @@ pub const Session = struct {
         }
     }
 };
+
+test "announceBackoffSecs: exponential from 15s, capped at 300s" {
+    try std.testing.expectEqual(@as(i64, 0), announceBackoffSecs(0));
+    try std.testing.expectEqual(@as(i64, 15), announceBackoffSecs(1));
+    try std.testing.expectEqual(@as(i64, 30), announceBackoffSecs(2));
+    try std.testing.expectEqual(@as(i64, 60), announceBackoffSecs(3));
+    try std.testing.expectEqual(@as(i64, 120), announceBackoffSecs(4));
+    try std.testing.expectEqual(@as(i64, 240), announceBackoffSecs(5));
+    try std.testing.expectEqual(@as(i64, 300), announceBackoffSecs(6));
+    // Huge streaks must not overflow the shift, just stay at the cap.
+    try std.testing.expectEqual(@as(i64, 300), announceBackoffSecs(1000));
+}
+
+test "rediscoveryBackoffSecs: 45s doubling, capped at 600s" {
+    try std.testing.expectEqual(@as(i64, 45), rediscoveryBackoffSecs(0));
+    try std.testing.expectEqual(@as(i64, 90), rediscoveryBackoffSecs(1));
+    try std.testing.expectEqual(@as(i64, 180), rediscoveryBackoffSecs(2));
+    try std.testing.expectEqual(@as(i64, 360), rediscoveryBackoffSecs(3));
+    try std.testing.expectEqual(@as(i64, 600), rediscoveryBackoffSecs(4));
+    try std.testing.expectEqual(@as(i64, 600), rediscoveryBackoffSecs(1000));
+}
 
 test "sampleRate counts block bytes as progress before a piece verifies" {
     // Regression: on a slow link (single I2P peer) a piece can take far longer

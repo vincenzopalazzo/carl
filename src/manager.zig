@@ -1270,7 +1270,11 @@ pub const Manager = struct {
         defer ml.deinit(self.allocator);
         const a = self.allocator;
 
-        const mi = try buildMagnetMetainfo(a, ml);
+        // On i2p the defaults are pointless (clearnet trackers are skipped
+        // entirely by the session); everywhere else a tracker-less magnet gets
+        // the well-known public tier so DHT isn't the sole — or on tor, a
+        // nonexistent — peer source.
+        const mi = try buildMagnetMetainfo(a, ml, i2p == null);
         errdefer mi.deinit(a);
 
         const session = a.create(session_mod.Session) catch return error.OutOfMemory;
@@ -1287,11 +1291,33 @@ pub const Manager = struct {
     }
 };
 
+/// Well-known public trackers injected (as one BEP 12 tier) into a magnet that
+/// carries no `tr=` params, so such magnets have a peer source beyond DHT —
+/// which is the sole source on `direct` and doesn't exist at all when
+/// anonymized. On proxy/tor routes the session rewrites these udp:// URLs to
+/// http:// and tunnels them (see `Session.tryUdpAsHttp`). Not used on i2p,
+/// where clearnet trackers are unreachable by design.
+pub const default_trackers = [_][]const u8{
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.demonii.com:1337/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "udp://exodus.desync.com:6969/announce",
+};
+
 /// Construct a fully-owned placeholder `Metainfo` from a magnet link. On any
 /// failure all partial allocations are freed; on success ownership transfers to
 /// the returned value (free it via `Metainfo.deinit`). Kept free-standing so
 /// its errdefers never overlap a caller's `mi.deinit` (which would double-free).
-fn buildMagnetMetainfo(a: Allocator, ml: magnet_mod.MagnetLink) Allocator.Error!metainfo.Metainfo {
+/// With `use_default_trackers`, a magnet with no `tr=` params gets the
+/// `default_trackers` tier instead of zero trackers.
+fn buildMagnetMetainfo(a: Allocator, ml: magnet_mod.MagnetLink, use_default_trackers: bool) Allocator.Error!metainfo.Metainfo {
+    const trackers: []const []const u8 = if (ml.trackers.len > 0)
+        ml.trackers
+    else if (use_default_trackers)
+        &default_trackers
+    else
+        &.{};
+
     const name = try a.dupe(u8, ml.name orelse "unknown");
     errdefer a.free(name);
 
@@ -1312,8 +1338,8 @@ fn buildMagnetMetainfo(a: Allocator, ml: magnet_mod.MagnetLink) Allocator.Error!
         }
         a.free(tiers);
     };
-    if (ml.trackers.len > 0) {
-        const tier = try a.alloc([]const u8, ml.trackers.len);
+    if (trackers.len > 0) {
+        const tier = try a.alloc([]const u8, trackers.len);
         // Scoped to this block: covers the window before `announce_list` (and
         // its function-scope errdefer) takes ownership.
         var filled: usize = 0;
@@ -1321,15 +1347,15 @@ fn buildMagnetMetainfo(a: Allocator, ml: magnet_mod.MagnetLink) Allocator.Error!
             for (tier[0..filled]) |t| a.free(t);
             a.free(tier);
         }
-        while (filled < ml.trackers.len) : (filled += 1) {
-            tier[filled] = try a.dupe(u8, ml.trackers[filled]);
+        while (filled < trackers.len) : (filled += 1) {
+            tier[filled] = try a.dupe(u8, trackers[filled]);
         }
         const tiers = try a.alloc([]const []const u8, 1);
         tiers[0] = tier;
         announce_list = tiers;
     }
 
-    const announce = try a.dupe(u8, if (ml.trackers.len > 0) ml.trackers[0] else "");
+    const announce = try a.dupe(u8, if (trackers.len > 0) trackers[0] else "");
     errdefer a.free(announce);
 
     return metainfo.Metainfo{
@@ -1838,4 +1864,48 @@ test "Manager: init/deinit with config defaults" {
     try testing.expectEqual(@as(usize, 0), snap.len);
     m.setRoute(.tor);
     try testing.expectEqual(api.Route.tor, m.cfg.route);
+}
+
+test "buildMagnetMetainfo: tracker-less magnet gets the default tracker tier" {
+    const a = testing.allocator;
+    const ml = try magnet_mod.parse(a, "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&dn=test");
+    defer ml.deinit(a);
+
+    const mi = try buildMagnetMetainfo(a, ml, true);
+    defer mi.deinit(a);
+
+    try testing.expectEqualStrings(default_trackers[0], mi.announce);
+    const tiers = mi.announce_list orelse return error.TestExpectedTrackers;
+    try testing.expectEqual(@as(usize, 1), tiers.len);
+    try testing.expectEqual(default_trackers.len, tiers[0].len);
+    for (default_trackers, tiers[0]) |want, got| {
+        try testing.expectEqualStrings(want, got);
+    }
+}
+
+test "buildMagnetMetainfo: no default trackers on i2p (use_default_trackers=false)" {
+    const a = testing.allocator;
+    const ml = try magnet_mod.parse(a, "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&dn=test");
+    defer ml.deinit(a);
+
+    const mi = try buildMagnetMetainfo(a, ml, false);
+    defer mi.deinit(a);
+
+    try testing.expectEqualStrings("", mi.announce);
+    try testing.expectEqual(@as(?[]const []const []const u8, null), mi.announce_list);
+}
+
+test "buildMagnetMetainfo: magnet's own trackers win over the defaults" {
+    const a = testing.allocator;
+    const ml = try magnet_mod.parse(a, "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&tr=udp%3A%2F%2Fmine.example.com%3A6969");
+    defer ml.deinit(a);
+
+    const mi = try buildMagnetMetainfo(a, ml, true);
+    defer mi.deinit(a);
+
+    try testing.expectEqualStrings("udp://mine.example.com:6969", mi.announce);
+    const tiers = mi.announce_list orelse return error.TestExpectedTrackers;
+    try testing.expectEqual(@as(usize, 1), tiers.len);
+    try testing.expectEqual(@as(usize, 1), tiers[0].len);
+    try testing.expectEqualStrings("udp://mine.example.com:6969", tiers[0][0]);
 }

@@ -10,6 +10,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const secp = @import("secp.zig");
 const nip19 = @import("nip19.zig");
+const ws = @import("ws.zig");
 
 const log = std.log.scoped(.config);
 
@@ -133,11 +134,68 @@ pub fn readRelays(allocator: Allocator) ![][]const u8 {
     while (it.next()) |line| {
         const t = std.mem.trim(u8, line, " \t");
         if (t.len == 0 or t[0] == '#') continue;
-        const dup = try allocator.dupe(u8, t);
-        try list.append(allocator, dup);
+        const url = (try normalizeRelayUrl(allocator, t)) orelse {
+            // Warn once here at read time instead of returning the entry to
+            // connect loops that would retry (and log) it forever.
+            log.warn("ignoring invalid relay URL in config: '{s}'", .{t});
+            continue;
+        };
+        try list.append(allocator, url);
     }
     if (list.items.len == 0) return dupeDefaults(allocator);
     return list.toOwnedSlice(allocator);
+}
+
+/// Normalize a user-entered relay URL into the canonical `ws://`/`wss://`
+/// form that `ws.parseUrl` accepts. A wss endpoint IS an https endpoint
+/// pre-upgrade, so users routinely write `https://relay.example`; map
+/// `https://` → `wss://` and `http://` → `ws://`, and treat a bare host with
+/// no scheme at all as `wss://<host>`. A trailing `/` on a bare root path is
+/// dropped so `wss://host/` and `wss://host` normalize identically (parseUrl
+/// treats both as path "/"); deeper paths are kept verbatim. Returns null for
+/// entries that still aren't valid ws/wss relays after normalization
+/// (unknown scheme, empty host, embedded whitespace, bad port) — callers
+/// skip those instead of feeding them to connect loops. Caller owns the
+/// returned slice.
+pub fn normalizeRelayUrl(allocator: Allocator, raw: []const u8) !?[]u8 {
+    const t = std.mem.trim(u8, raw, " \t\r\n");
+
+    var scheme: []const u8 = "wss://";
+    var rest: []const u8 = t;
+    if (std.mem.startsWith(u8, t, "wss://")) {
+        rest = t["wss://".len..];
+    } else if (std.mem.startsWith(u8, t, "ws://")) {
+        scheme = "ws://";
+        rest = t["ws://".len..];
+    } else if (std.mem.startsWith(u8, t, "https://")) {
+        rest = t["https://".len..];
+    } else if (std.mem.startsWith(u8, t, "http://")) {
+        scheme = "ws://";
+        rest = t["http://".len..];
+    } else if (std.mem.indexOf(u8, t, "://") != null) {
+        return null; // Unknown scheme — can't be a websocket relay.
+    }
+
+    // A URL never contains raw whitespace; a "bare host" with a space in it
+    // is a garbage line, not a relay.
+    if (std.mem.indexOfAny(u8, rest, " \t") != null) return null;
+
+    // Drop a single trailing '/' when it's just the root path.
+    if (rest.len > 0 and rest[rest.len - 1] == '/' and
+        std.mem.indexOfScalar(u8, rest[0 .. rest.len - 1], '/') == null)
+    {
+        rest = rest[0 .. rest.len - 1];
+    }
+    if (rest.len == 0) return null; // Empty host (e.g. a lone "https://").
+
+    const url = try std.mem.concat(allocator, u8, &.{ scheme, rest });
+    // Final gate: whatever we hand out must be accepted by the websocket
+    // client, or the connect loop will spin on error.InvalidUrl forever.
+    _ = ws.parseUrl(url) catch {
+        allocator.free(url);
+        return null;
+    };
+    return url;
 }
 
 fn dupeDefaults(allocator: Allocator) ![][]const u8 {
@@ -230,4 +288,59 @@ test "parseNsecFile: rejects a non-nsec bech32 entity" {
 test "parseNsecFile: rejects garbage" {
     try std.testing.expectError(error.BadKeyFile, parseNsecFile("not bech32"));
     try std.testing.expectError(error.BadKeyFile, parseNsecFile(""));
+}
+
+fn expectNormalized(expected: []const u8, raw: []const u8) !void {
+    const allocator = std.testing.allocator;
+    const got = (try normalizeRelayUrl(allocator, raw)) orelse return error.TestUnexpectedResult;
+    defer allocator.free(got);
+    try std.testing.expectEqualStrings(expected, got);
+}
+
+fn expectRejected(raw: []const u8) !void {
+    const allocator = std.testing.allocator;
+    if (try normalizeRelayUrl(allocator, raw)) |got| {
+        allocator.free(got);
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "normalizeRelayUrl: https becomes wss" {
+    // The live-daemon spam case: user entered the relay as an https URL.
+    try expectNormalized("wss://nostr.relay.hedwig.sh", "https://nostr.relay.hedwig.sh/");
+    try expectNormalized("wss://relay.damus.io", "https://relay.damus.io");
+}
+
+test "normalizeRelayUrl: http becomes ws" {
+    try expectNormalized("ws://localhost:7777", "http://localhost:7777");
+}
+
+test "normalizeRelayUrl: bare host gets wss" {
+    try expectNormalized("wss://relay.damus.io", "relay.damus.io");
+    try expectNormalized("wss://localhost:7777", "localhost:7777");
+}
+
+test "normalizeRelayUrl: ws and wss pass through" {
+    try expectNormalized("wss://relay.damus.io", "wss://relay.damus.io");
+    try expectNormalized("ws://127.0.0.1:8080", "ws://127.0.0.1:8080");
+}
+
+test "normalizeRelayUrl: root trailing slash is stripped, deeper paths kept" {
+    try expectNormalized("wss://relay.damus.io", "wss://relay.damus.io/");
+    try expectNormalized("wss://relay.example/nostr", "wss://relay.example/nostr");
+    try expectNormalized("wss://relay.example/nostr/", "wss://relay.example/nostr/");
+}
+
+test "normalizeRelayUrl: trims surrounding whitespace" {
+    try expectNormalized("wss://relay.damus.io", "  https://relay.damus.io/ \t");
+}
+
+test "normalizeRelayUrl: garbage is rejected" {
+    try expectRejected("ftp://relay.example"); // unknown scheme
+    try expectRejected("https://"); // empty host
+    try expectRejected("wss://"); // empty host
+    try expectRejected("not a url"); // embedded whitespace
+    try expectRejected("wss://relay.example:notaport"); // parseUrl rejects the port
+    try expectRejected("");
+    try expectRejected("/");
 }

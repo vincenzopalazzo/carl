@@ -1156,7 +1156,10 @@ fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u
     try stdout.print("carl daemon\n", .{});
     try stdout.print("listen: http://127.0.0.1:{d}\n", .{port});
     try stdout.print("token: {s}\n", .{token});
-    try stdout.print("route: {s}\n", .{route_str});
+    // `restoreSettings` above may have replaced the route with the persisted
+    // (GUI-set) one, so print the EFFECTIVE route — the flag default here was
+    // a misleading "direct" whenever the user had picked another route.
+    try stdout.print("route: {s}\n", .{@tagName(mgr.cfg.route)});
 
     // On a proxy/tor route, check the SOCKS proxy up front and say clearly why
     // it's unreachable (the daemon keeps running and the GUI shows live health).
