@@ -20,6 +20,13 @@ const i2p_sam = @import("i2p_sam.zig");
 const log = std.log.scoped(.session);
 
 const max_peers: usize = 50;
+/// Cap on simultaneously in-progress pieces. With large pieces (e.g. 8 MiB /
+/// 512 blocks) and high peer churn, spreading blocks across dozens of pieces
+/// means none ever completes. Concentrating on a few pieces lets multiple peers
+/// contribute blocks to the SAME piece, completing it far sooner — after which
+/// it can be verified, written, and shared (uploaded). 8 balances concentration
+/// against parallelism (and ~8 × piece_len of piece-buffer memory).
+const max_concurrent_pieces: usize = 8;
 const unchoke_slots: usize = 4;
 const unchoke_interval_secs: i64 = 10;
 const optimistic_interval_secs: i64 = 30;
@@ -926,9 +933,11 @@ pub const Session = struct {
         const complete = pp_ptr.addBlock(pd.begin, pd.block);
 
         if (complete) {
+            log.info("piece {d} complete ({d} bytes received, {d} KiB in), verifying...", .{ pd.index, pp_ptr.piece_len, self.block_bytes_in / 1024 });
             const hash = piece_mod.pieceHash(self.meta.pieces, pd.index) orelse return;
 
             if (piece_mod.verifyPiece(pp_ptr.data, hash)) {
+                log.info("piece {d} VERIFIED + written to disk", .{pd.index});
                 self.store.writePiece(pd.index, pp_ptr.data) catch {
                     // Write failed (disk full, I/O error) -- don't mark as complete.
                     // Reset the piece so it can be re-downloaded.
@@ -948,6 +957,7 @@ pub const Session = struct {
                     }
                 }
             } else {
+                log.warn("piece {d} hash mismatch, resetting", .{pd.index});
                 pp_ptr.reset();
                 return;
             }
@@ -1504,6 +1514,12 @@ pub const Session = struct {
             // Skip if already active with every block received or in flight
             if (self.active_pieces.get(idx)) |pp| {
                 if (pp.nextUnrequestedBlock() == null) continue;
+            } else {
+                // Piece concentration: don't start a new piece when we already
+                // have max_concurrent_pieces in progress. Concentrating blocks
+                // on fewer pieces lets them complete (verify + write + share)
+                // instead of spreading thin across dozens that never finish.
+                if (self.active_pieces.count() >= max_concurrent_pieces) continue;
             }
 
             const avail = if (idx < self.piece_availability.len) self.piece_availability[idx] else 0;
@@ -1569,10 +1585,14 @@ pub const Session = struct {
             }
         }
 
-        // Sort by bytes_downloaded descending (they upload to us the most)
+        // Sort: tit-for-tat when downloading (prefer peers that upload to us the
+        // most); when seeding, prefer peers that download from us fastest so we
+        // maximize outbound throughput and distribution.
         const slice = interested_peers[0..count];
-        std.mem.sort(*peer_mod.PeerConnection, slice, {}, struct {
-            fn cmp(_: void, a: *peer_mod.PeerConnection, b: *peer_mod.PeerConnection) bool {
+        const seeding = self.mode == .seed;
+        std.mem.sort(*peer_mod.PeerConnection, slice, seeding, struct {
+            fn cmp(s: bool, a: *peer_mod.PeerConnection, b: *peer_mod.PeerConnection) bool {
+                if (s) return a.bytes_uploaded > b.bytes_uploaded;
                 return a.bytes_downloaded > b.bytes_downloaded;
             }
         }.cmp);
