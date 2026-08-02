@@ -47,6 +47,8 @@ const SCHEMA =
     \\CREATE TABLE IF NOT EXISTS follows(
     \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
     \\  pubkey TEXT NOT NULL, route TEXT NOT NULL);
+    \\CREATE TABLE IF NOT EXISTS drives(
+    \\  id TEXT PRIMARY KEY, role TEXT, dir TEXT, name TEXT, author TEXT, also TEXT, route TEXT);
 ;
 
 pub const Error = error{ DbOpen, DbExec, DbPrepare } || Allocator.Error;
@@ -79,11 +81,41 @@ pub const FollowSpec = struct {
     route: api.Route,
 };
 
+/// A shared drive's role: a publisher watches a folder and publishes its files;
+/// a subscriber mirrors a publisher's drive index into a local folder.
+pub const DriveRole = enum {
+    publisher,
+    subscriber,
+
+    fn jsonName(self: DriveRole) []const u8 {
+        return @tagName(self);
+    }
+
+    fn parse(s: []const u8) ?DriveRole {
+        return std.meta.stringToEnum(DriveRole, s);
+    }
+};
+
+/// A shared drive to re-create on restart. `author` is the subscriber's
+/// followed author as 64-char hex ('' for a publisher); `also` is a
+/// comma-separated hex list of extra writer pubkeys ('' for none). The id is
+/// the daemon's "d<n>" handle id.
+pub const DriveSpec = struct {
+    id: []const u8,
+    role: DriveRole,
+    dir: []const u8,
+    name: []const u8,
+    author: []const u8,
+    also: []const u8,
+    route: api.Route,
+};
+
 pub const State = struct {
     route: api.Route,
     download_dir: []const u8,
     transfers: []const TransferSpec,
     follows: []const FollowSpec = &.{},
+    drives: []const DriveSpec = &.{},
 
     pub fn deinit(self: State, a: Allocator) void {
         a.free(self.download_dir);
@@ -91,6 +123,14 @@ pub const State = struct {
         a.free(self.transfers);
         for (self.follows) |f| a.free(f.pubkey);
         a.free(self.follows);
+        for (self.drives) |d| {
+            a.free(d.id);
+            a.free(d.dir);
+            a.free(d.name);
+            a.free(d.author);
+            a.free(d.also);
+        }
+        a.free(self.drives);
     }
 };
 
@@ -126,12 +166,13 @@ pub fn save(
     download_dir: []const u8,
     specs: []const TransferSpec,
     follows: []const FollowSpec,
+    drives: []const DriveSpec,
 ) !void {
     const dir = try nostr_config.ensureConfigDir(a);
     defer a.free(dir);
     const path = try std.fmt.allocPrintSentinel(a, "{s}/carl.db", .{dir}, 0);
     defer a.free(path);
-    try saveTo(path, route, download_dir, specs, follows);
+    try saveTo(path, route, download_dir, specs, follows, drives);
 }
 
 fn saveTo(
@@ -140,6 +181,7 @@ fn saveTo(
     download_dir: []const u8,
     specs: []const TransferSpec,
     follows: []const FollowSpec,
+    drives: []const DriveSpec,
 ) Error!void {
     const db = try open(path);
     defer _ = sqlite3_close(db);
@@ -174,6 +216,23 @@ fn saveTo(
         bindText(fstmt, 1, f.pubkey);
         bindText(fstmt, 2, f.route.jsonName());
         if (sqlite3_step(fstmt) != SQLITE_DONE) return error.DbExec;
+    }
+
+    try exec(db, "DELETE FROM drives");
+    var dstmt: ?*Stmt = null;
+    const dsql = "INSERT INTO drives(id,role,dir,name,author,also,route) VALUES(?,?,?,?,?,?,?)";
+    if (sqlite3_prepare_v2(db, dsql, @intCast(dsql.len), &dstmt, null) != SQLITE_OK) return error.DbPrepare;
+    defer _ = sqlite3_finalize(dstmt);
+    for (drives) |d| {
+        _ = sqlite3_reset(dstmt);
+        bindText(dstmt, 1, d.id);
+        bindText(dstmt, 2, d.role.jsonName());
+        bindText(dstmt, 3, d.dir);
+        bindText(dstmt, 4, d.name);
+        bindText(dstmt, 5, d.author);
+        bindText(dstmt, 6, d.also);
+        bindText(dstmt, 7, d.route.jsonName());
+        if (sqlite3_step(dstmt) != SQLITE_DONE) return error.DbExec;
     }
 
     try exec(db, "COMMIT");
@@ -235,6 +294,37 @@ fn loadFrom(a: Allocator, path: [:0]const u8) Error!State {
         try follows.append(a, .{ .pubkey = pk, .route = r });
     }
 
+    var drives: std.ArrayList(DriveSpec) = .empty;
+    errdefer {
+        for (drives.items) |d| {
+            a.free(d.id);
+            a.free(d.dir);
+            a.free(d.name);
+            a.free(d.author);
+            a.free(d.also);
+        }
+        drives.deinit(a);
+    }
+    var dstmt: ?*Stmt = null;
+    const dsql = "SELECT id,role,dir,name,author,also,route FROM drives ORDER BY rowid";
+    if (sqlite3_prepare_v2(db, dsql, @intCast(dsql.len), &dstmt, null) != SQLITE_OK) return error.DbPrepare;
+    defer _ = sqlite3_finalize(dstmt);
+    while (sqlite3_step(dstmt) == SQLITE_ROW) {
+        const id = try a.dupe(u8, columnText(dstmt, 0));
+        errdefer a.free(id);
+        const role = DriveRole.parse(columnText(dstmt, 1)) orelse .publisher;
+        const ddir = try a.dupe(u8, columnText(dstmt, 2));
+        errdefer a.free(ddir);
+        const name = try a.dupe(u8, columnText(dstmt, 3));
+        errdefer a.free(name);
+        const author = try a.dupe(u8, columnText(dstmt, 4));
+        errdefer a.free(author);
+        const also = try a.dupe(u8, columnText(dstmt, 5));
+        errdefer a.free(also);
+        const r = api.Route.parse(columnText(dstmt, 6)) orelse .direct;
+        try drives.append(a, .{ .id = id, .role = role, .dir = ddir, .name = name, .author = author, .also = also, .route = r });
+    }
+
     const transfers = try list.toOwnedSlice(a);
     errdefer {
         for (transfers) |t| a.free(t.source);
@@ -245,6 +335,7 @@ fn loadFrom(a: Allocator, path: [:0]const u8) Error!State {
         .download_dir = download_dir,
         .transfers = transfers,
         .follows = try follows.toOwnedSlice(a),
+        .drives = try drives.toOwnedSlice(a),
     };
 }
 
@@ -321,7 +412,7 @@ test "sqlite save/load round-trips settings + transfers" {
         .{ .kind = .download, .source = "magnet:?xt=urn:btih:abc", .route = .tor, .nostr = true },
         .{ .kind = .seed, .source = "/data/movie.tar", .route = .direct, .nostr = false },
     };
-    try saveTo(path, .proxy, "/home/u/dl", &specs, &.{});
+    try saveTo(path, .proxy, "/home/u/dl", &specs, &.{}, &.{});
 
     const st = try loadFrom(a, path);
     defer st.deinit(a);
@@ -346,8 +437,8 @@ test "sqlite save replaces prior transfers (no accumulation)" {
     defer a.free(path);
 
     const one = [_]TransferSpec{.{ .kind = .download, .source = "a", .route = .direct, .nostr = false }};
-    try saveTo(path, .direct, "/x", &one, &.{});
-    try saveTo(path, .tor, "/y", &one, &.{}); // overwrite
+    try saveTo(path, .direct, "/x", &one, &.{}, &.{});
+    try saveTo(path, .tor, "/y", &one, &.{}, &.{}); // overwrite
 
     const st = try loadFrom(a, path);
     defer st.deinit(a);
@@ -369,7 +460,7 @@ test "sqlite save/load round-trips follows" {
         .{ .pubkey = "16e8c40c332df0746a15d1e8c0a569af59d8da3ac0bafbe8f1c3f23156c44313", .route = .i2p },
         .{ .pubkey = "ab" ** 32, .route = .direct },
     };
-    try saveTo(path, .direct, "/dl", &.{}, &follows);
+    try saveTo(path, .direct, "/dl", &.{}, &follows, &.{});
 
     const st = try loadFrom(a, path);
     defer st.deinit(a);
@@ -379,10 +470,48 @@ test "sqlite save/load round-trips follows" {
     try testing.expectEqual(api.Route.direct, st.follows[1].route);
 
     // Re-save with none: the table is rebuilt, not accumulated.
-    try saveTo(path, .direct, "/dl", &.{}, &.{});
+    try saveTo(path, .direct, "/dl", &.{}, &.{}, &.{});
     const st2 = try loadFrom(a, path);
     defer st2.deinit(a);
     try testing.expectEqual(@as(usize, 0), st2.follows.len);
+}
+
+test "sqlite save/load round-trips drives" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/carl.db", .{dir}, 0);
+    defer a.free(path);
+
+    const drives = [_]DriveSpec{
+        .{ .id = "d1", .role = .publisher, .dir = "/data/pub", .name = "docs", .author = "", .also = "", .route = .direct },
+        .{ .id = "d2", .role = .subscriber, .dir = "/data/sub", .name = "mirror", .author = "ab" ** 32, .also = "cd" ** 32 ++ "," ++ "ef" ** 32, .route = .i2p },
+    };
+    try saveTo(path, .direct, "/dl", &.{}, &.{}, &drives);
+
+    const st = try loadFrom(a, path);
+    defer st.deinit(a);
+    try testing.expectEqual(@as(usize, 2), st.drives.len);
+    try testing.expectEqualStrings("d1", st.drives[0].id);
+    try testing.expectEqual(DriveRole.publisher, st.drives[0].role);
+    try testing.expectEqualStrings("/data/pub", st.drives[0].dir);
+    try testing.expectEqualStrings("docs", st.drives[0].name);
+    try testing.expectEqualStrings("", st.drives[0].author);
+    try testing.expectEqualStrings("", st.drives[0].also);
+    try testing.expectEqual(api.Route.direct, st.drives[0].route);
+    try testing.expectEqualStrings("d2", st.drives[1].id);
+    try testing.expectEqual(DriveRole.subscriber, st.drives[1].role);
+    try testing.expectEqualStrings("ab" ** 32, st.drives[1].author);
+    try testing.expectEqualStrings("cd" ** 32 ++ "," ++ "ef" ** 32, st.drives[1].also);
+    try testing.expectEqual(api.Route.i2p, st.drives[1].route);
+
+    // Re-save with none: the table is rebuilt, not accumulated.
+    try saveTo(path, .direct, "/dl", &.{}, &.{}, &.{});
+    const st2 = try loadFrom(a, path);
+    defer st2.deinit(a);
+    try testing.expectEqual(@as(usize, 0), st2.drives.len);
 }
 
 test "loadDownloadDirFrom reads the setting; empty/missing read as unset" {
@@ -397,11 +526,11 @@ test "loadDownloadDirFrom reads the setting; empty/missing read as unset" {
     // Fresh DB (schema only): no setting yet.
     try testing.expect(loadDownloadDirFrom(a, path) == null);
 
-    try saveTo(path, .direct, "/home/u/dl", &.{}, &.{});
+    try saveTo(path, .direct, "/home/u/dl", &.{}, &.{}, &.{});
     const got = loadDownloadDirFrom(a, path) orelse return error.TestUnexpectedResult;
     defer a.free(got);
     try testing.expectEqualStrings("/home/u/dl", got);
 
-    try saveTo(path, .direct, "", &.{}, &.{});
+    try saveTo(path, .direct, "", &.{}, &.{}, &.{});
     try testing.expect(loadDownloadDirFrom(a, path) == null);
 }

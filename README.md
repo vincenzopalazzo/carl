@@ -13,6 +13,7 @@ A BitTorrent client written in pure Zig. The BitTorrent core has zero Zig packag
 - **Seeding** -- upload mode with incoming connection support
 - **Proxy / anonymous mode** -- route peers and trackers through a SOCKS5/SOCKS5h or HTTP proxy, hiding your real IP from the swarm ([docs](docs/proxy.md))
 - **Nostr discovery** -- publish torrents you seed as NIP-35 events and find others' torrents via `carl search`; per-seeder peer-announces over a custom kind 30078 feed peers into download sessions
+- **Shared drives over Nostr** -- sync a folder across machines and people: publishers watch a directory, subscribers mirror it and re-seed, converging on every edit via a custom kind 30035 drive index ([docs](docs/drive.md))
 
 ## Protocol Support
 
@@ -34,6 +35,7 @@ A BitTorrent client written in pure Zig. The BitTorrent core has zero Zig packag
 | [NIP-19](https://github.com/nostr-protocol/nips/blob/master/19.md) | bech32 encoding (`npub`, `nsec`, `note`) |
 | [NIP-35](https://github.com/nostr-protocol/nips/blob/master/35.md) | Kind 2003 torrent index events |
 | custom kind 30078 | Carl's NIP-33-parameterized peer-announce events (one per `(pubkey, infohash)`) |
+| custom kind 30035 | Carl's NIP-33-parameterized drive-index events (one per `(pubkey, drive)`) |
 
 ## Building
 

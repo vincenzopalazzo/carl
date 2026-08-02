@@ -15,6 +15,7 @@ const NAV = [
   ["transfers", "Transfers", "transfers"],
   ["discover", "Discover", "discover"],
   ["seeding", "Seeding", "seeding"],
+  ["drive", "Drive", "folder"],
   ["settings", "Settings", "settings"],
 ];
 
@@ -22,6 +23,7 @@ function Sidebar({ screen, setScreen }) {
   const counts = {
     transfers: TRANSFERS.filter((t) => t.status === "downloading" || t.status === "metadata").length,
     seeding: SEEDS.length,
+    drive: DRIVES.length,
   };
   const connected = RELAYS.filter((r) => r.state === "connected").length;
   return (
@@ -91,6 +93,7 @@ function App() {
         {screen === "transfers" && <TransfersScreen openAdd={() => setShowAdd(true)} />}
         {screen === "discover" && <DiscoverScreen />}
         {screen === "seeding" && <SeedingScreen />}
+        {screen === "drive" && <DriveScreen />}
         {screen === "settings" && <SettingsScreen />}
       </main>
 

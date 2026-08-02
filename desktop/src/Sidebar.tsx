@@ -8,6 +8,7 @@ export type Screen =
   | "discover"
   | "following"
   | "seeding"
+  | "drive"
   | "settings";
 
 const NAV: [Screen, string, string][] = [
@@ -15,6 +16,7 @@ const NAV: [Screen, string, string][] = [
   ["discover", "Discover", "discover"],
   ["following", "Following", "pulse"],
   ["seeding", "Seeding", "seeding"],
+  ["drive", "Drive", "folder"],
   ["settings", "Settings", "settings"],
 ];
 
@@ -32,6 +34,8 @@ export function Sidebar({
     ).length,
     following: (state.follows ?? []).length,
     seeding: state.seeds.length,
+    drive:
+      (state as typeof state & { drives?: unknown[] }).drives?.length ?? 0,
   };
   const connectedRelays = state.relays.filter(
     (r) => r.state === "connected",

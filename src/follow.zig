@@ -80,6 +80,13 @@ pub const Options = struct {
     /// Cap on concurrently mirrored torrents (defends against a flooding
     /// publisher filling the disk).
     max_mirrors: usize = 128,
+    /// Optional subdirectory of `dir` for checkpointed torrents
+    /// (`<dir>/<checkpoint_subdir>/<infohash>.follow.torrent`). Null keeps the
+    /// historical layout (checkpoints next to the data); `carl follow` never
+    /// sets it, so its on-disk layout is byte-identical. The drive module sets
+    /// it to `.carl-drive` so checkpoints stay hidden out of the watched
+    /// folder (and out of the publisher's own scan).
+    checkpoint_subdir: ?[]const u8 = null,
 };
 
 /// Lifecycle of one mirrored torrent, for status displays.
@@ -150,10 +157,16 @@ pub const Mirror = struct {
         errdefer allocator.free(dir);
         const sam = allocator.dupe(u8, opts.i2p_sam) catch return error.OutOfMemory;
         errdefer allocator.free(sam);
+        const subdir: ?[]u8 = if (opts.checkpoint_subdir) |s|
+            allocator.dupe(u8, s) catch return error.OutOfMemory
+        else
+            null;
+        errdefer if (subdir) |s| allocator.free(s);
         const self = allocator.create(Mirror) catch return error.OutOfMemory;
         self.* = .{ .allocator = allocator, .opts = opts };
         self.opts.dir = dir;
         self.opts.i2p_sam = sam;
+        self.opts.checkpoint_subdir = subdir;
         secp.toHex(&opts.pubkey, &self.pk_hex);
         return self;
     }
@@ -210,6 +223,7 @@ pub const Mirror = struct {
         self.transfers.deinit(self.allocator);
         self.allocator.free(self.opts.dir);
         self.allocator.free(self.opts.i2p_sam);
+        if (self.opts.checkpoint_subdir) |s| self.allocator.free(s);
         self.allocator.destroy(self);
     }
 
@@ -250,19 +264,56 @@ pub const Mirror = struct {
         return out;
     }
 
-    fn count(self: *Mirror) usize {
+    /// Number of registered transfers (running or not).
+    pub fn count(self: *Mirror) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.transfers.items.len;
     }
 
-    fn hasInfoHash(self: *Mirror, hash: [20]u8) bool {
+    /// True when `hash` is already registered (dedupe for `startTransfer`).
+    pub fn hasInfoHash(self: *Mirror, hash: [20]u8) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
         for (self.transfers.items) |t| {
             if (std.mem.eql(u8, &t.info_hash, &hash)) return true;
         }
         return false;
+    }
+
+    /// Stop and evict a single transfer: set its per-transfer stop flag, kick
+    /// its live session out of its run loop, remove it from the list (under
+    /// the mutex, so a concurrent `torrentsSnapshot` never sees a torn entry),
+    /// then join its thread and free it OUTSIDE the mutex. No-op when the
+    /// hash isn't registered.
+    ///
+    /// Must not race `stop`/`destroy`: the caller (the drive loop) serializes
+    /// eviction against mirror shutdown by joining its own loop thread before
+    /// stopping the mirror.
+    pub fn evictTransfer(self: *Mirror, info_hash: [20]u8) void {
+        self.mutex.lock();
+        var idx: ?usize = null;
+        for (self.transfers.items, 0..) |t, i| {
+            if (std.mem.eql(u8, &t.info_hash, &info_hash)) {
+                idx = i;
+                break;
+            }
+        }
+        const i = idx orelse {
+            self.mutex.unlock();
+            return;
+        };
+        const t = self.transfers.items[i];
+        t.stop_flag.store(true, .release);
+        if (t.live_session) |s| s.running = false;
+        _ = self.transfers.orderedRemove(i);
+        // Take the thread handle while still under the mutex so a concurrent
+        // `stop` can never double-join it.
+        const th = t.thread;
+        t.thread = null;
+        self.mutex.unlock();
+        if (th) |h| h.join();
+        t.destroy();
     }
 };
 
@@ -290,17 +341,32 @@ const Transfer = struct {
     /// progress reads and stop signaling. Guarded by `mirror.mutex`; cleared
     /// before the session is deinitialized.
     live_session: ?*session_mod.Session = null,
+    /// Per-transfer stop request, set by `Mirror.evictTransfer` (the drive
+    /// module evicts one torrent without stopping the whole mirror). Checked
+    /// alongside `mirror.stopping()` everywhere a transfer thread unwinds.
+    stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     fn setPhase(self: *Transfer, p: Phase) void {
         self.phase.store(@intFromEnum(p), .monotonic);
     }
 
     /// Publish `session` as this transfer's live session for the duration of a
-    /// phase. Returns a guard whose `release` clears it again.
-    fn publishSession(self: *Transfer, session: *session_mod.Session) void {
+    /// phase — unless a stop was requested while the session was being set up
+    /// (SAM create + storage piece verification can take seconds, and an
+    /// eviction landing in that window must not let the transfer slip into
+    /// `session.run` with no live session for the evictor to stop).
+    /// Mutex-serialized against `evictTransfer`/`Mirror.stop`, which set the
+    /// stop flag and kick the live session under the same mutex, so exactly
+    /// one side wins: either the transfer sees the stop here and never
+    /// publishes (the caller unwinds before `session.run`), or the evictor
+    /// sees the published session and sets `running = false`.
+    /// Returns false when stopping (session NOT published).
+    fn publishSessionUnlessStopping(self: *Transfer, session: *session_mod.Session) bool {
         self.mirror.mutex.lock();
+        defer self.mirror.mutex.unlock();
+        if (transferStopping(self)) return false;
         self.live_session = session;
-        self.mirror.mutex.unlock();
+        return true;
     }
 
     fn clearSession(self: *Transfer) void {
@@ -359,7 +425,12 @@ fn pollLoop(mirror: *Mirror) void {
 /// Re-add every checkpointed torrent in the mirror dir, so a restart resumes
 /// (and re-seeds) without waiting for relays.
 fn resumeSaved(mirror: *Mirror) void {
-    var dir = std.fs.cwd().openDir(mirror.opts.dir, .{ .iterate = true }) catch return;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const scan_dir: []const u8 = if (mirror.opts.checkpoint_subdir) |sub|
+        std.fmt.bufPrint(&buf, "{s}/{s}", .{ mirror.opts.dir, sub }) catch return
+    else
+        mirror.opts.dir;
+    var dir = std.fs.cwd().openDir(scan_dir, .{ .iterate = true }) catch return;
     defer dir.close();
     var it = dir.iterate();
     while (it.next() catch null) |entry| {
@@ -428,9 +499,18 @@ fn pollOnce(mirror: *Mirror) void {
     if (started > 0) log.info("started {d} new mirror(s)", .{started});
 }
 
+/// True when a transfer thread should unwind cleanly (no error phase, no
+/// warn): either the whole mirror is stopping or this transfer alone was
+/// evicted via `Mirror.evictTransfer`.
+fn transferStopping(t: *Transfer) bool {
+    return t.stop_flag.load(.acquire) or t.mirror.stopping();
+}
+
 /// Create the Transfer, register it (so dedupe sees it immediately), and spawn
-/// its mirror thread.
-fn startTransfer(
+/// its mirror thread. Public so the drive module can drive per-file mirrors
+/// through the same download→seed lifecycle (`mirrorTorrentEntry` in the
+/// drive design is simply this function with `trackers = &.{}`).
+pub fn startTransfer(
     mirror: *Mirror,
     info_hash: [20]u8,
     title: []const u8,
@@ -462,8 +542,12 @@ fn startTransfer(
         a.free(tr_owned);
     }
 
-    const torrent_path = std.fmt.allocPrint(a, "{s}/{s}{s}", .{ mirror.opts.dir, &hash_hex, torrent_suffix }) catch
-        return error.OutOfMemory;
+    const torrent_path = if (mirror.opts.checkpoint_subdir) |sub|
+        std.fmt.allocPrint(a, "{s}/{s}/{s}{s}", .{ mirror.opts.dir, sub, &hash_hex, torrent_suffix }) catch
+            return error.OutOfMemory
+    else
+        std.fmt.allocPrint(a, "{s}/{s}{s}", .{ mirror.opts.dir, &hash_hex, torrent_suffix }) catch
+            return error.OutOfMemory;
     errdefer a.free(torrent_path);
 
     const t = a.create(Transfer) catch return error.OutOfMemory;
@@ -498,7 +582,7 @@ fn startTransfer(
 
 fn mirrorThread(t: *Transfer) void {
     mirrorTorrent(t) catch |err| {
-        if (t.mirror.stopping()) return;
+        if (transferStopping(t)) return;
         t.setPhase(.failed);
         log.warn("mirror {s} ({s}) stopped: {}", .{ &t.hash_hex, t.title, err });
     };
@@ -507,10 +591,12 @@ fn mirrorThread(t: *Transfer) void {
 fn mirrorTorrent(t: *Transfer) Error!void {
     const a = t.allocator;
 
+    if (transferStopping(t)) return;
+
     // Phase 1 — get the data (and the resolved metainfo) onto disk.
     const mi = try ensureDownloaded(t);
     defer mi.deinit(a);
-    if (t.mirror.stopping()) return;
+    if (transferStopping(t)) return;
 
     log.info("mirror {s}: download complete, starting reseed", .{t.title});
 
@@ -630,6 +716,10 @@ fn runDownload(t: *Transfer, mi: metainfo_mod.Metainfo, magnet: bool) Error!void
     }
     const i2p_ptr: ?*i2p_sam.Session = if (i2p_session) |*s| s else null;
 
+    // SAM session create can take seconds; an eviction landing in that window
+    // must unwind here, not after the storage verify + full download run.
+    if (transferStopping(t)) return;
+
     const port = pickFreePort(false) orelse 6881;
     var session = session_mod.Session.init(a, mi, opts.dir, .download, port, null, .any, false, i2p_ptr, false) catch
         return error.SessionInitFailed;
@@ -643,7 +733,10 @@ fn runDownload(t: *Transfer, mi: metainfo_mod.Metainfo, magnet: bool) Error!void
     session.seed_after_complete = false;
     session.setPeerDiscovery(&session, rediscoverPeersCb);
 
-    t.publishSession(&session);
+    // Stop requested during session init (storage verify): unwind before the
+    // session runs. Publishing is mutex-serialized against the evictor, so a
+    // stop can never slip through unpublished.
+    if (!t.publishSessionUnlessStopping(&session)) return;
     defer t.clearSession();
     t.setPhase(.downloading);
 
@@ -685,6 +778,11 @@ fn seedForever(t: *Transfer, mi: metainfo_mod.Metainfo) Error!void {
             defer sam.deinit();
             if (persisted == null) i2p_seed.save(a, &t.hash_hex, sam.destination);
 
+            // SAM session create can take seconds; an eviction landing in
+            // that window must unwind here, not slip into seed mode with no
+            // live session for the evictor to stop.
+            if (transferStopping(t)) return;
+
             const host = i2p_sam.b32Address(a, sam.destination) catch return error.SamFailed;
             defer a.free(host);
 
@@ -692,12 +790,17 @@ fn seedForever(t: *Transfer, mi: metainfo_mod.Metainfo) Error!void {
                 return error.SessionInitFailed;
             defer session.deinit();
             if (session.listener == null) return error.NoListener;
+            // Storage piece verification (inside Session.init) is the second
+            // long window; honor a stop before forwarding + announcing.
+            if (transferStopping(t)) return;
             sam.forward(port) catch {
                 log.warn("i2p STREAM FORWARD failed; mirror would be unreachable", .{});
                 return error.SamFailed;
             };
 
-            t.publishSession(&session);
+            // Final stop check at the seed-entry boundary, mutex-serialized
+            // against the evictor: never enter seed mode unstoppably.
+            if (!t.publishSessionUnlessStopping(&session)) return;
             defer t.clearSession();
             t.setPhase(.seeding);
 
@@ -712,7 +815,10 @@ fn seedForever(t: *Transfer, mi: metainfo_mod.Metainfo) Error!void {
             defer session.deinit();
             if (session.listener == null) return error.NoListener;
 
-            t.publishSession(&session);
+            // Stop check at the seed-entry boundary (covers a stop requested
+            // during the storage verify inside Session.init), mutex-
+            // serialized against the evictor.
+            if (!t.publishSessionUnlessStopping(&session)) return;
             defer t.clearSession();
             t.setPhase(.seeding);
 
@@ -936,6 +1042,42 @@ test "Mirror create/start/stop lifecycle with no relays reachable" {
     const snap = try mirror.torrentsSnapshot(arena.allocator());
     try std.testing.expectEqual(@as(usize, 0), snap.len);
     mirror.destroy();
+}
+
+test "Transfer.publishSessionUnlessStopping honors the stop flag at the seed-entry boundary" {
+    const a = std.testing.allocator;
+    var mirror = Mirror{ .allocator = a, .opts = .{ .pubkey = .{0} ** 32, .dir = "." } };
+    var t = Transfer{
+        .allocator = a,
+        .mirror = &mirror,
+        .info_hash = .{0xEF} ** 20,
+        .hash_hex = .{'e'} ** 40,
+        .title = @constCast("f"),
+        .trackers = &.{},
+        .torrent_path = @constCast("unused"),
+    };
+    // Dummy session pointer: stored/cleared only, never dereferenced.
+    const dummy: *session_mod.Session = @ptrFromInt(0x1000);
+
+    // No stop requested: the session publishes normally (the pre-fix
+    // behavior for the common path).
+    try std.testing.expect(t.publishSessionUnlessStopping(dummy));
+    try std.testing.expect(t.live_session == dummy);
+    t.clearSession();
+    try std.testing.expect(t.live_session == null);
+
+    // Per-transfer stop (eviction) requested during seed setup: the transfer
+    // must refuse to publish so the caller unwinds instead of entering seed
+    // mode with no live session for the evictor to stop.
+    t.stop_flag.store(true, .release);
+    try std.testing.expect(!t.publishSessionUnlessStopping(dummy));
+    try std.testing.expect(t.live_session == null);
+
+    // Mirror-level stop is honored the same way.
+    t.stop_flag.store(false, .release);
+    mirror.stop_flag.store(true, .release);
+    try std.testing.expect(!t.publishSessionUnlessStopping(dummy));
+    try std.testing.expect(t.live_session == null);
 }
 
 test "Phase jsonName matches enum tags" {
