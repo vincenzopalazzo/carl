@@ -101,34 +101,32 @@ pub fn parseUrl(input: []const u8) Error!Url {
     return .{ .secure = secure, .host = host, .port = port, .path = path };
 }
 
-/// A live WebSocket connection. `wss://` uses `std.http.Client` for TLS (same
-/// stack as our HTTPS tracker client). `ws://` uses a plain TCP socket.
+/// A live WebSocket connection. `wss://` runs `std.crypto.tls` on top of a
+/// stream we own (a direct socket, or a SOCKS tunnel when a proxy is set);
+/// `ws://` uses that stream raw.
 pub const Conn = struct {
     allocator: Allocator,
     /// Socket handle for `setsockopt` (recv timeout). Closed via `deinit`.
     stream: std.net.Stream,
     /// Non-null for `wss://`; owns the TLS session used for reads/writes.
-    http: ?HttpIo = null,
-    /// Non-null for `wss://` over a proxy tunnel (TLS on top of SOCKS).
-    tls_proxy: ?*TlsProxyIo = null,
+    tls_io: ?*TlsIo = null,
 
     /// Buffer used to accumulate the payload of an in-progress message when
     /// the relay fragments. Owned by the Conn.
     fragment_buf: std.ArrayList(u8),
     fragment_opcode: ?Opcode,
 
-    const HttpIo = struct {
-        client: *std.http.Client,
-        connection: *std.http.Client.Connection,
-    };
-
     const tls_io_buf_len = tls.max_ciphertext_record_len;
 
-    /// SO_RCVTIMEO (seconds) for the proxied-TLS path: bounds the handshake and
-    /// every read so an unresponsive relay fails instead of hanging.
-    const tls_proxy_handshake_secs: u32 = 20;
+    /// SO_RCVTIMEO (seconds) for the TLS path: bounds the handshake and every
+    /// read so an unresponsive relay fails instead of hanging.
+    const tls_handshake_secs: u32 = 20;
 
-    const TlsProxyIo = struct {
+    /// How many redirects the upgrade follows before giving up. Some relays
+    /// (and the CDNs in front of them) 301 the upgrade to a canonical path.
+    const max_redirects: u8 = 3;
+
+    const TlsIo = struct {
         stream: std.net.Stream,
         socket_reader: std.net.Stream.Reader,
         socket_writer: std.net.Stream.Writer,
@@ -139,131 +137,104 @@ pub const Conn = struct {
         tls_read_buf: [tls_io_buf_len]u8,
         tls_write_buf: [tls_io_buf_len]u8,
 
-        fn deinit(self: *TlsProxyIo, allocator: Allocator) void {
+        fn deinit(self: *TlsIo, allocator: Allocator) void {
             self.ca_bundle.deinit(allocator);
             self.stream.close();
             allocator.destroy(self);
         }
     };
 
+    /// Open a WebSocket to `url_input`, following up to `max_redirects` hops.
+    ///
+    /// One dial per hop: the connect is bounded by `connect_timeout_ms` on the
+    /// socket we then keep, instead of the old probe-then-reconnect pair (a
+    /// bounded TCP connect that was immediately closed, followed by the real
+    /// connect). That double-dial showed a CDN edge a connect-abort right
+    /// before every TLS handshake — exactly the shape edge rate-limiting
+    /// punishes — and cost two dials per attempt for nothing.
     pub fn connect(allocator: Allocator, url_input: []const u8, options: ConnectOptions) Error!Conn {
+        // Ping-pong buffers: the hop we are dialing may alias one of them, so
+        // the next location is always written into the other.
+        var bufs: [2][512]u8 = undefined;
+        var target: []const u8 = url_input;
+        var hops: u8 = 0;
+        while (true) {
+            var redirect: RedirectOut = .{ .buf = &bufs[hops % 2] };
+            if (try connectOnce(allocator, target, options, &redirect)) |conn| return conn;
+            hops += 1;
+            if (hops > max_redirects) {
+                log.warn("ws handshake to {s}: too many redirects", .{url_input});
+                return error.HandshakeFailed;
+            }
+            target = redirect.value();
+        }
+    }
+
+    /// One dial + upgrade attempt. Returns null when the relay redirected us
+    /// (the resolved target is written to `redirect`) — the caller re-dials.
+    fn connectOnce(
+        allocator: Allocator,
+        url_input: []const u8,
+        options: ConnectOptions,
+        redirect: *RedirectOut,
+    ) Error!?Conn {
         const url = try parseUrl(url_input);
 
-        // For direct connections, probe reachability with a bounded timeout
-        // first so a relay with a hanging TCP connect can't stall us for the
-        // OS default (~75 s) inside std's timeout-free connect. Proxied
-        // connections dial the proxy, not the relay, so skip the probe there.
-        if (options.proxy == null and
-            !preflightReachable(allocator, url.host, url.port, preflight_connect_ms))
-        {
-            log.warn("relay {s}:{d} unreachable within {d}ms, skipping", .{ url.host, url.port, preflight_connect_ms });
-            return error.ConnectFailed;
-        }
-
-        if (url.secure) {
-            // wss:// through the proxy: tunnel TCP via SOCKS, then run TLS on top
-            // of the proxied stream so the proxy only sees ciphertext. The relay
-            // never learns our IP -- the whole connection rides the proxy/Tor.
-            if (options.proxy) |px| {
-                const stream = proxy_mod.connectThroughProxyHost(allocator, px, url.host, url.port) catch |err| {
-                    log.debug("wss proxy tunnel to {s}:{d} failed: {}", .{ url.host, url.port, err });
-                    return error.ConnectFailed;
-                };
-                var conn = Conn{
-                    .allocator = allocator,
-                    .stream = stream,
-                    .fragment_buf = .empty,
-                    .fragment_opcode = null,
-                };
-                conn.tls_proxy = connectTlsOverProxy(allocator, stream, url.host) catch |err| {
-                    // connectTlsOverProxy already closed `stream` on failure.
-                    conn.fragment_buf.deinit(allocator);
-                    log.warn("tls over proxy to {s}:{d} failed: {}", .{ url.host, url.port, err });
-                    return err;
-                };
-                conn.stream = conn.tls_proxy.?.stream;
-                errdefer conn.deinit();
-                try conn.performHandshake(url);
-                return conn;
-            }
-            const client = try allocator.create(std.http.Client);
-            client.* = .{ .allocator = allocator };
-
-            {
-                client.ca_bundle_mutex.lock();
-                defer client.ca_bundle_mutex.unlock();
-                client.ca_bundle.rescan(allocator) catch {
-                    client.deinit();
-                    allocator.destroy(client);
-                    return error.TlsInitFailed;
-                };
-            }
-
-            const connection = client.connectTcp(url.host, url.port, .tls) catch |err| {
-                log.warn("tls connect to {s}:{d} failed: {}", .{ url.host, url.port, err });
-                client.deinit();
-                allocator.destroy(client);
-                return httpConnectError(err);
-            };
-
-            var conn = Conn{
-                .allocator = allocator,
-                .stream = connection.stream_reader.getStream(),
-                .http = .{
-                    .client = client,
-                    .connection = connection,
-                },
-                .fragment_buf = .empty,
-                .fragment_opcode = null,
-            };
-            errdefer conn.deinit();
-
-            try conn.performHandshake(url);
-            setRecvTimeout(conn.stream, 30);
-            return conn;
-        }
-
-        // `ws://` (no TLS). Through a proxy this is how we reach a relay's
-        // `.onion` address: the SOCKS tunnel (Tor) provides the encryption and
-        // authenticates the address, so the plaintext WebSocket rides safely on
-        // top -- no redundant TLS layer needed.
+        // Through a proxy we dial the proxy, not the relay: the SOCKS tunnel
+        // carries the connection so the relay never learns our IP. `ws://`
+        // rides the tunnel raw (an onion relay: Tor already encrypts and
+        // authenticates it); `wss://` runs TLS on top, so the proxy only ever
+        // sees ciphertext.
         const stream = if (options.proxy) |px|
             proxy_mod.connectThroughProxyHost(allocator, px, url.host, url.port) catch |err| {
-                log.debug("ws proxy tunnel to {s}:{d} failed: {}", .{ url.host, url.port, err });
+                log.debug("proxy tunnel to {s}:{d} failed: {}", .{ url.host, url.port, err });
                 return error.ConnectFailed;
             }
         else
             tcpConnect(allocator, url.host, url.port) catch |err| {
                 log.warn("tcp connect to {s}:{d} failed: {}", .{ url.host, url.port, err });
-                return error.ConnectFailed;
+                return err;
             };
 
         var conn = Conn{
             .allocator = allocator,
             .stream = stream,
-            .http = null,
             .fragment_buf = .empty,
             .fragment_opcode = null,
         };
+
+        if (url.secure) {
+            conn.tls_io = connectTls(allocator, stream, url.host) catch |err| {
+                // connectTls already closed `stream` on failure.
+                conn.fragment_buf.deinit(allocator);
+                log.warn("tls handshake with {s}:{d} failed: {}", .{ url.host, url.port, err });
+                return err;
+            };
+            conn.stream = conn.tls_io.?.stream;
+        } else {
+            // Set the recv timeout before the handshake so a silent relay
+            // can't hang us (the TLS path sets its own inside connectTls).
+            setRecvTimeout(conn.stream, 30);
+        }
         errdefer conn.deinit();
 
-        // Set the recv timeout before the handshake so a silent onion relay
-        // can't hang us (the proxy dial leaves its own timeout, but be explicit).
-        setRecvTimeout(conn.stream, 30);
-        try conn.performHandshake(url);
-        return conn;
+        if (try conn.performHandshake(url, redirect)) return conn;
+        // Redirected: this connection is done with. (Not an error path, so the
+        // errdefer above doesn't fire — close it here.)
+        conn.deinit();
+        return null;
     }
 
-    /// Run a TLS client handshake over an already-proxied `stream` and return a
-    /// heap-allocated `TlsProxyIo` that owns it (same TLS-over-a-raw-stream
-    /// mechanism as proxy.httpsExchange; the buffers + reader/writer live inside
-    /// the returned struct, which is heap-stable so TLS's pointers stay valid).
+    /// Run a TLS client handshake over `stream` and return a heap-allocated
+    /// `TlsIo` that owns it (same TLS-over-a-raw-stream mechanism as
+    /// proxy.httpsExchange; the buffers + reader/writer live inside the
+    /// returned struct, which is heap-stable so TLS's pointers stay valid).
     /// On any error the stream is closed and nothing leaks.
-    fn connectTlsOverProxy(allocator: Allocator, stream: std.net.Stream, host: []const u8) Error!*TlsProxyIo {
+    fn connectTls(allocator: Allocator, stream: std.net.Stream, host: []const u8) Error!*TlsIo {
         var owned = false;
         defer if (!owned) stream.close();
 
-        const tp = allocator.create(TlsProxyIo) catch return error.OutOfMemory;
+        const tp = allocator.create(TlsIo) catch return error.OutOfMemory;
         errdefer allocator.destroy(tp);
 
         tp.stream = stream;
@@ -286,7 +257,7 @@ pub const Conn = struct {
         // unresponsive relay fails instead of hanging. std's File.Reader turns a
         // read timeout into an error, which for our request/response +
         // subscribe-until-timeout relay usage simply ends the op -- the intent.
-        setRecvTimeout(stream, tls_proxy_handshake_secs);
+        setRecvTimeout(stream, tls_handshake_secs);
         tp.tls = tls.Client.init(tp.socket_reader.interface(), &tp.socket_writer.interface, .{
             .host = if (onion) .no_verification else .{ .explicit = host },
             .ca = if (onion) .no_verification else .{ .bundle = tp.ca_bundle },
@@ -294,19 +265,12 @@ pub const Conn = struct {
             .read_buffer = &tp.tls_read_buf,
         }) catch return error.TlsInitFailed;
 
-        owned = true; // tp now owns `stream`; TlsProxyIo.deinit closes it
+        owned = true; // tp now owns `stream`; TlsIo.deinit closes it
         return tp;
     }
 
     pub fn deinit(self: *Conn) void {
-        if (self.http) |h| {
-            // `connectTcp` registers the connection in the client's pool.
-            // Mark closing and release so `client.deinit()` does not panic.
-            h.connection.closing = true;
-            h.client.connection_pool.release(h.connection);
-            h.client.deinit();
-            self.allocator.destroy(h.client);
-        } else if (self.tls_proxy) |t| {
+        if (self.tls_io) |t| {
             t.deinit(self.allocator);
         } else {
             self.stream.close();
@@ -415,126 +379,18 @@ pub const Conn = struct {
     // Internal
     // -------------------------------------------------------------------
 
-    fn performHandshake(self: *Conn, url: Url) Error!void {
-        if (self.http) |h| return performHandshakeHttps(self, url, h);
-        return performHandshakePlain(self, url);
-    }
-
-    /// `wss://` upgrade via `std.http.Client` — the same stack as HTTPS
-    /// trackers. Hand-writing TLS application data and reading it back with
-    /// `tls.Client.reader` deadlocks on Zig 0.15 for Nostr relays.
-    fn performHandshakeHttps(self: *Conn, url: Url, h: HttpIo) Error!void {
-        var key_raw: [16]u8 = undefined;
-        std.crypto.random.bytes(&key_raw);
-        var key_b64: [24]u8 = undefined;
-        _ = std.base64.standard.Encoder.encode(&key_b64, &key_raw);
-
-        const uri_str = std.fmt.allocPrint(self.allocator, "https://{s}{s}", .{ url.host, url.path }) catch return error.OutOfMemory;
-        defer self.allocator.free(uri_str);
-        const uri = std.Uri.parse(uri_str) catch return error.HandshakeFailed;
-
-        const extra = [_]std.http.Header{
-            .{ .name = "Upgrade", .value = "websocket" },
-            .{ .name = "Sec-WebSocket-Key", .value = &key_b64 },
-            .{ .name = "Sec-WebSocket-Version", .value = "13" },
-        };
-
-        var req = h.client.request(.GET, uri, .{
-            .connection = h.connection,
-            .keep_alive = true,
-            .extra_headers = &extra,
-            .headers = .{
-                .host = .{ .override = url.host },
-                .connection = .{ .override = "Upgrade" },
-                .user_agent = .{ .override = "carl/0.1" },
-            },
-        }) catch return error.HandshakeFailed;
-
-        req.sendBodiless() catch return error.HandshakeFailed;
-
-        // Read + parse the response head ourselves instead of req.receiveHead():
-        // std's Response.Head.parse does @enumFromInt into the *exhaustive*
-        // std.http.Status enum, so a relay (or the CDN in front of it)
-        // answering with a non-standard code (Cloudflare's 52x/530, etc.)
-        // panics the whole daemon with "invalid enum value" — and the desktop
-        // app sits "offline" on its dead sidecar. Here any non-101 is a
-        // handshake failure, not a crash. (Observed in the field: a relay
-        // behind Cloudflare aborted the daemon exactly this way.)
-        //
-        // Redirects are still followed (std's default redirect_behavior allows
-        // 3): some relays/CDNs 301 the upgrade to a canonical path. Location
-        // is parsed from the raw head so the status never becomes a
-        // std.http.Status.
-        var redirects_left: u8 = 3;
-        var head: []const u8 = undefined;
-        var st: HeadStatus = undefined;
-        while (true) {
-            head = req.reader.receiveHead() catch return error.HandshakeFailed;
-            st = parseHeadStatus(head) orelse {
-                log.warn("ws handshake malformed status line", .{});
-                return error.HandshakeFailed;
-            };
-            switch (st.code) {
-                301, 302, 303, 307, 308 => {
-                    if (redirects_left == 0) {
-                        log.warn("ws handshake too many redirects", .{});
-                        return error.HandshakeFailed;
-                    }
-                    redirects_left -= 1;
-                    const location = findHeadHeader(head, "location") orelse {
-                        log.warn("ws handshake {d} without Location header", .{st.code});
-                        return error.HandshakeFailed;
-                    };
-                    // Drain the redirect body so the stream stays in sync for
-                    // the follow-up request (as std's Request.redirect does).
-                    const te: std.http.TransferEncoding = if (findHeadHeader(head, "transfer-encoding") != null) .chunked else .none;
-                    const cl: ?u64 = if (findHeadHeader(head, "content-length")) |v| std.fmt.parseInt(u64, v, 10) catch null else null;
-                    _ = req.reader.bodyReader(&.{}, te, cl).discardRemaining() catch return error.HandshakeFailed;
-                    // Resolve Location the two ways relays actually use it:
-                    // an absolute https:// URI, or an absolute path on the
-                    // same host.
-                    var new_uri_str: []u8 = undefined;
-                    if (std.mem.startsWith(u8, location, "https://")) {
-                        new_uri_str = self.allocator.dupe(u8, location) catch return error.OutOfMemory;
-                    } else if (location.len > 0 and location[0] == '/') {
-                        new_uri_str = std.fmt.allocPrint(self.allocator, "https://{s}{s}", .{ url.host, location }) catch return error.OutOfMemory;
-                    } else {
-                        log.warn("ws handshake unsupported redirect target: {s}", .{location});
-                        return error.HandshakeFailed;
-                    }
-                    defer self.allocator.free(new_uri_str);
-                    req.uri = std.Uri.parse(new_uri_str) catch return error.HandshakeFailed;
-                    req.sendBodiless() catch return error.HandshakeFailed;
-                    continue;
-                },
-                else => break,
-            }
-        }
-        if (st.code != 101) {
-            log.warn("ws handshake status {d} {s}", .{ st.code, st.reason });
-            return error.HandshakeFailed;
-        }
-
-        const expected = expectedAccept(&key_b64);
-        const accept = findHeadHeader(head, "Sec-WebSocket-Accept") orelse {
-            log.warn("ws handshake missing Sec-WebSocket-Accept header", .{});
-            return error.HandshakeFailed;
-        };
-        if (!std.mem.eql(u8, accept, &expected)) {
-            log.warn("ws handshake bad Sec-WebSocket-Accept", .{});
-            return error.HandshakeFailed;
-        }
-
-        // Detach the connection so `req.deinit` does not return it to the pool
-        // or drain bytes that belong to the first WebSocket frame.
-        h.connection.closing = false;
-        req.reader.state = .ready;
-        req.connection = null;
-        req.deinit();
-    }
-
-    /// `ws://` upgrade over a plain TCP socket.
-    fn performHandshakePlain(self: *Conn, url: Url) Error!void {
+    /// Send the upgrade request and read the response. Returns true when the
+    /// relay switched protocols; false when it redirected us, in which case
+    /// `redirect` holds the resolved target and the caller re-dials.
+    ///
+    /// The response head is parsed by hand rather than with std.http: std's
+    /// Response.Head.parse does @enumFromInt into the *exhaustive*
+    /// std.http.Status enum, so a relay (or the CDN in front of it) answering
+    /// with a non-standard code (Cloudflare's 52x/530, etc.) panics the whole
+    /// daemon with "invalid enum value" -- and the desktop app sits "offline"
+    /// on its dead sidecar. Here any non-101 is a handshake failure, not a
+    /// crash. (Observed in the field.)
+    fn performHandshake(self: *Conn, url: Url, redirect: *RedirectOut) Error!bool {
         var key_raw: [16]u8 = undefined;
         std.crypto.random.bytes(&key_raw);
         var key_b64: [24]u8 = undefined;
@@ -556,25 +412,51 @@ pub const Conn = struct {
 
         try self.writeAll(req);
 
+        // Read until the head is complete. A 101 carries no body, so anything
+        // past the blank line would be WebSocket frames -- but a redirect may
+        // carry one, hence indexOf rather than "the read ended on \r\n\r\n"
+        // (we drop the connection on a redirect, so a partly-read body is
+        // harmless).
         var hdr_buf: [4096]u8 = undefined;
         var hdr_len: usize = 0;
-        while (hdr_len < hdr_buf.len) {
-            const space = hdr_buf.len - hdr_len;
-            const want = @min(space, 512);
+        while (std.mem.indexOf(u8, hdr_buf[0..hdr_len], "\r\n\r\n") == null) {
+            if (hdr_len == hdr_buf.len) {
+                log.warn("ws handshake response head too large", .{});
+                return error.HandshakeFailed;
+            }
+            const want = @min(hdr_buf.len - hdr_len, 512);
             const n = try self.readSome(hdr_buf[hdr_len..][0..want]);
             if (n == 0) return error.HandshakeFailed;
             hdr_len += n;
-            if (hdr_len >= 4 and std.mem.eql(u8, hdr_buf[hdr_len - 4 .. hdr_len], "\r\n\r\n")) break;
         }
         const headers = hdr_buf[0..hdr_len];
 
-        if (!std.mem.startsWith(u8, headers, "HTTP/1.1 101")) {
-            log.warn("ws handshake non-101 response: {s}", .{headers[0..@min(80, headers.len)]});
+        const st = parseHeadStatus(headers) orelse {
+            log.warn("ws handshake malformed status line", .{});
             return error.HandshakeFailed;
+        };
+        switch (st.code) {
+            101 => {},
+            301, 302, 303, 307, 308 => {
+                const location = findHeadHeader(headers, "location") orelse {
+                    log.warn("ws handshake {d} without Location header", .{st.code});
+                    return error.HandshakeFailed;
+                };
+                if (!resolveRedirect(url, location, redirect)) {
+                    log.warn("ws handshake unsupported redirect target: {s}", .{location});
+                    return error.HandshakeFailed;
+                }
+                log.info("ws {s}: relay redirected the upgrade to {s}", .{ url.host, redirect.value() });
+                return false;
+            },
+            else => {
+                log.warn("ws handshake status {d} {s}", .{ st.code, st.reason });
+                return error.HandshakeFailed;
+            },
         }
 
         const expected = expectedAccept(&key_b64);
-        const accept_value = findHeader(headers, "Sec-WebSocket-Accept") orelse {
+        const accept_value = findHeadHeader(headers, "Sec-WebSocket-Accept") orelse {
             log.warn("ws handshake missing Sec-WebSocket-Accept header", .{});
             return error.HandshakeFailed;
         };
@@ -582,25 +464,7 @@ pub const Conn = struct {
             log.warn("ws handshake bad Sec-WebSocket-Accept", .{});
             return error.HandshakeFailed;
         }
-    }
-
-    /// Find the value of a case-insensitive header name in an HTTP/1.1 header
-    /// block. Returns null if the header is absent.
-    fn findHeader(headers: []const u8, name: []const u8) ?[]const u8 {
-        var line_start: usize = 0;
-        while (line_start < headers.len) {
-            const line_end = std.mem.indexOfScalarPos(u8, headers, line_start, '\n') orelse return null;
-            const line = headers[line_start..line_end];
-            const trimmed = std.mem.trimRight(u8, line, "\r");
-            if (std.mem.indexOfScalar(u8, trimmed, ':')) |colon| {
-                const hdr_name = trimmed[0..colon];
-                if (hdr_name.len == name.len and std.ascii.eqlIgnoreCase(hdr_name, name)) {
-                    return std.mem.trim(u8, trimmed[colon + 1 ..], " \t");
-                }
-            }
-            line_start = line_end + 1;
-        }
-        return null;
+        return true;
     }
 
     const FrameMeta = struct {
@@ -679,11 +543,7 @@ pub const Conn = struct {
     }
 
     fn writeAll(self: *Conn, buf: []const u8) Error!void {
-        if (self.http) |h| {
-            const w = h.connection.writer();
-            w.writeAll(buf) catch return error.SendFailed;
-            h.connection.flush() catch return error.SendFailed;
-        } else if (self.tls_proxy) |t| {
+        if (self.tls_io) |t| {
             t.tls.writer.writeAll(buf) catch return error.SendFailed;
             t.tls.writer.flush() catch return error.SendFailed;
             t.socket_writer.interface.flush() catch return error.SendFailed;
@@ -698,11 +558,7 @@ pub const Conn = struct {
     }
 
     fn readSome(self: *Conn, buf: []u8) Error!usize {
-        if (self.http) |h| {
-            const r = h.connection.reader();
-            return r.readSliceShort(buf) catch return error.RecvFailed;
-        }
-        if (self.tls_proxy) |t| {
+        if (self.tls_io) |t| {
             // readSliceShort() fills the whole buffer -- it loops until `buf` is
             // full or EOF -- so it deadlocks reading a kept-alive HTTP/WS
             // response that never reaches EOF (e.g. the 101 upgrade headers).
@@ -746,66 +602,11 @@ fn setRecvTimeout(stream: std.net.Stream, sec: u32) void {
     posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
 }
 
-fn httpConnectError(err: std.http.Client.ConnectTcpError) Error {
-    return switch (err) {
-        error.TlsInitializationFailed => error.TlsInitFailed,
-        error.UnknownHostName, error.HostLacksNetworkAddresses => error.DnsResolveFailed,
-        else => error.ConnectFailed,
-    };
-}
-
-/// Connect-probe budget (ms) for the preflight reachability check. The blocking
-/// connect inside `std.http.Client` (used for the `wss://` TLS path) has no
-/// timeout, so a relay whose TCP connect hangs -- e.g. an unroutable address or
-/// a silently-dropped SYN, as public relays like relay.nostr.band sometimes do
-/// -- would otherwise stall the caller for the OS default (~75 s). We probe
-/// first with a bounded non-blocking connect and skip the relay fast on failure.
-const preflight_connect_ms: i32 = 4000;
-
-/// Best-effort fast reachability probe: resolve `host` and try a non-blocking
-/// TCP connect (IPv4 first) bounded by `timeout_ms`. Returns true as soon as any
-/// address accepts. A false return lets the caller skip a dead/slow relay
-/// quickly instead of blocking in std's timeout-free connect.
-fn preflightReachable(allocator: Allocator, host: []const u8, port: u16, timeout_ms: i32) bool {
-    const list = std.net.getAddressList(allocator, host, port) catch return false;
-    defer list.deinit();
-
-    inline for (.{ posix.AF.INET, posix.AF.INET6 }) |family| {
-        for (list.addrs) |addr| {
-            if (addr.any.family != family) continue;
-            if (probeConnect(addr, timeout_ms)) return true;
-        }
-    }
-    return false;
-}
-
-/// Non-blocking connect to a single address, bounded by `timeout_ms`. The probe
-/// socket is always closed; we only care whether the connect would succeed.
-fn probeConnect(addr: std.net.Address, timeout_ms: i32) bool {
-    const sock = posix.socket(
-        addr.any.family,
-        posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
-        posix.IPPROTO.TCP,
-    ) catch return false;
-    defer posix.close(sock);
-
-    const flags = posix.fcntl(sock, posix.F.GETFL, 0) catch return false;
-    var o: posix.O = @bitCast(@as(u32, @truncate(flags)));
-    o.NONBLOCK = true;
-    _ = posix.fcntl(sock, posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
-
-    posix.connect(sock, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
-        error.WouldBlock => {
-            var pfd = [_]posix.pollfd{.{ .fd = sock, .events = posix.POLL.OUT, .revents = 0 }};
-            const ready = posix.poll(&pfd, timeout_ms) catch return false;
-            if (ready == 0) return false;
-            posix.getsockoptError(sock) catch return false;
-            return true;
-        },
-        else => return false,
-    };
-    return true; // connected synchronously
-}
+/// Connect-timeout budget (ms) for the TCP dial. std's `connect` has no
+/// timeout at all, so a relay whose TCP connect hangs -- an unroutable address
+/// or a silently-dropped SYN, as public relays like relay.nostr.band sometimes
+/// do -- would otherwise stall the caller for the OS default (~75 s).
+const connect_timeout_ms: i32 = 4000;
 
 /// Open TCP to `host`:`port`, preferring IPv4 and trying every resolved address
 /// before giving up. `std.net.tcpConnectToHost` stops on the first non-refused
@@ -815,21 +616,101 @@ fn tcpConnect(allocator: Allocator, host: []const u8, port: u16) Error!std.net.S
     defer list.deinit();
     if (list.addrs.len == 0) return error.DnsResolveFailed;
 
-    var last_err: ?std.net.TcpConnectToAddressError = null;
-
     inline for (.{ posix.AF.INET, posix.AF.INET6 }) |family| {
         for (list.addrs) |addr| {
             if (addr.any.family != family) continue;
-            const stream = std.net.tcpConnectToAddress(addr) catch |err| {
-                last_err = err;
-                continue;
-            };
-            return stream;
+            if (connectTimed(addr, connect_timeout_ms)) |stream| return stream;
         }
     }
-
-    if (last_err) |_| return error.ConnectFailed;
     return error.ConnectFailed;
+}
+
+/// TCP connect to a single address bounded by `timeout_ms`, handing back the
+/// *connected* socket: dial non-blocking, wait with poll(), then restore
+/// blocking mode. The socket that proves the relay reachable is the one we
+/// keep -- no probe-and-throw-away, so a relay sees exactly one connect per
+/// attempt.
+fn connectTimed(addr: std.net.Address, timeout_ms: i32) ?std.net.Stream {
+    const sock = posix.socket(
+        addr.any.family,
+        posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
+        posix.IPPROTO.TCP,
+    ) catch return null;
+    var keep = false;
+    defer if (!keep) posix.close(sock);
+
+    if (!setNonBlocking(sock, true)) return null;
+    posix.connect(sock, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
+        error.WouldBlock => {
+            var pfd = [_]posix.pollfd{.{ .fd = sock, .events = posix.POLL.OUT, .revents = 0 }};
+            const ready = posix.poll(&pfd, timeout_ms) catch return null;
+            if (ready == 0) return null; // timed out
+            // poll() only says "the connect finished" -- SO_ERROR says how.
+            posix.getsockoptError(sock) catch return null;
+        },
+        else => return null,
+    };
+    // Everything downstream (our recv loop, std's TLS client) assumes a
+    // blocking socket with SO_RCVTIMEO.
+    if (!setNonBlocking(sock, false)) return null;
+
+    keep = true;
+    return .{ .handle = sock };
+}
+
+fn setNonBlocking(sock: posix.socket_t, on: bool) bool {
+    const flags = posix.fcntl(sock, posix.F.GETFL, 0) catch return false;
+    var o: posix.O = @bitCast(@as(u32, @truncate(flags)));
+    o.NONBLOCK = on;
+    _ = posix.fcntl(sock, posix.F.SETFL, @as(u32, @bitCast(o))) catch return false;
+    return true;
+}
+
+/// Where a relay's redirect points, resolved into an absolute ws/wss URL. The
+/// caller owns the backing buffer (see `Conn.connect`).
+const RedirectOut = struct {
+    buf: []u8,
+    len: usize = 0,
+
+    fn value(self: RedirectOut) []const u8 {
+        return self.buf[0..self.len];
+    }
+
+    fn set(self: *RedirectOut, parts: []const []const u8) bool {
+        var n: usize = 0;
+        for (parts) |p| {
+            if (n + p.len > self.buf.len) return false;
+            @memcpy(self.buf[n..][0..p.len], p);
+            n += p.len;
+        }
+        self.len = n;
+        return true;
+    }
+};
+
+/// Resolve a `Location` value against the URL we just requested. Handles the
+/// two forms relays actually send: an absolute URL (https/wss and their
+/// insecure twins) and an absolute path on the same host. Anything else --
+/// including a relative path -- is rejected rather than guessed at. Returns
+/// false when the target doesn't fit the caller's buffer either.
+fn resolveRedirect(url: Url, location: []const u8, out: *RedirectOut) bool {
+    if (location.len == 0) return false;
+    if (std.mem.startsWith(u8, location, "wss://") or std.mem.startsWith(u8, location, "ws://"))
+        return out.set(&.{location});
+    // A wss endpoint IS an https endpoint pre-upgrade; relays name it either way.
+    if (std.mem.startsWith(u8, location, "https://"))
+        return out.set(&.{ "wss://", location["https://".len..] });
+    if (std.mem.startsWith(u8, location, "http://"))
+        return out.set(&.{ "ws://", location["http://".len..] });
+    if (location[0] != '/') return false;
+
+    const scheme: []const u8 = if (url.secure) "wss://" else "ws://";
+    var port_buf: [8]u8 = undefined;
+    const port: []const u8 = if (url.port == (if (url.secure) @as(u16, 443) else 80))
+        ""
+    else
+        std.fmt.bufPrint(&port_buf, ":{d}", .{url.port}) catch return false;
+    return out.set(&.{ scheme, url.host, port, location });
 }
 
 /// Compute the expected Sec-WebSocket-Accept header value for a given
@@ -937,6 +818,46 @@ test "findHeadHeader: lookup is case-insensitive and trims the value" {
     try std.testing.expectEqualStrings("wss://relay.example.com/nostr", findHeadHeader(head, "location").?);
     try std.testing.expectEqualStrings("0", findHeadHeader(head, "Content-Length").?);
     try std.testing.expect(findHeadHeader(head, "sec-websocket-accept") == null);
+}
+
+fn expectRedirect(expected: []const u8, from: []const u8, location: []const u8) !void {
+    var buf: [256]u8 = undefined;
+    var out: RedirectOut = .{ .buf = &buf };
+    try std.testing.expect(resolveRedirect(try parseUrl(from), location, &out));
+    try std.testing.expectEqualStrings(expected, out.value());
+}
+
+test "resolveRedirect: absolute targets keep (or gain) a websocket scheme" {
+    try expectRedirect("wss://b.example/nostr", "wss://a.example", "wss://b.example/nostr");
+    try expectRedirect("ws://b.example/", "wss://a.example", "ws://b.example/");
+    // A wss endpoint is an https endpoint pre-upgrade; relays name it both ways.
+    try expectRedirect("wss://b.example/nostr", "wss://a.example", "https://b.example/nostr");
+    try expectRedirect("ws://b.example:8080/", "wss://a.example", "http://b.example:8080/");
+}
+
+test "resolveRedirect: absolute paths resolve against the current host" {
+    try expectRedirect("wss://a.example/nostr", "wss://a.example", "/nostr");
+    try expectRedirect("wss://a.example/canonical", "wss://a.example/", "/canonical");
+    // A non-default port has to survive the rewrite, or we'd re-dial 443.
+    try expectRedirect("wss://a.example:7777/nostr", "wss://a.example:7777/x", "/nostr");
+    try expectRedirect("ws://a.example/nostr", "ws://a.example", "/nostr");
+    try expectRedirect("ws://a.example:81/nostr", "ws://a.example:81", "/nostr");
+}
+
+test "resolveRedirect: rejects what we can't resolve safely" {
+    var buf: [256]u8 = undefined;
+    var out: RedirectOut = .{ .buf = &buf };
+    const url = try parseUrl("wss://a.example");
+    try std.testing.expect(!resolveRedirect(url, "", &out));
+    try std.testing.expect(!resolveRedirect(url, "nostr", &out)); // relative
+    try std.testing.expect(!resolveRedirect(url, "ftp://b.example", &out));
+
+    // A target longer than the caller's buffer is refused, never truncated
+    // (a truncated URL would dial the wrong host).
+    var tiny: [8]u8 = undefined;
+    var small: RedirectOut = .{ .buf = &tiny };
+    try std.testing.expect(!resolveRedirect(url, "wss://much.longer.example/nostr", &small));
+    try std.testing.expectEqual(@as(usize, 0), small.len);
 }
 
 // Frame-level tests use a fixed-buffer "byte stream" instead of real sockets,

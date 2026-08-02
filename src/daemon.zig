@@ -47,14 +47,14 @@ const max_body: usize = 256 * 1024 * 1024;
 /// How often the background prober refreshes relay reachability. The daemon
 /// holds no persistent relay connections, so without this the UI could only
 /// ever show relays as "configured" (never connected).
+///
+/// A relay that fails is *not* re-dialed every tick: the shared per-relay
+/// health table (`relay.HealthTable`) backs it off individually, 30s doubling
+/// to 5 minutes, so a permanently-503 relay costs one dial per backoff window
+/// instead of one every 30s. This replaced a global "all relays down N cycles
+/// in a row" streak, which a single healthy relay reset forever — the daemon
+/// then hammered the dead one indefinitely.
 const probe_interval_ns: u64 = 30 * std.time.ns_per_s;
-
-/// After this many consecutive all-unreachable probe cycles, the prober
-/// backs off to `backoff_interval_ns` to stop flooding the logs and
-/// wasting Tor circuits. Resets to the normal interval on the first
-/// successful probe.
-const max_consecutive_failures: u8 = 3;
-const backoff_interval_ns: u64 = 5 * 60 * std.time.ns_per_s;
 
 pub const Daemon = struct {
     allocator: Allocator,
@@ -70,8 +70,6 @@ pub const Daemon = struct {
     proxy_state: proxy_mod.ProxyState = .ok,
     proxy_reply: ?u8 = null,
     proxy_probed: bool = false,
-    /// Consecutive probe cycles where every relay was unreachable.
-    relay_fail_streak: u8 = 0,
 
     /// Bind to 127.0.0.1:`port` and serve until `running` is cleared. Blocking.
     pub fn serve(self: *Daemon, port: u16) !void {
@@ -260,12 +258,8 @@ pub const Daemon = struct {
             // down) so they come back within a tick instead of after the next
             // restart — until now they existed only as invisible DB rows.
             self.manager.retryRetained();
-            const interval = if (self.relay_fail_streak >= max_consecutive_failures)
-                backoff_interval_ns
-            else
-                probe_interval_ns;
             var slept: u64 = 0;
-            while (slept < interval and
+            while (slept < probe_interval_ns and
                 self.running.load(.acquire) and
                 !session_mod.shutdown_requested.load(.acquire)) : (slept += 250 * std.time.ns_per_ms)
             {
@@ -291,16 +285,19 @@ pub const Daemon = struct {
         }
 
         var list: std.ArrayList(api.Relay) = .empty;
-        var any_connected = false;
         for (urls) |url| {
             const onion = std.mem.indexOf(u8, url, ".onion") != null;
             var state: []const u8 = "configured";
             if (!(onion and proxy == null)) {
-                if (relay_mod.Relay.connect(a, url, proxy)) |r| {
+                // `.honor`: a relay we already know is failing is not dialed
+                // again until its backoff expires. `error.Skipped` therefore
+                // means "still down as far as we know", which is what the UI
+                // showed for it last cycle anyway — backoff only ever starts
+                // after a real failure.
+                if (relay_mod.dial(a, url, proxy, .honor)) |r| {
                     var rc = r;
                     rc.deinit();
                     state = "connected";
-                    any_connected = true;
                 } else |_| {
                     state = "unreachable";
                 }
@@ -320,17 +317,6 @@ pub const Daemon = struct {
             list.deinit(a);
             return;
         };
-
-        if (any_connected) {
-            self.relay_fail_streak = 0;
-        } else if (urls.len > 0) {
-            self.relay_fail_streak +|= 1;
-            if (self.relay_fail_streak == max_consecutive_failures) {
-                log.warn("all relays unreachable {d}x in a row, backing off to {d}s interval", .{
-                    max_consecutive_failures, backoff_interval_ns / std.time.ns_per_s,
-                });
-            }
-        }
 
         self.health_mutex.lock();
         const old = self.health;
@@ -1184,9 +1170,18 @@ fn percentDecode(arena: Allocator, s: []const u8) ![]u8 {
 // ===========================================================================
 
 fn runSearch(arena: Allocator, daemon: *Daemon, query: []const u8) ![]u8 {
-    // Use the prober's health view: skip relays already known unreachable so a
-    // dead relay's connect timeout doesn't stall the whole search.
+    // The prober's snapshot is only the *list*; whether each relay is dialable
+    // right now comes from the shared health table, which every subsystem
+    // feeds (so a relay the prober found dead 10s ago isn't re-dialed here).
     const health = daemon.healthSnapshot(arena) catch &.{};
+
+    // A search is user-initiated and one-shot: prefer healthy relays, but if
+    // every relay happens to be backing off, dial them all anyway rather than
+    // hand back an empty result list the user can't explain. One extra dial
+    // per search is a price worth paying; a silent no-op isn't.
+    const urls = try arena.alloc([]const u8, health.len);
+    for (health, 0..) |r, i| urls[i] = r.url;
+    const gate = relay_mod.oneShotGate(urls);
 
     // Match the route the manager is configured for, so search over Tor/proxy
     // doesn't leak the real IP. The i2p route's `socks` is a SAM endpoint, not a
@@ -1208,9 +1203,8 @@ fn runSearch(arena: Allocator, daemon: *Daemon, query: []const u8) ![]u8 {
 
     for (health) |relay| {
         if (results.items.len >= 50) break;
-        if (std.mem.eql(u8, relay.state, "unreachable")) continue;
         const url = relay.url;
-        var r = relay_mod.Relay.connect(arena, url, proxy) catch continue;
+        var r = relay_mod.dial(arena, url, proxy, gate) catch continue;
         defer r.deinit();
         const events = relay_mod.subscribeAndCollect(arena, &r, filter, .{
             .timeout_ms = 7_000,

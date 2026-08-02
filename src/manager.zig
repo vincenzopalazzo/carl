@@ -1588,8 +1588,13 @@ fn broadcastIfNew(mt: *ManagedTransfer) void {
         .limit = 1,
     };
 
+    // This query is the precondition for a one-shot publish, so it uses the
+    // same gate: honor the per-relay backoff while any relay is dialable, and
+    // if none is, ask anyway rather than broadcast blind (a duplicate kind-2003
+    // is exactly what gets a client rate-limited).
+    const gate = relay_mod.oneShotGate(relay_urls);
     for (relay_urls) |url| {
-        var r = relay_mod.Relay.connect(a, url, mt.proxy) catch continue;
+        var r = relay_mod.dial(a, url, mt.proxy, gate) catch continue;
         defer r.deinit();
         const events = relay_mod.subscribeAndCollect(a, &r, filter, .{
             .timeout_ms = 8_000,
@@ -1666,7 +1671,10 @@ fn collectNostrPeers(mt: *ManagedTransfer) void {
     var added: usize = 0;
     for (relay_urls) |url| {
         if (!mt.session.running) return;
-        var r = relay_mod.Relay.connect(a, url, mt.proxy) catch continue;
+        // Periodic (fires whenever a transfer stalls), so `.honor`: a relay in
+        // backoff is skipped outright. The next stall re-runs this anyway, and
+        // dialing a known-dead relay only delays the ones that answer.
+        var r = relay_mod.dial(a, url, mt.proxy, .honor) catch continue;
         defer r.deinit();
         const events = relay_mod.subscribeAndCollect(a, &r, filter, .{
             .timeout_ms = 10_000,

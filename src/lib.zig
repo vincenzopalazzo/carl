@@ -5,6 +5,7 @@ pub const udp_tracker = @import("udp_tracker.zig");
 pub const wire = @import("wire.zig");
 pub const piece = @import("piece.zig");
 pub const storage = @import("storage.zig");
+pub const resume_data = @import("resume_data.zig");
 pub const peer = @import("peer.zig");
 pub const session = @import("session.zig");
 pub const magnet = @import("magnet.zig");
@@ -40,6 +41,7 @@ test {
     _ = wire;
     _ = piece;
     _ = storage;
+    _ = resume_data;
     _ = peer;
     _ = session;
     _ = magnet;

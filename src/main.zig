@@ -75,6 +75,7 @@ pub fn main() !void {
         const port = parsePort(args[3..]);
         const want_nostr = parseFlagPresent(args[3..], "--nostr");
         const want_seed = parseFlagPresent(args[3..], "--seed");
+        if (parseFlagPresent(args[3..], "--verify")) carl.session.force_verify = true;
         try cmdDownload(allocator, source, output_dir, port, parseProxy(args[3..]), want_nostr, want_seed);
     } else if (std.mem.eql(u8, command, "seed")) {
         if (args.len < 3) {
@@ -94,6 +95,7 @@ pub fn main() !void {
         };
         const port = parsePort(flag_args);
         const want_nostr = parseFlagPresent(flag_args, "--nostr");
+        if (parseFlagPresent(flag_args, "--verify")) carl.session.force_verify = true;
         const tor_seed = parseFlagPresent(flag_args, "--tor-seed");
         const external_ip = parseFlag(flag_args, "--external-ip");
         const description = parseFlag(flag_args, "--description") orelse "";
@@ -149,12 +151,14 @@ fn printUsage() void {
         \\commands:
         \\  info <file.torrent>                              show torrent metadata
         \\  announce <file.torrent> [--proxy url]            query tracker for peers
-        \\  download <source> [--output-dir d] [--port p] [--proxy url] [--nostr] [--seed]
+        \\  download <source> [--output-dir d] [--port p] [--proxy url] [--nostr] [--seed] [--verify]
         \\           source: file.torrent, magnet:?..., or http(s):// URL
         \\           --output-dir: defaults to the carl work dir (see below)
         \\           --nostr: also subscribe to nostr peer-announce events
         \\           --seed: keep seeding after the download completes
         \\                   (default: exit once the download is done)
+        \\           --verify: re-hash existing data instead of trusting the
+        \\                     saved resume state (use if a file looks corrupt)
         \\  seed <file.torrent> [data-dir] [--port p] [--proxy url] [--nostr] [--external-ip <ip>]
         \\           [--tor-seed] [--tor-control host:port] [--tor-cookie path]
         \\           [--tor-onion-port p] [--tor-socks url]
@@ -165,6 +169,8 @@ fn printUsage() void {
         \\           --tor-seed: hidden service via Tor ControlPort; requires --nostr
         \\           --i2p-seed: inbound I2P seed via SAM (stable .b32.i2p); requires
         \\                       --nostr. SAM bridge from --i2p-sam (default 127.0.0.1:7656)
+        \\           --verify: re-hash the data instead of trusting the saved
+        \\                     resume state (use if a file looks corrupt)
         \\  create <file-or-dir> [-o out.torrent] [-t tracker]... [--comment "..."] [--piece-length bytes]
         \\           build a .torrent from a file or directory (multi-file).
         \\           -t may repeat; trackers are optional (Nostr/DHT discovery).

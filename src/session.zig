@@ -10,6 +10,7 @@ const udp_tracker = @import("udp_tracker.zig");
 const wire = @import("wire.zig");
 const piece_mod = @import("piece.zig");
 const storage_mod = @import("storage.zig");
+const resume_mod = @import("resume_data.zig");
 const peer_mod = @import("peer.zig");
 const extension = @import("extension.zig");
 const bencode = @import("bencode.zig");
@@ -119,6 +120,22 @@ pub const OnComplete = struct {
 /// Global flag for graceful shutdown on SIGINT. Atomic because it's
 /// written from a signal handler and read from event loop / test threads.
 pub var shutdown_requested = std.atomic.Value(bool).init(false);
+
+/// Ignore any persisted resume record and re-hash every piece from disk
+/// (`--verify`).
+///
+/// The resume record is a cache of a hash check keyed on each file's size and
+/// mtime. That is what libtorrent does too, and it is sound for the ordinary
+/// case, but nothing keyed on metadata can see a same-size in-place change that
+/// leaves mtime alone — silent disk corruption being the realistic one, since
+/// bad sectors do not touch mtime. The record's spot check re-hashes a handful
+/// of pieces, which narrows that window without closing it.
+///
+/// So every torrent client ships a "force recheck", and this is ours: the way
+/// out when a file is suspect. Global rather than a parameter because every
+/// frontend (CLI, daemon, manager, follow) builds sessions through different
+/// paths and this is a process-wide, run-once user intent.
+pub var force_verify: bool = false;
 
 fn sigintHandler(_: i32) callconv(.c) void {
     shutdown_requested.store(true, .release);
@@ -382,6 +399,10 @@ pub const Session = struct {
     peer_id: [20]u8,
     our_bitfield: piece_mod.Bitfield,
     store: storage_mod.Storage,
+    /// Persisted verified-piece bitfield, so a restart doesn't re-hash the
+    /// whole payload. Never trusted blindly — see resume_data.zig for the
+    /// staleness rules that decide between "load" and "verify everything".
+    resume_data: resume_mod.Resume,
 
     peers: std.ArrayList(*peer_mod.PeerConnection),
     active_pieces: std.AutoHashMap(u32, *piece_mod.PieceProgress),
@@ -620,23 +641,52 @@ pub const Session = struct {
             return error.StorageInitFailed;
         errdefer store.deinit();
 
-        // Verify existing pieces (resume + seed)
+        // Resume + seed: establish which pieces we already have.
+        //
+        // Hashing every existing piece is O(bytes on disk) — seconds for a
+        // 755 MB torrent, minutes for a multi-GB one, on whichever thread added
+        // the transfer. So prefer the bitfield the last run persisted, and only
+        // fall back to the full scan when that record can't be trusted (see
+        // resume_data.zig). The scan's result is saved on the way out, which is
+        // what makes the NEXT start O(1).
+        var resume_state: resume_mod.Resume = .{ .info_hash = info_hash };
+        const resume_key: resume_mod.Key = .{
+            .info_hash = info_hash,
+            .piece_length = meta.piece_length,
+            .total_length = total_length,
+            .num_pieces = num_pieces,
+            .num_files = std.math.cast(u32, meta.files.len) orelse 0,
+        };
         {
             const stderr = std.fs.File.stderr().deprecatedWriter();
-            stderr.print("verifying existing pieces...\n", .{}) catch {};
-            for (0..num_pieces) |i| {
-                const idx: u32 = @intCast(i);
-                const plen = piece_mod.pieceLength(idx, meta.piece_length, total_length);
-                const data = store.readPiece(allocator, idx, plen) catch continue;
-                defer allocator.free(data);
-                const hash = piece_mod.pieceHash(meta.pieces, idx) orelse continue;
-                if (piece_mod.verifyPiece(data, hash)) {
-                    our_bitfield.setPiece(idx);
+            const saved_state = if (force_verify)
+                null
+            else
+                resume_state.load(allocator, &store, resume_key, meta.pieces);
+            if (saved_state) |saved| {
+                our_bitfield.deinit(allocator);
+                our_bitfield = saved;
+                stderr.print("resume: {d}/{d} pieces from saved state\n", .{
+                    our_bitfield.count(),
+                    num_pieces,
+                }) catch {};
+            } else {
+                stderr.print("verifying existing pieces...\n", .{}) catch {};
+                for (0..num_pieces) |i| {
+                    const idx: u32 = @intCast(i);
+                    const plen = piece_mod.pieceLength(idx, meta.piece_length, total_length);
+                    const data = store.readPiece(allocator, idx, plen) catch continue;
+                    defer allocator.free(data);
+                    const hash = piece_mod.pieceHash(meta.pieces, idx) orelse continue;
+                    if (piece_mod.verifyPiece(data, hash)) {
+                        our_bitfield.setPiece(idx);
+                    }
                 }
-            }
-            const verified = our_bitfield.count();
-            if (verified > 0) {
-                stderr.print("resume: {d}/{d} pieces already verified\n", .{ verified, num_pieces }) catch {};
+                const verified = our_bitfield.count();
+                if (verified > 0) {
+                    stderr.print("resume: {d}/{d} pieces already verified\n", .{ verified, num_pieces }) catch {};
+                }
+                resume_state.save(allocator, &store, resume_key, our_bitfield);
             }
         }
 
@@ -664,6 +714,7 @@ pub const Session = struct {
             .peer_id = peer_id,
             .our_bitfield = our_bitfield,
             .store = store,
+            .resume_data = resume_state,
             .peers = .empty,
             .active_pieces = std.AutoHashMap(u32, *piece_mod.PieceProgress).init(allocator),
             .piece_availability = piece_availability,
@@ -709,6 +760,11 @@ pub const Session = struct {
         // `allocator`, so it must be gone before the caller tears that down.
         self.stopWebSeed();
 
+        // Clean shutdown: persist whatever this run verified, while the files
+        // are still open (the record stamps them). A crash skips this and
+        // costs a re-verify — never a wrong bitfield.
+        self.saveResume();
+
         var it = self.active_pieces.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.*.deinit(self.allocator);
@@ -734,6 +790,41 @@ pub const Session = struct {
         // The magnet path replaces `meta` with a session-owned copy; free it.
         // The original caller-owned `meta` is freed by the caller.
         if (self.meta_owned) self.meta.deinit(self.allocator);
+    }
+
+    /// The geometry a resume record must match to be usable for this transfer.
+    /// Recomputed on demand rather than stored, because a magnet's geometry
+    /// only settles when its metadata lands (`onMetadataComplete` replaces the
+    /// piece length, piece count, and file list wholesale).
+    fn resumeKey(self: *const Session) resume_mod.Key {
+        return .{
+            .info_hash = self.info_hash,
+            .piece_length = self.piece_len,
+            .total_length = self.total_length,
+            .num_pieces = self.num_pieces,
+            .num_files = std.math.cast(u32, self.meta.files.len) orelse 0,
+        };
+    }
+
+    /// Persist the verified bitfield now (completion, clean shutdown). A no-op
+    /// unless a piece moved since the last save: the record on disk already
+    /// describes the payload exactly, and rewriting it would only cost an
+    /// fsync.
+    fn saveResume(self: *Session) void {
+        if (self.metadata_only) return;
+        if (!self.resume_data.dirty) return;
+        self.resume_data.save(self.allocator, &self.store, self.resumeKey(), self.our_bitfield);
+    }
+
+    /// Forget a piece we previously verified: drop the bit, restate the
+    /// cross-thread count, and mark the record for rewrite so the piece is not
+    /// resurrected from a stale save on the next start.
+    fn dropVerifiedPiece(self: *Session, index: u32) void {
+        if (!self.our_bitfield.hasPiece(index)) return;
+        self.our_bitfield.clearPiece(index);
+        self.have_pieces.store(self.our_bitfield.count(), .monotonic);
+        self.resume_data.markDirty();
+        log.warn("piece {d} unreadable on disk; dropped from the verified set", .{index});
     }
 
     /// A consistent, race-safe view of the session's live progress, for other
@@ -902,6 +993,10 @@ pub const Session = struct {
         while (self.running and !shutdown_requested.load(.acquire)) {
             if (self.mode == .download and !self.metadata_only and self.num_pieces > 0 and self.our_bitfield.isComplete()) {
                 stdout.print("\ndownload complete!\n", .{}) catch {};
+                // Record the finished set before anything closes or reopens the
+                // files: a completed torrent is exactly the case that must never
+                // re-hash gigabytes on the next start.
+                self.saveResume();
                 self.doMultiTrackerAnnounce(.completed) catch {};
                 if (self.on_complete) |cb| cb.run(cb.ctx);
 
@@ -1218,6 +1313,7 @@ pub const Session = struct {
                 self.our_bitfield.setPiece(pd.index);
                 self.downloaded += pp_ptr.piece_len;
                 self.have_pieces.store(self.our_bitfield.count(), .monotonic);
+                self.resume_data.markDirty();
 
                 self.printProgress() catch {};
 
@@ -1250,7 +1346,14 @@ pub const Session = struct {
         if (req.length == 0) return;
         if (req.begin >= plen or req.length > plen - req.begin) return;
 
-        const block = self.store.readRange(self.allocator, req.index, req.begin, req.length) catch return;
+        const block = self.store.readRange(self.allocator, req.index, req.begin, req.length) catch {
+            // We advertised this piece but can't read it back: the bytes are
+            // gone or the disk is failing. Stop claiming it (and stop
+            // persisting the claim) instead of silently failing every request
+            // for it forever.
+            if (!self.store.files_closed) self.dropVerifiedPiece(req.index);
+            return;
+        };
         defer self.allocator.free(block);
 
         p.enqueueMessage(.{ .piece = .{
@@ -1584,6 +1687,22 @@ pub const Session = struct {
         self.store.deinit();
         self.store = storage_mod.Storage.init(self.allocator, self.meta, self.output_dir, true) catch
             return error.StorageInitFailed;
+
+        // An earlier run of this same magnet may have left a resume record: the
+        // info hash was known from the start, so the record was always
+        // addressable — only now is there a geometry to match it against. It is
+        // checked exactly as strictly as at startup (same sizes, same mtimes,
+        // same spot check), so a re-added magnet resumes instead of
+        // re-downloading, and anything doubtful just leaves the fresh bitfield
+        // alone.
+        if (self.resume_data.load(self.allocator, &self.store, self.resumeKey(), self.meta.pieces)) |saved| {
+            self.snapshot_mutex.lock();
+            self.our_bitfield.deinit(self.allocator);
+            self.our_bitfield = saved;
+            self.have_pieces.store(self.our_bitfield.count(), .monotonic);
+            self.snapshot_mutex.unlock();
+            log.info("resume: {d}/{d} pieces from saved state", .{ self.our_bitfield.count(), self.num_pieces });
+        }
 
         // Metadata is in; clear the fetch-progress atomics BEFORE flipping to
         // download mode, so a snapshot that observes `metadata_only == false`
@@ -2092,6 +2211,19 @@ pub const Session = struct {
 
         // Run choking algorithm
         self.runChokingAlgorithm();
+
+        // Checkpoint the verified bitfield while pieces are arriving, so a
+        // crash costs at most `save_interval_secs` of re-hashing instead of the
+        // whole payload. No-op unless something moved since the last save.
+        if (!self.metadata_only) {
+            self.resume_data.maybeSave(
+                self.allocator,
+                &self.store,
+                self.resumeKey(),
+                self.our_bitfield,
+                now,
+            );
+        }
 
         if (!self.tor_hidden) {
             // Re-announce to trackers at the tracker-provided interval. After
@@ -2724,6 +2856,7 @@ pub const Session = struct {
         self.downloaded += data.len;
         self.block_bytes_in += data.len;
         self.have_pieces.store(self.our_bitfield.count(), .monotonic);
+        self.resume_data.markDirty();
         self.web_seed_fail_streak = 0;
         self.web_seed_retry_at = 0;
 

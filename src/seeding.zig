@@ -67,11 +67,25 @@ pub fn publish(
     const relay_urls = try nostr_config.readRelays(allocator);
     defer nostr_config.freeRelays(allocator, relay_urls);
 
+    // Publishing is one-shot and there is no retry behind it: the event is
+    // either accepted now or lost. So honor the shared per-relay backoff only
+    // while it still leaves someone to publish to — if every relay happens to
+    // be backing off, dial them all anyway rather than silently no-op. (One
+    // extra round of dials per publish, versus a seed nobody can discover.)
+    const gate = relay.oneShotGate(relay_urls);
+    if (gate == .force) log.info("nostr publish: every relay is backing off, publishing anyway", .{});
+
     var torrent_acks: usize = 0;
     var announce_acks: usize = 0;
     for (relay_urls) |url| {
-        var r = relay.Relay.connect(allocator, url, proxy) catch |err| {
-            log.warn("nostr publish: {s}: {}", .{ url, err });
+        var r = relay.dial(allocator, url, proxy, gate) catch |err| {
+            // A skip is expected bookkeeping, not a problem worth a warning;
+            // a real dial failure still is.
+            if (err == error.Skipped) {
+                log.debug("nostr publish: {s}: backing off, skipped", .{url});
+            } else {
+                log.warn("nostr publish: {s}: {}", .{ url, err });
+            }
             continue;
         };
         defer r.deinit();

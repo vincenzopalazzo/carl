@@ -391,7 +391,10 @@ fn pollOnce(mirror: *Mirror) void {
     var started: usize = 0;
     for (relay_urls) |url| {
         if (mirror.stopping()) return;
-        var r = relay_mod.Relay.connect(a, url, null) catch |err| {
+        // The poller runs on a timer, so it honors the shared per-relay
+        // backoff: a relay that is down stays skipped until its window
+        // expires instead of being re-dialed every sweep.
+        var r = relay_mod.dial(a, url, null, .honor) catch |err| {
             log.debug("relay {s}: {}", .{ url, err });
             continue;
         };
@@ -752,9 +755,12 @@ fn publishAnnounce(a: Allocator, info_hash: [20]u8, endpoint: AnnounceEndpoint) 
     const relay_urls = nostr_config.readRelays(a) catch return;
     defer nostr_config.freeRelays(a, relay_urls);
 
+    // One-shot publish: honor the backoff while some relay is dialable, else
+    // try them all -- an announce nobody hears makes the mirror undiscoverable.
+    const gate = relay_mod.oneShotGate(relay_urls);
     var acks: usize = 0;
     for (relay_urls) |url| {
-        var r = relay_mod.Relay.connect(a, url, null) catch continue;
+        var r = relay_mod.dial(a, url, null, gate) catch continue;
         defer r.deinit();
         if (relay_mod.publishAndWait(a, &r, ev, 5_000)) acks += 1;
     }
@@ -790,7 +796,8 @@ fn discoverPeers(a: Allocator, info_hash: [20]u8, session: *session_mod.Session)
     var added: usize = 0;
     for (relay_urls) |url| {
         if (!session.running or session_mod.shutdown_requested.load(.acquire)) return;
-        var r = relay_mod.Relay.connect(a, url, null) catch continue;
+        // Re-runs whenever the transfer has no peers, so honor the backoff.
+        var r = relay_mod.dial(a, url, null, .honor) catch continue;
         defer r.deinit();
         const events = relay_mod.subscribeAndCollect(a, &r, filter, .{
             .timeout_ms = 10_000,
