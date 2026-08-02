@@ -68,6 +68,9 @@ PYEOF
 
 python3 "$WORK/tracker.py" "$SEED_PORT" "$TRACKER_PORT" &
 TRACKER_PID=$!
+# Detach from job control so the shell doesn't print a "Terminated" notice for
+# it when the cleanup trap fires.
+disown "$TRACKER_PID" 2>/dev/null || true
 sleep 1
 
 # --- payload + torrent ------------------------------------------------------
