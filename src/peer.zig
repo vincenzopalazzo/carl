@@ -21,7 +21,7 @@ pub const PeerState = enum {
 /// only 40 KiB/s. The session resizes `pipeline_limit` once a second from
 /// the peer's measured download rate, targeting `pipeline_queue_secs` of
 /// data in flight, clamped to [`min_pipeline`, `max_pipeline`].
-pub const min_pipeline: u32 = 16;
+pub const min_pipeline: u32 = 32;
 pub const max_pipeline: u32 = 512;
 pub const pipeline_queue_secs: u32 = 4;
 
