@@ -697,11 +697,15 @@ pub const Drive = struct {
         defer arena_inst.deinit();
         const a = arena_inst.allocator();
 
+        // Snapshot the record table BEFORE bumping created_at: if the snapshot
+        // fails (OOM) we must not have advanced created_at in memory only,
+        // which on crash would let a later publish go non-monotonic vs the
+        // state file actually written.
+        const recs = self.snapshotRecords(a) orelse return;
         self.mutex.lock();
         const created_at = @max(std.time.timestamp(), self.last_created_at + 1);
         self.last_created_at = created_at;
         self.mutex.unlock();
-        const recs = self.snapshotRecords(a) orelse return;
 
         // State first: even if every relay is down, the bumped created_at is
         // persisted so the next publish is still strictly newer.

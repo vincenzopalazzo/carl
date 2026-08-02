@@ -1062,13 +1062,18 @@ fn cmdDrive(allocator: std.mem.Allocator, rest: []const [:0]u8) !void {
         defer also.deinit(allocator);
         {
             var i: usize = 0;
-            while (i + 1 < extra.len) : (i += 1) {
+            while (i < extra.len) : (i += 1) {
                 if (std.mem.eql(u8, extra[i], "--also")) {
+                    if (i + 1 >= extra.len) {
+                        log.err("--also requires a pubkey argument", .{});
+                        std.process.exit(1);
+                    }
                     const pk = carl.follow.parsePubkeyArg(extra[i + 1]) catch {
                         log.err("invalid --also pubkey '{s}'", .{extra[i + 1]});
                         std.process.exit(1);
                     };
                     try also.append(allocator, pk);
+                    i += 1; // consume the value
                 }
             }
         }

@@ -330,12 +330,16 @@ fn loadFrom(a: Allocator, path: [:0]const u8) Error!State {
         for (transfers) |t| a.free(t.source);
         a.free(transfers);
     }
+    const follows_slice = try follows.toOwnedSlice(a);
+    errdefer a.free(follows_slice);
+    const drives_slice = try drives.toOwnedSlice(a);
+    errdefer a.free(drives_slice);
     return .{
         .route = route,
         .download_dir = download_dir,
         .transfers = transfers,
-        .follows = try follows.toOwnedSlice(a),
-        .drives = try drives.toOwnedSlice(a),
+        .follows = follows_slice,
+        .drives = drives_slice,
     };
 }
 
