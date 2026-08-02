@@ -21,12 +21,13 @@ const log = std.log.scoped(.session);
 
 const max_peers: usize = 50;
 /// Cap on simultaneously in-progress pieces. With large pieces (e.g. 8 MiB /
-/// 512 blocks) and high peer churn, spreading blocks across dozens of pieces
-/// means none ever completes. Concentrating on a few pieces lets multiple peers
+/// 512 blocks) and high peer churn, spreading blocks across many pieces means
+/// none ever completes. Concentrating on a few pieces lets multiple peers
 /// contribute blocks to the SAME piece, completing it far sooner — after which
-/// it can be verified, written, and shared (uploaded). 8 balances concentration
-/// against parallelism (and ~8 × piece_len of piece-buffer memory).
-const max_concurrent_pieces: usize = 8;
+/// it can be verified, written, and shared (uploaded). 4 is aggressive enough
+/// to complete pieces quickly even in high-churn public swarms where each peer
+/// only contributes a handful of blocks before dropping.
+const max_concurrent_pieces: usize = 4;
 const unchoke_slots: usize = 4;
 const unchoke_interval_secs: i64 = 10;
 const optimistic_interval_secs: i64 = 30;
