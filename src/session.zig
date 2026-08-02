@@ -19,7 +19,42 @@ const i2p_sam = @import("i2p_sam.zig");
 
 const log = std.log.scoped(.session);
 
-const max_peers: usize = 50;
+/// Hard ceiling on simultaneous peer connections, and the size of the
+/// `[max_peers + 1]pollfd` / `[max_peers]*PeerConnection` stack arrays that
+/// walk the peer set (~1 KiB each — fine on any thread stack). Raised from 50
+/// once dialing became asynchronous: with blocking dials a bigger number was
+/// unreachable anyway, since filling the set would have frozen the loop for
+/// minutes. libtorrent's `connections_limit` defaults to 200; 100 keeps us well
+/// inside a conservative 256 open-file limit (peers + payload files + DHT).
+const max_peers: usize = 100;
+/// Peer ceiling for anonymized routes (proxy/Tor/I2P), where each dial still
+/// costs a blocking SOCKS/SAM handshake and every connection is a circuit.
+const max_peers_anonymized: usize = 50;
+/// New outbound dials started per `pumpConnects` (which runs at 1 Hz), i.e. a
+/// connection RATE, not a half-open limit — libtorrent's `connection_speed`
+/// default, 30 connections per second. Capping concurrent dials instead would
+/// mean a batch of unreachable peers blocked every other candidate for a full
+/// `connect_timeout_secs`; the total is already bounded by `max_peers`, which
+/// counts peers still in `.connecting`.
+const max_dials_per_pump: usize = 30;
+/// Proxied dials are still blocking, so only one may start per pump — ten
+/// seconds of Tor circuit setup is ten seconds the event loop is not serving
+/// peers. (The old code ran ten of them back to back per announce.)
+const max_dials_per_pump_proxied: usize = 1;
+/// Cap on the retained candidate-peer pool. libtorrent's `max_peerlist_size`
+/// is 3000; a few hundred is plenty to keep `max_peers` topped up between
+/// tracker announces (which are 15-30 minutes apart).
+const max_peer_pool: usize = 500;
+/// Minimum seconds between two dials of the same address, so a peer that
+/// refuses (or drops) us is not hammered every second.
+const min_reconnect_secs: i64 = 60;
+/// Consecutive failed dials after which a candidate address is dropped from
+/// the pool entirely.
+const max_dial_fails: u32 = 3;
+/// How often the dial telemetry line is emitted (debug level), when anything
+/// has been dialed since the last one.
+const dial_log_interval_secs: i64 = 30;
+
 const unchoke_slots: usize = 4;
 const unchoke_interval_secs: i64 = 10;
 const optimistic_interval_secs: i64 = 30;
@@ -319,6 +354,27 @@ const WebSeedWorker = struct {
     }
 };
 
+/// A discovered peer address we may dial, retained across announces.
+///
+/// The announce response used to be freed the moment its peers had been dialed
+/// once, so there was no candidate pool at all: between two tracker announces
+/// (15-30 minutes) the peer count could only go down, and a swarm that decayed
+/// to zero had to wait for the next announce to recover. Keeping the addresses
+/// lets `maintenance` top the set back up every second.
+const PoolEntry = struct {
+    addr: std.net.Address,
+    /// Earliest wall-clock second this address may be dialed again.
+    next_try: i64 = 0,
+    /// Consecutive failed dials; dropped from the pool past `max_dial_fails`.
+    fails: u32 = 0,
+};
+
+/// Byte-compare two addresses. Matches the comparison the peer set already
+/// used for de-duplication (sockaddr storage, so family + ip + port).
+fn addrEql(a: std.net.Address, b: std.net.Address) bool {
+    return std.mem.eql(u8, &std.mem.toBytes(a), &std.mem.toBytes(b));
+}
+
 pub const Session = struct {
     allocator: Allocator,
     meta: metainfo.Metainfo,
@@ -329,6 +385,24 @@ pub const Session = struct {
 
     peers: std.ArrayList(*peer_mod.PeerConnection),
     active_pieces: std.AutoHashMap(u32, *piece_mod.PieceProgress),
+
+    // --- Candidate peer pool (all defaulted; `init`'s literal need not set them) ---
+
+    /// Addresses learned from trackers / DHT / nostr that we are not currently
+    /// connected to. Deduplicated, capped at `max_peer_pool`, drained by
+    /// `pumpConnects`.
+    peer_pool: std.ArrayList(PoolEntry) = .empty,
+    /// Round-robin scan position into `peer_pool`, so a run of dead addresses
+    /// at the front cannot shadow the rest.
+    pool_cursor: usize = 0,
+    /// Second at which `pumpConnects` last ran; gates it to 1 Hz.
+    last_connect_pump_s: i64 = 0,
+    /// Dial telemetry since the last `dial_log_interval_secs` report. Without
+    /// these, 50 dials and 5 dials produced identical (empty) logs.
+    dial_attempts: u64 = 0,
+    dial_ok: u64 = 0,
+    dial_failed: u64 = 0,
+    last_dial_log_s: i64 = 0,
 
     // Piece availability counts (how many peers have each piece)
     piece_availability: []u32,
@@ -648,6 +722,7 @@ pub const Session = struct {
             self.allocator.destroy(p);
         }
         self.peers.deinit(self.allocator);
+        self.peer_pool.deinit(self.allocator);
 
         if (self.dht_instance) |*d| d.deinit();
         if (self.metadata_download) |*md| md.deinit();
@@ -909,8 +984,13 @@ pub const Session = struct {
             if (p.state == .disconnected or p.stream == null) continue;
             if (n >= fds.len) break;
 
-            var events: i16 = std.posix.POLL.IN;
-            if (p.wantsSend()) events |= std.posix.POLL.OUT;
+            // A `.connecting` socket only cares about writability: POLLOUT (or
+            // an error) is how the kernel reports the finished TCP handshake.
+            var events: i16 = if (p.state == .connecting)
+                std.posix.POLL.OUT
+            else
+                std.posix.POLL.IN;
+            if (p.state != .connecting and p.wantsSend()) events |= std.posix.POLL.OUT;
 
             fds[n] = .{ .fd = p.fd(), .events = events, .revents = 0 };
             n += 1;
@@ -934,6 +1014,14 @@ pub const Session = struct {
             if (fd_idx >= fds.len) break;
 
             const revents = fds[fd_idx].revents;
+
+            // Outbound dial in progress: any readiness at all (writable, or
+            // HUP/ERR for a refused connection) means the kernel is done.
+            if (p.state == .connecting) {
+                if (revents != 0) self.onConnectReady(p);
+                fd_idx += 1;
+                continue;
+            }
 
             if (revents & (std.posix.POLL.HUP | std.posix.POLL.ERR) != 0) {
                 p.disconnect();
@@ -1003,6 +1091,33 @@ pub const Session = struct {
 
             fd_idx += 1;
         }
+    }
+
+    /// Poll says a `.connecting` socket is ready: collect the connect result and,
+    /// on success, put the BitTorrent handshake ON THE WIRE immediately.
+    ///
+    /// Queueing the 68-byte handshake and leaving it for the next POLLOUT was
+    /// the second half of the dial bug: the remote saw an established TCP
+    /// connection carrying zero bytes and dropped us at its handshake timeout
+    /// (10 s in libtorrent). Writing it here makes "connected" and "greeted"
+    /// the same event.
+    fn onConnectReady(self: *Session, p: *peer_mod.PeerConnection) void {
+        p.completeConnect() catch {
+            self.dial_failed += 1;
+            self.notePoolDial(p.address, false);
+            p.disconnect();
+            return;
+        };
+        self.dial_ok += 1;
+        self.notePoolDial(p.address, true);
+
+        p.sendHandshake(self.info_hash, self.peer_id) catch {
+            p.disconnect();
+            return;
+        };
+        _ = p.flushSend() catch {
+            p.disconnect();
+        };
     }
 
     fn handleMessage(self: *Session, p: *peer_mod.PeerConnection, msg: wire.Message) !void {
@@ -1875,6 +1990,8 @@ pub const Session = struct {
             self.allocator.destroy(p);
             return;
         };
+        // Answer the incoming handshake immediately; see `onConnectReady`.
+        _ = p.flushSend() catch {};
 
         self.peers.append(self.allocator, p) catch {
             p.deinit();
@@ -1888,11 +2005,16 @@ pub const Session = struct {
         // Resample the live transfer rate (≤ once a second; `now` is seconds).
         self.sampleRate(now);
 
-        // Publish the live peer count for the daemon's cross-thread snapshot.
-        // Refreshed each tick here (and just below after pruning) so the daemon
-        // never reads `self.peers` directly. One tick of staleness is invisible
-        // to the 1 Hz snapshot.
-        self.peer_count.store(self.peers.items.len, .monotonic);
+        // Enforce the connect deadline here instead of blocking inside
+        // connect(): a peer that never completes its TCP handshake is dropped
+        // after `connect_timeout_secs` without the loop ever waiting on it.
+        for (self.peers.items) |p| {
+            if (p.connectTimedOut(now)) {
+                self.dial_failed += 1;
+                self.notePoolDial(p.address, false);
+                p.disconnect();
+            }
+        }
 
         // Remove disconnected peers and update availability
         var i: usize = 0;
@@ -1907,14 +2029,53 @@ pub const Session = struct {
                 self.allocator.destroy(p);
                 _ = self.peers.orderedRemove(i);
             } else {
-                if (now - p.last_send_time > 60) {
-                    p.enqueueMessage(.keep_alive) catch {};
-                }
-                if (now - p.last_recv_time > 120) {
-                    p.disconnect();
+                if (p.state != .connecting) {
+                    if (now - p.last_send_time > 60) {
+                        p.enqueueMessage(.keep_alive) catch {};
+                    }
+                    if (now - p.last_recv_time > 120) {
+                        p.disconnect();
+                    }
                 }
                 i += 1;
             }
+        }
+
+        // Publish the live peer count for the daemon's cross-thread snapshot.
+        // In-flight dials are excluded: they are not peers yet, and a whole
+        // pump's worth of them would inflate the displayed count. The daemon
+        // never reads `self.peers` directly.
+        {
+            var established: usize = 0;
+            for (self.peers.items) |p| {
+                if (p.state != .connecting) established += 1;
+            }
+            self.peer_count.store(established, .monotonic);
+        }
+
+        // Top the swarm up from the candidate pool, once a second. This used to
+        // happen only at the tracker interval (15-30 min) or when the peer count
+        // hit exactly zero, so between announces the count could only shrink.
+        if (now - self.last_connect_pump_s >= 1 and self.peers.items.len < self.peerLimit()) {
+            self.pumpConnects(now);
+        }
+
+        // Dial telemetry: without it a session that dialed 50 peers and one that
+        // dialed 5 produced identical (silent) logs.
+        if (self.last_dial_log_s == 0) self.last_dial_log_s = now; // start the clock
+        if (self.dial_attempts > 0 and now - self.last_dial_log_s >= dial_log_interval_secs) {
+            self.last_dial_log_s = now;
+            log.debug("dials: {d} attempted, {d} connected, {d} failed; peers {d} (+{d} connecting), pool {d}", .{
+                self.dial_attempts,
+                self.dial_ok,
+                self.dial_failed,
+                self.peers.items.len,
+                self.countConnecting(),
+                self.peer_pool.items.len,
+            });
+            self.dial_attempts = 0;
+            self.dial_ok = 0;
+            self.dial_failed = 0;
         }
 
         // Once a second: resize each peer's request pipeline from its
@@ -2140,83 +2301,183 @@ pub const Session = struct {
         return remaining;
     }
 
+    /// Absorb a discovery result (tracker, DHT, or nostr) into the candidate
+    /// pool and immediately start dialing, up to this pump's connection budget.
+    /// The addresses are RETAINED — the response they came from is freed by the
+    /// caller, but the pool keeps feeding `maintenance` until the next announce.
     fn connectToPeers(self: *Session, peer_list: []const tracker_mod.Peer) !void {
-        // Each proxied connection attempt takes ~10s through Tor (SOCKS
-        // handshake + circuit). Trying all 50 peers serially would block
-        // the session thread for minutes. Cap attempts per call; the
-        // tracker re-announce cycle gradually fills the peer pool.
-        const max_attempts: usize = if (self.proxy != null) 10 else 50;
-        var attempts: usize = 0;
-
-        // Rotate start offset so repeated announces don't always retry
-        // the same failing peers at the front of the list.
-        const offset = if (peer_list.len > 0)
-            std.crypto.random.intRangeAtMost(usize, 0, peer_list.len - 1)
-        else
-            0;
-
-        for (0..peer_list.len) |i| {
-            const tracker_peer = peer_list[(i + offset) % peer_list.len];
-            if (self.peers.items.len >= max_peers) break;
-            if (attempts >= max_attempts) break;
-
+        var added: usize = 0;
+        for (peer_list) |tracker_peer| {
             const addr = std.net.Address.initIp4(tracker_peer.ip, tracker_peer.port);
-            var already = false;
-            for (self.peers.items) |existing| {
-                if (std.mem.eql(u8, &std.mem.toBytes(existing.address), &std.mem.toBytes(addr))) {
-                    already = true;
-                    break;
-                }
-            }
-            if (already) continue;
+            if (self.addCandidate(addr)) added += 1;
+        }
+        log.debug("discovery: {d} peers offered, {d} new candidates, pool now {d}", .{
+            peer_list.len,
+            added,
+            self.peer_pool.items.len,
+        });
+        // Randomize where this announce's dialing starts, so a tracker that
+        // consistently lists dead peers first can't spend the whole per-pump
+        // budget on them. (The cursor still advances round-robin between pumps.)
+        if (self.peer_pool.items.len > 0) {
+            self.pool_cursor = std.crypto.random.uintLessThan(usize, self.peer_pool.items.len);
+        }
+        self.pumpConnects(std.time.timestamp());
+    }
 
-            attempts += 1;
+    /// Add an address to the candidate pool. Returns true if it was actually
+    /// added — an address already pooled, already connected, or currently being
+    /// dialed is dropped, as is anything past `max_peer_pool`.
+    fn addCandidate(self: *Session, addr: std.net.Address) bool {
+        if (self.peer_pool.items.len >= max_peer_pool) return false;
+        for (self.peer_pool.items) |e| {
+            if (addrEql(e.addr, addr)) return false;
+        }
+        if (self.isPeerLive(addr)) return false;
+        self.peer_pool.append(self.allocator, .{ .addr = addr }) catch return false;
+        return true;
+    }
 
-            const p = self.allocator.create(peer_mod.PeerConnection) catch continue;
-            p.* = peer_mod.PeerConnection.init(self.allocator, addr);
-            p.proxy = self.proxy;
+    /// Whether we already hold a connection (established or in flight) to this
+    /// address.
+    fn isPeerLive(self: *Session, addr: std.net.Address) bool {
+        for (self.peers.items) |p| {
+            if (p.state == .disconnected) continue;
+            if (addrEql(p.address, addr)) return true;
+        }
+        return false;
+    }
 
-            p.connect() catch {
-                p.deinit();
-                self.allocator.destroy(p);
-                continue;
-            };
-
-            p.sendHandshake(self.info_hash, self.peer_id) catch {
-                p.deinit();
-                self.allocator.destroy(p);
-                continue;
-            };
-
-            self.peers.append(self.allocator, p) catch {
-                p.deinit();
-                self.allocator.destroy(p);
-                continue;
-            };
+    /// Record a dial outcome against the pool entry for `addr`: success clears
+    /// the failure streak, failure counts toward `max_dial_fails` (after which
+    /// `pumpConnects` prunes the entry).
+    fn notePoolDial(self: *Session, addr: std.net.Address, ok: bool) void {
+        for (self.peer_pool.items) |*e| {
+            if (!addrEql(e.addr, addr)) continue;
+            if (ok) e.fails = 0 else e.fails +|= 1;
+            return;
         }
     }
 
+    fn countConnecting(self: *Session) usize {
+        var n: usize = 0;
+        for (self.peers.items) |p| {
+            if (p.state == .connecting) n += 1;
+        }
+        return n;
+    }
+
+    /// Peer ceiling for the active route. Anonymized routes still pay a
+    /// blocking handshake per dial, so they keep the old, smaller limit.
+    fn peerLimit(self: *const Session) usize {
+        return if (self.anonymized()) max_peers_anonymized else max_peers;
+    }
+
+    /// Start outbound dials from the candidate pool, up to `max_dials_per_pump`,
+    /// and prune addresses that have failed too often. Cheap enough to call
+    /// every event-loop iteration but gated to 1 Hz by `maintenance`; the
+    /// direct-route dials it starts never block.
+    fn pumpConnects(self: *Session, now: i64) void {
+        self.last_connect_pump_s = now;
+
+        // Drop candidates that keep refusing us, so the round-robin scan does
+        // not spend its budget re-dialing corpses.
+        var i: usize = 0;
+        while (i < self.peer_pool.items.len) {
+            if (self.peer_pool.items[i].fails > max_dial_fails) {
+                _ = self.peer_pool.swapRemove(i);
+            } else i += 1;
+        }
+        if (self.peer_pool.items.len == 0) return;
+
+        const budget = if (self.proxy != null) max_dials_per_pump_proxied else max_dials_per_pump;
+        var started: usize = 0;
+        var scanned: usize = 0;
+        while (scanned < self.peer_pool.items.len) : (scanned += 1) {
+            // `peers` includes peers still connecting, so this is what bounds
+            // the number of sockets (and file descriptors) in flight.
+            if (self.peers.items.len >= self.peerLimit()) break;
+            if (started >= budget) break;
+
+            const idx = self.pool_cursor % self.peer_pool.items.len;
+            self.pool_cursor = idx + 1;
+
+            const entry = &self.peer_pool.items[idx];
+            if (now < entry.next_try) continue;
+            const addr = entry.addr;
+            if (self.isPeerLive(addr)) continue;
+            // Stamp the cool-down before dialing, so a failure (async or
+            // immediate) cannot be retried until `min_reconnect_secs` has
+            // passed no matter which path reports it.
+            entry.next_try = now + min_reconnect_secs;
+
+            self.dial_attempts += 1;
+            started += 1;
+            if (!self.startDial(addr)) {
+                self.dial_failed += 1;
+                // `startDial` did not touch the pool; the entry index is still
+                // valid (nothing was added or removed above).
+                self.peer_pool.items[idx].fails +|= 1;
+            }
+        }
+    }
+
+    /// Create a peer for `addr` and begin connecting. Returns false if the dial
+    /// could not even be started (the peer is freed in that case; on success
+    /// ownership is in `self.peers`).
+    ///
+    /// The direct route returns with the peer in `.connecting` and the poll loop
+    /// owning the rest. Proxy dials still block here: SOCKS/CONNECT is a
+    /// request/response handshake of its own, and making it async would mean
+    /// reimplementing `proxy.zig` as a state machine for a route where each
+    /// connection costs ~10 s of circuit setup anyway. `max_inflight_connects_proxied`
+    /// keeps that to one blocking dial per pump.
+    fn startDial(self: *Session, addr: std.net.Address) bool {
+        const p = self.allocator.create(peer_mod.PeerConnection) catch return false;
+        p.* = peer_mod.PeerConnection.init(self.allocator, addr);
+        p.proxy = self.proxy;
+
+        var ok = false;
+        defer if (!ok) {
+            p.deinit();
+            self.allocator.destroy(p);
+        };
+
+        if (self.proxy != null) {
+            p.connect() catch return false;
+            p.sendHandshake(self.info_hash, self.peer_id) catch return false;
+            _ = p.flushSend() catch return false;
+            self.dial_ok += 1;
+            self.notePoolDial(addr, true);
+        } else {
+            // Handshake is sent by `onConnectReady` the moment the socket
+            // completes, not here — there is no connection to write to yet.
+            p.startConnect() catch return false;
+        }
+
+        self.peers.append(self.allocator, p) catch return false;
+        ok = true;
+        return true;
+    }
+
     /// Connect directly to a peer address, bypassing the tracker.
-    /// Useful for testing and for manual peer addition.
+    /// Useful for testing and for manual peer addition (nostr peer-announces).
     pub fn connectDirectPeer(self: *Session, addr: std.net.Address) !void {
-        if (self.peers.items.len >= max_peers) return;
+        if (self.peers.items.len >= self.peerLimit()) return;
         // On the I2P transport there is no clearnet route (and no proxy to tunnel
         // through), so a clearnet IPv4 peer is unreachable and dialing it would
         // leak the real IP — skip it. I2P peers arrive via connectI2pPeer.
         if (self.i2p != null) return;
 
-        const p = self.allocator.create(peer_mod.PeerConnection) catch return error.OutOfMemory;
-        errdefer self.allocator.destroy(p);
-        p.* = peer_mod.PeerConnection.init(self.allocator, addr);
-        errdefer p.deinit();
-        p.proxy = self.proxy;
-
-        try self.finishPeerConnect(p);
+        // Route it through the pool so the address survives a failed or dropped
+        // connection and is retried on the normal cool-down.
+        _ = self.addCandidate(addr);
+        self.pumpConnects(std.time.timestamp());
     }
 
     /// Connect to a Tor hidden service (or other hostname) via the session proxy.
     pub fn connectOnionPeer(self: *Session, host: []const u8, port: u16) !void {
-        if (self.peers.items.len >= max_peers) return;
+        if (self.peers.items.len >= self.peerLimit()) return;
         const px = self.proxy orelse return error.ConnectionFailed;
 
         const p = self.allocator.create(peer_mod.PeerConnection) catch return error.OutOfMemory;
@@ -2241,7 +2502,7 @@ pub const Session = struct {
     /// to SAM as `TO_PORT`; 0 = default). Requires the `i2p` route (a live SAM
     /// session).
     pub fn connectI2pPeer(self: *Session, dest: []const u8, port: u16) !void {
-        if (self.peers.items.len >= max_peers) return;
+        if (self.peers.items.len >= self.peerLimit()) return;
         const sam = self.i2p orelse return error.ConnectionFailed;
 
         const p = self.allocator.create(peer_mod.PeerConnection) catch return error.OutOfMemory;
@@ -2260,6 +2521,10 @@ pub const Session = struct {
     fn finishPeerConnect(self: *Session, p: *peer_mod.PeerConnection) !void {
         p.connect() catch return error.ConnectionFailed;
         p.sendHandshake(self.info_hash, self.peer_id) catch return error.OutOfMemory;
+        // Put the handshake on the wire now rather than waiting for the loop's
+        // next POLLOUT: remote clients drop a silent connection at their
+        // handshake timeout (10 s in libtorrent).
+        _ = p.flushSend() catch return error.ConnectionFailed;
         try self.peers.append(self.allocator, p);
     }
 
@@ -2681,6 +2946,85 @@ test "WebSeedWorker stopAndJoin frees an uncollected result" {
 
     w.stopAndJoin();
     try std.testing.expect(w.res_data == null);
+}
+
+test "candidate pool: dedupes, skips live peers, and honours the cap" {
+    const a = std.testing.allocator;
+
+    // Only the fields `addCandidate` touches, like the sampleRate test below.
+    var s: Session = undefined;
+    s.allocator = a;
+    s.peers = .empty;
+    s.peer_pool = .empty;
+    s.pool_cursor = 0;
+    defer s.peer_pool.deinit(a);
+
+    const addr = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 6881);
+    try std.testing.expect(s.addCandidate(addr));
+    // Same address again: the pool must not grow.
+    try std.testing.expect(!s.addCandidate(addr));
+    // Same IP, different port is a different peer.
+    try std.testing.expect(s.addCandidate(std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 6882)));
+    try std.testing.expectEqual(@as(usize, 2), s.peer_pool.items.len);
+
+    // An address we already hold a connection to (including an in-flight dial)
+    // is not a candidate.
+    var live = peer_mod.PeerConnection.init(a, std.net.Address.initIp4(.{ 10, 0, 0, 9 }, 6881));
+    defer live.deinit();
+    live.state = .connecting;
+    try s.peers.append(a, &live);
+    defer s.peers.deinit(a);
+    try std.testing.expect(!s.addCandidate(live.address));
+
+    // Cap: the pool never grows past `max_peer_pool`.
+    var port: u16 = 7000;
+    while (s.peer_pool.items.len < max_peer_pool) : (port += 1) {
+        _ = s.addCandidate(std.net.Address.initIp4(.{ 10, 0, 1, 1 }, port));
+    }
+    try std.testing.expectEqual(max_peer_pool, s.peer_pool.items.len);
+    try std.testing.expect(!s.addCandidate(std.net.Address.initIp4(.{ 10, 0, 2, 2 }, 6881)));
+}
+
+test "pumpConnects respects the reconnect cool-down and prunes dead candidates" {
+    const a = std.testing.allocator;
+
+    var s: Session = undefined;
+    s.allocator = a;
+    s.peers = .empty;
+    s.peer_pool = .empty;
+    s.pool_cursor = 0;
+    s.proxy = null;
+    s.i2p = null;
+    s.dial_attempts = 0;
+    s.dial_ok = 0;
+    s.dial_failed = 0;
+    s.info_hash = [_]u8{0} ** 20;
+    s.peer_id = [_]u8{0} ** 20;
+    defer s.peer_pool.deinit(a);
+    defer {
+        for (s.peers.items) |p| {
+            p.deinit();
+            a.destroy(p);
+        }
+        s.peers.deinit(a);
+    }
+
+    // One candidate that must not be dialed yet, and one that has failed too
+    // often and must be dropped.
+    try s.peer_pool.append(a, .{
+        .addr = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 6881),
+        .next_try = 5_000,
+    });
+    try s.peer_pool.append(a, .{
+        .addr = std.net.Address.initIp4(.{ 10, 0, 0, 2 }, 6881),
+        .fails = max_dial_fails + 1,
+    });
+
+    s.pumpConnects(1_000);
+
+    try std.testing.expectEqual(@as(usize, 1), s.peer_pool.items.len);
+    try std.testing.expectEqual(@as(u64, 0), s.dial_attempts);
+    try std.testing.expectEqual(@as(usize, 0), s.peers.items.len);
 }
 
 test "sampleRate counts block bytes as progress before a piece verifies" {

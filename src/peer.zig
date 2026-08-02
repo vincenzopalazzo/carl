@@ -95,6 +95,10 @@ pub const PeerConnection = struct {
     /// places (direct connect, SOCKS proxy, I2P SAM, and inbound accept), so
     /// rather than have every producer remember, the first read/write flips it.
     nonblocking: bool = false,
+    /// Wall-clock second at which `startConnect` issued the non-blocking
+    /// connect(). The session enforces `connect_timeout_secs` against this in
+    /// its maintenance tick instead of blocking inside connect().
+    connect_started_at: i64 = 0,
 
     // Stats for choking algorithm
     bytes_downloaded: u64,
@@ -199,7 +203,83 @@ pub const PeerConnection = struct {
         ) catch {};
     }
 
-    /// Initiate TCP connection with a timeout.
+    /// Start a plain-TCP connect WITHOUT waiting for it to complete: create a
+    /// non-blocking socket, issue connect(), and leave the peer in `.connecting`
+    /// for the session's poll loop to finish via `completeConnect`.
+    ///
+    /// The blocking `connect` below waits up to `connect_timeout_secs` inside
+    /// its own poll(); doing that for every tracker peer serialized the dials
+    /// (20 dead peers x 5 s = ~100 s with the event loop frozen) and, because
+    /// the run loop was not yet turning, meant peers dialed early sat with an
+    /// open socket and zero handshake bytes on it until the loop got around to
+    /// them — long past the 10 s handshake timeout real clients enforce.
+    /// Only for the direct route; proxy/SAM dials keep their blocking handshake.
+    pub fn startConnect(self: *PeerConnection) !void {
+        const sock = std.posix.socket(
+            std.posix.AF.INET,
+            std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
+            std.posix.IPPROTO.TCP,
+        ) catch {
+            self.state = .disconnected;
+            return error.ConnectionFailed;
+        };
+        // `stream` is only adopted on the success path below, so the socket is
+        // ours to close until then (and never double-closed by `deinit`).
+        var adopted = false;
+        defer if (!adopted) {
+            std.posix.close(sock);
+            self.state = .disconnected;
+        };
+
+        const flags = std.posix.fcntl(sock, std.posix.F.GETFL, 0) catch
+            return error.ConnectionFailed;
+        var o: std.posix.O = @bitCast(@as(u32, @truncate(flags)));
+        o.NONBLOCK = true;
+        _ = std.posix.fcntl(sock, std.posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
+
+        std.posix.connect(sock, &self.address.any, @sizeOf(std.posix.sockaddr.in)) catch |err| switch (err) {
+            // EINPROGRESS is the expected outcome: the handshake runs in the
+            // kernel and poll(POLLOUT) reports the result.
+            error.WouldBlock => {},
+            else => return error.ConnectionFailed,
+        };
+
+        adopted = true;
+        self.stream = .{ .handle = sock };
+        self.nonblocking = true;
+        setNoDelay(self.stream.?);
+        self.connect_started_at = std.time.timestamp();
+        // Even a connect() that completed inline (loopback) goes through
+        // `completeConnect`, so there is exactly one path to `.handshaking`.
+        self.state = .connecting;
+    }
+
+    /// Finish a `.connecting` socket after poll reported it writable (or in
+    /// error). SO_ERROR carries the asynchronous outcome — a refused or
+    /// unreachable peer also makes the socket "ready".
+    pub fn completeConnect(self: *PeerConnection) !void {
+        const s = self.stream orelse {
+            self.state = .disconnected;
+            return error.ConnectionFailed;
+        };
+        std.posix.getsockoptError(s.handle) catch {
+            self.state = .disconnected;
+            return error.ConnectionFailed;
+        };
+        self.state = .handshaking;
+    }
+
+    /// True when a `.connecting` peer has outlived `connect_timeout_secs`.
+    /// Checked from the session's maintenance tick, so the deadline costs
+    /// nothing while the loop keeps serving every other peer.
+    pub fn connectTimedOut(self: PeerConnection, now: i64) bool {
+        if (self.state != .connecting) return false;
+        return now - self.connect_started_at >= connect_timeout_secs;
+    }
+
+    /// Initiate a connection and BLOCK until it is established (or times out).
+    /// Still used by the proxy/SOCKS and I2P/SAM routes, whose own handshakes
+    /// are synchronous. The direct route uses `startConnect` instead.
     pub fn connect(self: *PeerConnection) !void {
         // Native I2P: open a SAM stream to the destination. Synchronous, so on
         // success the stream is ready for the BT handshake (like the proxy path).
@@ -609,6 +689,76 @@ test "peer enqueue and send buffer" {
     try peer.enqueueMessage(.choke);
     try std.testing.expect(peer.wantsSend());
     try std.testing.expectEqual(@as(usize, 5), peer.send_buf.items.len); // 4 + 1
+}
+
+test "startConnect leaves the peer in .connecting and finishes via poll" {
+    const allocator = std.testing.allocator;
+
+    // Ephemeral loopback listener: something must accept, or the connect
+    // completes with ECONNREFUSED instead.
+    const listen_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var server = try listen_addr.listen(.{ .reuse_address = true });
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+
+    var peer = PeerConnection.init(allocator, std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port));
+    defer peer.deinit();
+
+    try peer.startConnect();
+    // The whole point: the call returned without waiting for the handshake.
+    try std.testing.expect(peer.stream != null);
+    try std.testing.expect(peer.nonblocking);
+    try std.testing.expectEqual(PeerState.connecting, peer.state);
+
+    var pfd = [_]std.posix.pollfd{.{ .fd = peer.fd(), .events = std.posix.POLL.OUT, .revents = 0 }};
+    const ready = try std.posix.poll(&pfd, 2000);
+    try std.testing.expect(ready == 1);
+
+    try peer.completeConnect();
+    try std.testing.expectEqual(PeerState.handshaking, peer.state);
+
+    var accepted = try server.accept();
+    accepted.stream.close();
+}
+
+test "a refused async connect ends disconnected, never established" {
+    const allocator = std.testing.allocator;
+
+    // Bind then release a port so (almost certainly) nothing is listening on it.
+    const probe_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+    var probe = try probe_addr.listen(.{ .reuse_address = true });
+    const dead_port = probe.listen_address.getPort();
+    probe.deinit();
+
+    var peer = PeerConnection.init(allocator, std.net.Address.initIp4(.{ 127, 0, 0, 1 }, dead_port));
+    defer peer.deinit();
+
+    // Loopback may refuse inside connect() (macOS) or asynchronously via
+    // SO_ERROR; both must land on `.disconnected`, never `.handshaking`.
+    if (peer.startConnect()) {
+        var pfd = [_]std.posix.pollfd{.{ .fd = peer.fd(), .events = std.posix.POLL.OUT, .revents = 0 }};
+        _ = try std.posix.poll(&pfd, 2000);
+        try std.testing.expectError(error.ConnectionFailed, peer.completeConnect());
+    } else |err| {
+        try std.testing.expectEqual(error.ConnectionFailed, err);
+    }
+    try std.testing.expectEqual(PeerState.disconnected, peer.state);
+}
+
+test "connectTimedOut only fires for a stalled .connecting peer" {
+    const allocator = std.testing.allocator;
+    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6881);
+    var peer = PeerConnection.init(allocator, addr);
+    defer peer.deinit();
+
+    peer.state = .connecting;
+    peer.connect_started_at = 1000;
+    try std.testing.expect(!peer.connectTimedOut(1000 + PeerConnection.connect_timeout_secs - 1));
+    try std.testing.expect(peer.connectTimedOut(1000 + PeerConnection.connect_timeout_secs));
+
+    // An established peer is never reaped by the connect deadline.
+    peer.state = .active;
+    try std.testing.expect(!peer.connectTimedOut(1_000_000));
 }
 
 test "peer handshake serialization" {

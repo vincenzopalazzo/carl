@@ -14,6 +14,12 @@
 #   TIMEOUT     seconds to allow the transfer     (default 600)
 #   CARL        path to the carl binary           (default ./zig-out/bin/carl)
 #   KEEP        set to 1 to keep the work dir
+#   DEAD_PEERS  blackhole peers the tracker lists BEFORE the real seeder
+#               (default 0). This is the swarm case that matters: a tracker
+#               hands back mostly-unreachable addresses. With serial blocking
+#               dials, 40 dead peers x a 5s connect timeout meant the transfer
+#               could not finish at all; they must be dialed concurrently and
+#               timed out off the event loop.
 #
 # Exit status: 0 when the leecher's bytes match the seeder's, non-zero otherwise.
 set -euo pipefail
@@ -23,6 +29,7 @@ SIZE_MB=${SIZE_MB:-256}
 PIECE_LEN=${PIECE_LEN:-262144}
 TIMEOUT=${TIMEOUT:-600}
 KEEP=${KEEP:-0}
+DEAD_PEERS=${DEAD_PEERS:-0}
 
 TRACKER_PORT=${TRACKER_PORT:-16969}
 SEED_PORT=${SEED_PORT:-16881}
@@ -50,7 +57,14 @@ cat > "$WORK/tracker.py" <<PYEOF
 import http.server, socket, struct, sys
 SEED_PORT = int(sys.argv[1])
 PORT = int(sys.argv[2])
-peer = socket.inet_aton("127.0.0.1") + struct.pack(">H", SEED_PORT)
+DEAD = int(sys.argv[3])
+# TEST-NET-2 (RFC 5737) is reserved for documentation and is not routed, so
+# these connects hang until they time out -- the point of the exercise.
+peer = b"".join(
+    socket.inet_aton("198.51.100.%d" % (i % 254 + 1)) + struct.pack(">H", 6881)
+    for i in range(DEAD)
+)
+peer += socket.inet_aton("127.0.0.1") + struct.pack(">H", SEED_PORT)
 body = b"d8:intervali60e5:peers" + str(len(peer)).encode() + b":" + peer + b"e"
 
 class H(http.server.BaseHTTPRequestHandler):
@@ -66,7 +80,7 @@ class H(http.server.BaseHTTPRequestHandler):
 http.server.HTTPServer(("127.0.0.1", PORT), H).serve_forever()
 PYEOF
 
-python3 "$WORK/tracker.py" "$SEED_PORT" "$TRACKER_PORT" &
+python3 "$WORK/tracker.py" "$SEED_PORT" "$TRACKER_PORT" "$DEAD_PEERS" &
 TRACKER_PID=$!
 # Detach from job control so the shell doesn't print a "Terminated" notice for
 # it when the cleanup trap fires.
