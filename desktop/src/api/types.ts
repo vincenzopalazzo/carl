@@ -110,6 +110,39 @@ export interface Follow {
   torrents: FollowTorrent[];
 }
 
+export type DriveRole = "publisher" | "subscriber";
+export type DriveRoute = "direct" | "i2p";
+/** A drive file's sync phase. Maps onto the shared status-pill vocabulary
+ *  (seeding→green, downloading→violet, starting→amber, paused→neutral,
+ *  failed→red) via PHASE_META in Drive.tsx. */
+export type DrivePhase = "starting" | "downloading" | "seeding" | "paused" | "failed";
+
+/** One file inside a synced drive. `path` is flat in v1 (== filename) but the
+ *  directory view still splits it on "/" so nested indexes render correctly. */
+export interface DriveFile {
+  path: string;
+  size: number;
+  phase: DrivePhase;
+  info_hash: string;
+}
+
+/** A Nostr-synced folder (kind-30035 index). A publisher watches + seeds a
+ *  folder and posts a signed index; subscribers mirror it. The daemon pushes
+ *  drives in the 1s WS full-state under `drives` (same shape as
+ *  GET /api/drives). `trash` is optional (older daemons omit it). */
+export interface Drive {
+  id: string;
+  role: DriveRole;
+  name: string;
+  dir: string;
+  route: DriveRoute;
+  author: string | null;
+  also: string[];
+  files: DriveFile[];
+  file_count: number;
+  trash?: number;
+}
+
 export interface Identity {
   npub: string;
 }
@@ -167,6 +200,7 @@ export interface AppState {
   transfers: Transfer[];
   seeds: Seed[];
   follows: Follow[];
+  drives: Drive[];
   relays: Relay[];
   proxy: ProxyHealth;
   identity: Identity;
@@ -177,6 +211,7 @@ export const emptyState: AppState = {
   transfers: [],
   seeds: [],
   follows: [],
+  drives: [],
   relays: [],
   proxy: { state: "disabled", endpoint: "", detail: "" },
   identity: { npub: "" },
