@@ -93,6 +93,232 @@ pub const Mode = enum { download, seed };
 
 pub const ListenBind = enum { any, loopback };
 
+/// Seconds to park the web seed after `fail_streak` consecutive failed piece
+/// fetches: 5s doubling per failure, capped at 120s. A mirror that 404s (or a
+/// url-list entry that never pointed at the payload) would otherwise claim a
+/// piece, fail, and re-claim it on the very next loop iteration forever —
+/// burning a worker wake-up and a TCP handshake every tick for nothing.
+fn webSeedBackoffSecs(fail_streak: u32) i64 {
+    if (fail_streak == 0) return 0;
+    const shift: u6 = @intCast(@min(fail_streak - 1, 5));
+    return @min(web_seed_backoff_base_secs << shift, web_seed_backoff_cap_secs);
+}
+
+const web_seed_backoff_base_secs: i64 = 5;
+const web_seed_backoff_cap_secs: i64 = 120;
+
+/// Pick the next piece the web seed should fetch: scan forward from `cursor`,
+/// wrapping exactly once, and return the first index `ctx` still wants.
+///
+/// The old code restarted the scan at piece 0 on every loop iteration, so on a
+/// 3000-piece torrent it re-walked the whole low end of the file every tick and
+/// always handed the web seed the same early piece the peers were already
+/// working on. A rotating cursor keeps the common-case scan to a single step
+/// and spreads the web seed across the file instead of fighting the peers for
+/// the front of it.
+///
+/// `ctx` must expose `fn wants(ctx, idx: u32) bool` — true for a piece we still
+/// need and that nothing else has claimed.
+fn nextWebSeedPiece(num_pieces: u32, cursor: u32, ctx: anytype) ?u32 {
+    if (num_pieces == 0) return null;
+    const n: u64 = num_pieces;
+    const start: u64 = @as(u64, cursor) % n;
+    var i: u64 = 0;
+    while (i < n) : (i += 1) {
+        const idx: u32 = @intCast((start + i) % n);
+        if (ctx.wants(idx)) return idx;
+    }
+    return null;
+}
+
+/// BEP 19 web-seed fetcher: one worker thread that performs the ranged HTTP
+/// GETs so the session's poll loop never blocks on them.
+///
+/// This used to run inline on the event loop, with a brand-new
+/// `std.http.Client` per 256 KiB piece — a full TCP+TLS handshake per piece,
+/// and hundreds of milliseconds during which no peer socket was read. Real
+/// peers (qBittorrent/libtorrent) time out and drop that connection, so a
+/// swarm of 50 tracker peers decayed to one or two live sockets. Both halves
+/// of the fix live here: the client is kept alive across fetches (std's
+/// connection pool then reuses the socket per host) and the fetch happens on
+/// another thread.
+///
+/// Threading contract: the ONLY shared state is this struct, guarded by
+/// `mutex`. The worker never touches session state (bitfield, storage,
+/// `active_pieces`, peers) — it returns bytes and the session thread runs them
+/// through the same verify/write/broadcast path a peer-delivered piece takes.
+const WebSeedWorker = struct {
+    /// idle -> requested (session) -> fetching (worker) -> done (worker)
+    /// -> idle (session, once it has taken the result). Exactly one fetch is
+    /// in flight at a time; that is already enough to keep a mirror saturated
+    /// while leaving the event loop free.
+    const State = enum { idle, requested, fetching, done };
+
+    /// What the worker needs to perform one fetch. Deliberately self-contained
+    /// (no pointer back into the Session) so nothing the session thread mutates
+    /// can be read from the worker.
+    const Job = struct {
+        piece: u32,
+        /// Fully-built absolute URL. Session-allocated; borrowed for the fetch
+        /// and freed by the session when it collects the result.
+        url: []const u8,
+        start: u64,
+        len: u64,
+    };
+
+    const Result = struct {
+        piece: u32,
+        /// Piece bytes on success, null on any failure. Session owns and frees.
+        data: ?[]u8,
+        /// The job's URL, handed back so the session frees it exactly once.
+        url: []const u8,
+    };
+
+    allocator: Allocator,
+    mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
+    thread: ?std.Thread = null,
+    state: State = .idle,
+    stop: bool = false,
+
+    job: Job = .{ .piece = 0, .url = &.{}, .start = 0, .len = 0 },
+    res_data: ?[]u8 = null,
+
+    fn start(w: *WebSeedWorker) !void {
+        if (w.thread != null) return;
+        w.thread = try std.Thread.spawn(.{}, threadMain, .{w});
+    }
+
+    /// Session side, non-blocking: hand a job to the worker. Returns false when
+    /// a fetch is already in flight or a result is still uncollected, in which
+    /// case the caller keeps ownership of `url`.
+    fn submit(w: *WebSeedWorker, job: Job) bool {
+        w.mutex.lock();
+        defer w.mutex.unlock();
+        if (w.state != .idle or w.stop) return false;
+        w.job = job;
+        w.state = .requested;
+        w.cond.signal();
+        return true;
+    }
+
+    /// Worker side: block until a job is queued. Returns null when the worker
+    /// has been asked to stop, which is the thread's exit signal.
+    fn awaitJob(w: *WebSeedWorker) ?Job {
+        w.mutex.lock();
+        defer w.mutex.unlock();
+        while (!w.stop and w.state != .requested) w.cond.wait(&w.mutex);
+        if (w.stop) return null;
+        w.state = .fetching;
+        return w.job;
+    }
+
+    /// Worker side: publish the outcome. `data` (or null on failure) transfers
+    /// to the session, which frees it.
+    fn publish(w: *WebSeedWorker, data: ?[]u8) void {
+        w.mutex.lock();
+        defer w.mutex.unlock();
+        w.res_data = data;
+        w.state = .done;
+    }
+
+    /// Session side, non-blocking: take a finished fetch, or null if none is
+    /// ready. The caller owns both `data` and `url` afterwards.
+    fn takeResult(w: *WebSeedWorker) ?Result {
+        w.mutex.lock();
+        defer w.mutex.unlock();
+        if (w.state != .done) return null;
+        const r: Result = .{ .piece = w.job.piece, .data = w.res_data, .url = w.job.url };
+        w.res_data = null;
+        w.job = .{ .piece = 0, .url = &.{}, .start = 0, .len = 0 };
+        w.state = .idle;
+        return r;
+    }
+
+    /// Ask the thread to exit and join it. A fetch already in flight runs to
+    /// completion first (std's HTTP client has no cancellation hook), so this
+    /// can block for as long as one 256 KiB ranged GET takes.
+    fn stopAndJoin(w: *WebSeedWorker) void {
+        w.mutex.lock();
+        w.stop = true;
+        w.cond.signal();
+        w.mutex.unlock();
+
+        if (w.thread) |t| t.join();
+        w.thread = null;
+
+        // Whatever the last cycle left behind is ours to free: a published
+        // result the session never collected, and the URL of the job it came
+        // from (or of a job that was queued but never picked up).
+        if (w.res_data) |d| w.allocator.free(d);
+        w.res_data = null;
+        if (w.job.url.len > 0) w.allocator.free(w.job.url);
+        w.job = .{ .piece = 0, .url = &.{}, .start = 0, .len = 0 };
+    }
+
+    fn threadMain(w: *WebSeedWorker) void {
+        // One client for the whole worker lifetime: std's connection pool is
+        // keyed by host, so consecutive ranged GETs against the same mirror
+        // reuse the socket (and the TLS session) instead of re-handshaking.
+        // Created lazily so a session that never uses a web seed pays nothing.
+        var client: ?std.http.Client = null;
+        defer if (client) |*c| c.deinit();
+
+        while (w.awaitJob()) |job| {
+            if (client == null) client = .{ .allocator = w.allocator };
+
+            const data: ?[]u8 = fetchRange(&client.?, w.allocator, job) catch |err| blk: {
+                // A failed request can leave a pooled connection unusable — and
+                // often the failure IS the pool (a mirror that quietly closed a
+                // kept-alive socket). Drop the client so the next attempt starts
+                // from a clean handshake rather than retrying through a
+                // poisoned pool.
+                if (client) |*c| c.deinit();
+                client = null;
+                log.debug("web seed: piece {d} fetch failed: {t}", .{ job.piece, err });
+                break :blk null;
+            };
+
+            w.publish(data);
+        }
+    }
+
+    /// Perform one ranged GET into a freshly allocated, exactly `job.len`-sized
+    /// buffer. Runs on the worker thread only. Caller owns the result.
+    fn fetchRange(client: *std.http.Client, a: Allocator, job: Job) ![]u8 {
+        var range_buf: [64]u8 = undefined;
+        const range_str = try std.fmt.bufPrint(&range_buf, "bytes={d}-{d}", .{
+            job.start,
+            job.start + job.len - 1,
+        });
+
+        const buf = try a.alloc(u8, @intCast(job.len));
+        errdefer a.free(buf);
+
+        // A fixed writer is both the destination and the length check: a mirror
+        // that ignores Range and streams the whole file overruns it and fails
+        // the fetch instead of quietly allocating gigabytes.
+        var body_writer = std.Io.Writer.fixed(buf);
+
+        const extra_headers = [_]std.http.Header{
+            .{ .name = "Range", .value = range_str },
+        };
+
+        const result = try client.fetch(.{
+            .location = .{ .url = job.url },
+            .response_writer = &body_writer,
+            .extra_headers = &extra_headers,
+        });
+
+        // 206 Partial Content, or 200 OK for a server that ignored the Range
+        // header but happened to hand us exactly the bytes we asked for.
+        if (result.status != .partial_content and result.status != .ok) return error.WebSeedHttpStatus;
+        if (body_writer.end != job.len) return error.WebSeedShortBody;
+
+        return buf;
+    }
+};
+
 pub const Session = struct {
     allocator: Allocator,
     meta: metainfo.Metainfo,
@@ -250,6 +476,32 @@ pub const Session = struct {
     /// the torrent on Nostr (NIP-35) if not already present on relays.
     on_complete: ?OnComplete = null,
 
+    // --- BEP 19 web seed (all defaulted; `init`'s struct literal need not set them) ---
+
+    /// The fetch thread, created on the first usable web-seed tick and joined in
+    /// `deinit`. Heap-allocated because the worker thread holds a pointer to it
+    /// and `Session` is returned by value from `init` (its own address is not
+    /// stable until the caller has parked it).
+    web_seed: ?*WebSeedWorker = null,
+    /// Rotating scan cursor for `nextWebSeedPiece`, advanced past every piece
+    /// the web seed claims.
+    web_seed_cursor: u32 = 0,
+    /// The piece currently handed to the worker. Kept as its own field rather
+    /// than a placeholder entry in `active_pieces` because a placeholder would
+    /// mean allocating a full piece-sized `PieceProgress` buffer we never write
+    /// a block into; the peer picker skips this index explicitly instead. Always
+    /// cleared when the result comes back, so a failing mirror can never
+    /// permanently sideline a piece.
+    web_seed_piece: ?u32 = null,
+    /// Round-robin position in `meta.url_list`, advanced per attempt so one dead
+    /// entry in a multi-mirror list doesn't shadow the working ones.
+    web_seed_url_idx: usize = 0,
+    /// Consecutive failed web-seed fetches; drives `webSeedBackoffSecs`. Reset
+    /// by any verified piece.
+    web_seed_fail_streak: u32 = 0,
+    /// Wall-clock second before which no new web-seed fetch is dispatched.
+    web_seed_retry_at: i64 = 0,
+
     // Progress tracking
     start_time: i64,
     last_progress_time: i64,
@@ -378,6 +630,11 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: *Session) void {
+        // Join the web-seed thread before anything it could be racing goes
+        // away. It only ever touches its own handoff struct, but it borrows
+        // `allocator`, so it must be gone before the caller tears that down.
+        self.stopWebSeed();
+
         var it = self.active_pieces.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.*.deinit(self.allocator);
@@ -615,9 +872,11 @@ pub const Session = struct {
 
             self.processPollResults(fds[0..nfds]) catch {};
 
-            // Try web seed downloads if available
+            // Collect any finished web-seed fetch and dispatch the next one.
+            // Both halves are non-blocking: the actual HTTP transfer happens on
+            // the worker thread, so the loop keeps servicing peer sockets.
             if (self.mode == .download and !self.metadata_only) {
-                self.tryWebSeedDownload() catch {};
+                self.pumpWebSeed();
             }
 
             // Check endgame activation
@@ -757,6 +1016,7 @@ pub const Session = struct {
             },
             .interested => {
                 p.peer_interested = true;
+                self.unchokeIfSlotFree(p);
             },
             .not_interested => {
                 p.peer_interested = false;
@@ -1408,6 +1668,14 @@ pub const Session = struct {
                 if (pp.nextUnrequestedBlock() == null) continue;
             }
 
+            // The web seed has one piece in flight at a time and holds it
+            // outside `active_pieces`; don't have peers duplicate that fetch.
+            // The claim is always released when the fetch resolves, so this can
+            // never strand a piece.
+            if (self.web_seed_piece) |claimed| {
+                if (claimed == idx) continue;
+            }
+
             const avail = if (idx < self.piece_availability.len) self.piece_availability[idx] else 0;
             if (avail < best_avail) {
                 best_avail = avail;
@@ -1428,7 +1696,10 @@ pub const Session = struct {
             const idx: u32 = @intCast(i);
             if (!self.our_bitfield.hasPiece(idx)) {
                 missing += 1;
-                if (self.active_pieces.contains(idx)) active += 1;
+                // A web-seed-claimed piece is "being fetched" just like an
+                // active one; counting it keeps the endgame trigger honest.
+                const claimed = if (self.web_seed_piece) |c| c == idx else false;
+                if (claimed or self.active_pieces.contains(idx)) active += 1;
             }
         }
         if (missing > 0 and missing == active and missing <= 5) {
@@ -1454,6 +1725,33 @@ pub const Session = struct {
             self.last_optimistic_time = now;
             self.optimisticUnchoke();
         }
+    }
+
+    /// Unchoke a newly-interested peer right away when a reciprocation slot is
+    /// still free, instead of making it wait for the next `regularUnchoke`.
+    ///
+    /// The periodic choker runs every `unchoke_interval_secs`, so a peer that
+    /// declared interest just after a tick sat choked for up to 10s. On a
+    /// loopback transfer that showed up as 8.0s of dead air between the
+    /// handshake and the first block — paid once per transfer we start, and
+    /// inflicted on every leecher we serve while seeding. libtorrent (our
+    /// reference implementation) likewise triggers its choker on the interested
+    /// message rather than waiting for the timer.
+    ///
+    /// Fairness is unaffected: this only fills a slot nobody holds, and the
+    /// next periodic run still re-ranks everyone by rate.
+    fn unchokeIfSlotFree(self: *Session, p: *peer_mod.PeerConnection) void {
+        if (!p.am_choking) return;
+
+        var unchoked: usize = 0;
+        for (self.peers.items) |q| {
+            if (q.state != .active) continue;
+            if (!q.am_choking) unchoked += 1;
+        }
+        if (unchoked >= unchoke_slots) return;
+
+        p.am_choking = false;
+        p.enqueueMessage(.unchoke) catch {};
     }
 
     fn regularUnchoke(self: *Session) void {
@@ -2028,7 +2326,31 @@ pub const Session = struct {
 
     // --- BEP 19: Web seed downloads ---
 
-    fn tryWebSeedDownload(self: *Session) !void {
+    /// One non-blocking web-seed tick: collect a finished fetch, then dispatch
+    /// the next one. Called once per event-loop iteration.
+    fn pumpWebSeed(self: *Session) void {
+        self.collectWebSeedResult();
+        self.dispatchWebSeedFetch();
+    }
+
+    /// Predicate context for `nextWebSeedPiece`: a piece is wanted when we don't
+    /// have it, no peer is assembling it, and the web seed hasn't claimed it.
+    const WebSeedWant = struct {
+        s: *Session,
+        fn wants(ctx: WebSeedWant, idx: u32) bool {
+            if (ctx.s.our_bitfield.hasPiece(idx)) return false;
+            if (ctx.s.active_pieces.contains(idx)) return false;
+            if (ctx.s.web_seed_piece) |claimed| {
+                if (claimed == idx) return false;
+            }
+            return true;
+        }
+    };
+
+    /// Hand one piece to the fetch thread, if the web seed is usable and idle.
+    /// Everything here is O(1) plus the (cursor-bounded) piece scan; the HTTP
+    /// work happens on the worker.
+    fn dispatchWebSeedFetch(self: *Session) void {
         // Web seeds use std.http.Client directly (clearnet); disable on any
         // anonymized transport (a tunneled, Range-aware path is a follow-up).
         if (self.anonymized()) return;
@@ -2036,108 +2358,138 @@ pub const Session = struct {
         const urls = self.meta.url_list orelse return;
         if (urls.len == 0) return;
         if (self.num_pieces == 0) return;
+        // A fetch is already in flight, or its result hasn't been collected yet.
+        if (self.web_seed_piece != null) return;
 
-        // Find a piece we need
-        for (0..self.num_pieces) |i| {
-            const idx: u32 = @intCast(i);
-            if (self.our_bitfield.hasPiece(idx)) continue;
-            if (self.active_pieces.contains(idx)) continue;
+        const now = std.time.timestamp();
+        if (now < self.web_seed_retry_at) return;
 
-            // Try each web seed URL
-            for (urls) |base_url| {
-                if (self.downloadWebSeedPiece(base_url, idx) catch false) {
-                    return;
-                } else {
-                    continue; // Try next URL
-                }
-            }
-            return; // Don't try more pieces if all URLs failed
-        }
-    }
+        const idx = nextWebSeedPiece(self.num_pieces, self.web_seed_cursor, WebSeedWant{ .s = self }) orelse return;
+        const plen = piece_mod.pieceLength(idx, self.piece_len, self.total_length);
+        if (plen == 0) return;
 
-    fn downloadWebSeedPiece(self: *Session, base_url: []const u8, piece_idx: u32) !bool {
-        const plen = piece_mod.pieceLength(piece_idx, self.piece_len, self.total_length);
-        if (plen == 0) return false;
+        // Rotate mirrors per attempt: with one fetch in flight we can't race the
+        // URLs against each other like the old inline loop did, so instead each
+        // attempt uses the next entry. A dead mirror then costs one piece
+        // attempt, not the whole web seed.
+        const base_url = urls[self.web_seed_url_idx % urls.len];
+        self.web_seed_url_idx +%= 1;
 
-        const start = @as(u64, piece_idx) * self.piece_len;
-        const end = start + plen - 1;
+        const url = self.buildWebSeedUrl(base_url) catch return;
 
-        // Build URL -- for single-file torrents, url-list points directly to the file
-        // Append the filename if the URL ends with /
-        var url_buf: [4096]u8 = undefined;
-        var url_len: usize = 0;
-        if (base_url.len > url_buf.len) return false;
-        @memcpy(url_buf[0..base_url.len], base_url);
-        url_len = base_url.len;
-
-        if (base_url.len > 0 and base_url[base_url.len - 1] == '/') {
-            // Append filename
-            if (url_len + self.meta.name.len > url_buf.len) return false;
-            @memcpy(url_buf[url_len .. url_len + self.meta.name.len], self.meta.name);
-            url_len += self.meta.name.len;
-        }
-
-        const url = url_buf[0..url_len];
-
-        // Build Range header value
-        var range_buf: [64]u8 = undefined;
-        const range_str = std.fmt.bufPrint(&range_buf, "bytes={d}-{d}", .{ start, end }) catch return false;
-
-        // HTTP request with Range header
-        var client: std.http.Client = .{ .allocator = self.allocator };
-        defer client.deinit();
-
-        var response_body: std.ArrayList(u8) = .empty;
-        defer response_body.deinit(self.allocator);
-
-        var adapt_buf: [4096]u8 = undefined;
-        const deprecated_writer = response_body.writer(self.allocator);
-        var adapter = deprecated_writer.adaptToNewApi(&adapt_buf);
-
-        const extra_headers = [_]std.http.Header{
-            .{ .name = "Range", .value = range_str },
+        const w = self.webSeedWorker() orelse {
+            self.allocator.free(url);
+            return;
         };
 
-        const result = client.fetch(.{
-            .location = .{ .url = url },
-            .response_writer = &adapter.new_interface,
-            .extra_headers = &extra_headers,
-        }) catch return false;
-
-        // 206 Partial Content or 200 OK
-        if (result.status != .partial_content and result.status != .ok) return false;
-
-        // Flush remaining buffered data from the adapter
-        const buffered = adapter.new_interface.buffered();
-        if (buffered.len > 0) {
-            response_body.appendSlice(self.allocator, buffered) catch return false;
+        const submitted = w.submit(.{
+            .piece = idx,
+            .url = url,
+            .start = @as(u64, idx) * self.piece_len,
+            .len = plen,
+        });
+        if (!submitted) {
+            // Worker busy after all (only reachable if `web_seed_piece` and the
+            // worker state ever disagree); drop the URL rather than leak it.
+            self.allocator.free(url);
+            return;
         }
 
-        const data = response_body.items;
-        if (data.len != plen) return false;
+        self.web_seed_piece = idx;
+        // Start the next scan after this piece so the web seed walks the file
+        // instead of re-picking around the same neighbourhood.
+        self.web_seed_cursor = (idx +% 1) % self.num_pieces;
+    }
 
-        // Verify SHA-1
-        const hash = piece_mod.pieceHash(self.meta.pieces, piece_idx) orelse return false;
-        if (!piece_mod.verifyPiece(data, hash)) return false;
+    /// Build the absolute URL for a web-seed request. BEP 19: a url-list entry
+    /// ending in `/` is a directory the torrent name hangs off; anything else
+    /// points straight at the payload. Caller owns the result.
+    fn buildWebSeedUrl(self: *Session, base_url: []const u8) ![]u8 {
+        if (base_url.len == 0) return error.EmptyWebSeedUrl;
+        if (base_url[base_url.len - 1] != '/') return self.allocator.dupe(u8, base_url);
+        return std.fmt.allocPrint(self.allocator, "{s}{s}", .{ base_url, self.meta.name });
+    }
 
-        // Write to disk
-        self.store.writePiece(piece_idx, data) catch return false;
-        self.our_bitfield.setPiece(piece_idx);
-        self.downloaded += plen;
-        self.block_bytes_in += plen;
+    /// Lazily create and start the fetch thread. Returns null if the thread
+    /// can't be spawned, in which case the web seed simply stays unused (peers
+    /// still carry the download).
+    fn webSeedWorker(self: *Session) ?*WebSeedWorker {
+        if (self.web_seed) |w| return w;
+
+        const w = self.allocator.create(WebSeedWorker) catch return null;
+        w.* = .{ .allocator = self.allocator };
+        w.start() catch {
+            self.allocator.destroy(w);
+            log.warn("web seed: could not spawn fetch thread; web seeds disabled", .{});
+            // Park it for a while instead of retrying the spawn every tick.
+            self.web_seed_retry_at = std.time.timestamp() + web_seed_backoff_cap_secs;
+            return null;
+        };
+        self.web_seed = w;
+        return w;
+    }
+
+    /// Non-blocking. If the worker published a piece, run it through the same
+    /// verify -> write -> bitfield -> `have` broadcast path a peer-delivered
+    /// piece takes. All session state is mutated here, on the session thread.
+    fn collectWebSeedResult(self: *Session) void {
+        const w = self.web_seed orelse return;
+        const r = w.takeResult() orelse return;
+        defer self.allocator.free(r.url);
+
+        // The claim is released no matter the outcome, so a failing mirror can
+        // never keep a piece out of the peer picker.
+        self.web_seed_piece = null;
+
+        const data = r.data orelse return self.onWebSeedFailure(r.piece);
+        defer self.allocator.free(data);
+
+        // A peer may well have finished this piece while the fetch was in
+        // flight — the bytes are then redundant, not wrong.
+        if (self.our_bitfield.hasPiece(r.piece)) return;
+
+        const hash = piece_mod.pieceHash(self.meta.pieces, r.piece) orelse return self.onWebSeedFailure(r.piece);
+        if (!piece_mod.verifyPiece(data, hash)) {
+            log.warn("web seed: piece {d} failed hash check", .{r.piece});
+            return self.onWebSeedFailure(r.piece);
+        }
+
+        self.store.writePiece(r.piece, data) catch return self.onWebSeedFailure(r.piece);
+        self.our_bitfield.setPiece(r.piece);
+        self.downloaded += data.len;
+        self.block_bytes_in += data.len;
         self.have_pieces.store(self.our_bitfield.count(), .monotonic);
+        self.web_seed_fail_streak = 0;
+        self.web_seed_retry_at = 0;
 
         self.printProgress() catch {};
 
-        // Broadcast have to all peers
         for (self.peers.items) |p| {
             if (p.state == .active) {
-                p.enqueueMessage(.{ .have = piece_idx }) catch {};
+                p.enqueueMessage(.{ .have = r.piece }) catch {};
+                cancelPieceRequests(p, r.piece);
             }
         }
 
-        log.info("web seed: piece {d}/{d} from {s}", .{ piece_idx + 1, self.num_pieces, url });
-        return true;
+        log.info("web seed: piece {d}/{d}", .{ r.piece + 1, self.num_pieces });
+    }
+
+    fn onWebSeedFailure(self: *Session, piece_idx: u32) void {
+        self.web_seed_fail_streak +|= 1;
+        self.web_seed_retry_at = std.time.timestamp() + webSeedBackoffSecs(self.web_seed_fail_streak);
+        // Re-pick this piece first once the backoff expires: the failure may
+        // have been the mirror, not the range.
+        self.web_seed_cursor = piece_idx;
+    }
+
+    /// Stop and join the fetch thread. Idempotent, and safe to call on a session
+    /// that never used a web seed.
+    fn stopWebSeed(self: *Session) void {
+        const w = self.web_seed orelse return;
+        w.stopAndJoin();
+        self.allocator.destroy(w);
+        self.web_seed = null;
+        self.web_seed_piece = null;
     }
 
     fn printProgress(self: *Session) !void {
@@ -2211,6 +2563,124 @@ test "rediscoveryBackoffSecs: 45s doubling, capped at 600s" {
     try std.testing.expectEqual(@as(i64, 360), rediscoveryBackoffSecs(3));
     try std.testing.expectEqual(@as(i64, 600), rediscoveryBackoffSecs(4));
     try std.testing.expectEqual(@as(i64, 600), rediscoveryBackoffSecs(1000));
+}
+
+test "webSeedBackoffSecs: 5s doubling, capped at 120s" {
+    try std.testing.expectEqual(@as(i64, 0), webSeedBackoffSecs(0));
+    try std.testing.expectEqual(@as(i64, 5), webSeedBackoffSecs(1));
+    try std.testing.expectEqual(@as(i64, 10), webSeedBackoffSecs(2));
+    try std.testing.expectEqual(@as(i64, 40), webSeedBackoffSecs(4));
+    try std.testing.expectEqual(@as(i64, 120), webSeedBackoffSecs(6));
+    try std.testing.expectEqual(@as(i64, 120), webSeedBackoffSecs(1000));
+}
+
+test "nextWebSeedPiece: scans forward from the cursor and wraps once" {
+    const Want = struct {
+        needed: []const u32,
+        fn wants(ctx: @This(), idx: u32) bool {
+            for (ctx.needed) |n| {
+                if (n == idx) return true;
+            }
+            return false;
+        }
+    };
+
+    // The whole point of the cursor: don't hand back piece 0 every tick.
+    const all = [_]u32{ 0, 1, 2, 3, 4, 5, 6, 7 };
+    try std.testing.expectEqual(@as(?u32, 0), nextWebSeedPiece(8, 0, Want{ .needed = &all }));
+    try std.testing.expectEqual(@as(?u32, 5), nextWebSeedPiece(8, 5, Want{ .needed = &all }));
+
+    // Wraps past the end exactly once to find a piece behind the cursor.
+    const only_low = [_]u32{ 1, 2 };
+    try std.testing.expectEqual(@as(?u32, 1), nextWebSeedPiece(8, 6, Want{ .needed = &only_low }));
+
+    // A cursor past the end is normalized, not an out-of-bounds scan.
+    try std.testing.expectEqual(@as(?u32, 1), nextWebSeedPiece(8, 99, Want{ .needed = &only_low }));
+
+    // Nothing wanted, and the degenerate zero-piece case.
+    const none = [_]u32{};
+    try std.testing.expectEqual(@as(?u32, null), nextWebSeedPiece(8, 3, Want{ .needed = &none }));
+    try std.testing.expectEqual(@as(?u32, null), nextWebSeedPiece(0, 0, Want{ .needed = &all }));
+}
+
+test "WebSeedWorker handoff: idle -> requested -> fetching -> done -> idle" {
+    const a = std.testing.allocator;
+    // No thread started: the test drives both sides of the handoff itself, so
+    // the transitions are checked without depending on scheduling.
+    var w: WebSeedWorker = .{ .allocator = a };
+
+    // Nothing to collect while idle.
+    try std.testing.expect(w.takeResult() == null);
+
+    const url = try a.dupe(u8, "http://example.invalid/f.bin");
+    try std.testing.expect(w.submit(.{ .piece = 7, .url = url, .start = 0, .len = 4 }));
+
+    // A second submit must be refused while a fetch is outstanding — that's
+    // what keeps exactly one fetch in flight and the URL ownership unambiguous.
+    const url2 = try a.dupe(u8, "http://example.invalid/other.bin");
+    defer a.free(url2);
+    try std.testing.expect(!w.submit(.{ .piece = 8, .url = url2, .start = 0, .len = 4 }));
+
+    const job = w.awaitJob().?;
+    try std.testing.expectEqual(@as(u32, 7), job.piece);
+    try std.testing.expectEqual(@as(u64, 4), job.len);
+
+    // Still nothing to collect mid-fetch.
+    try std.testing.expect(w.takeResult() == null);
+
+    const data = try a.dupe(u8, "abcd");
+    w.publish(data);
+
+    const r = w.takeResult().?;
+    try std.testing.expectEqual(@as(u32, 7), r.piece);
+    try std.testing.expectEqualStrings("abcd", r.data.?);
+    a.free(r.data.?);
+    a.free(r.url);
+
+    // Back to idle: the next piece can be dispatched, and the collected result
+    // is gone (a second take must not hand out the same buffer twice).
+    try std.testing.expect(w.takeResult() == null);
+    try std.testing.expectEqual(WebSeedWorker.State.idle, w.state);
+}
+
+test "WebSeedWorker failure publishes null and stays collectable" {
+    const a = std.testing.allocator;
+    var w: WebSeedWorker = .{ .allocator = a };
+
+    const url = try a.dupe(u8, "http://example.invalid/f.bin");
+    try std.testing.expect(w.submit(.{ .piece = 3, .url = url, .start = 0, .len = 16 }));
+    _ = w.awaitJob().?;
+    w.publish(null);
+
+    const r = w.takeResult().?;
+    try std.testing.expectEqual(@as(u32, 3), r.piece);
+    try std.testing.expect(r.data == null);
+    a.free(r.url);
+}
+
+test "WebSeedWorker stops and joins its thread without hanging" {
+    const a = std.testing.allocator;
+    var w: WebSeedWorker = .{ .allocator = a };
+    try w.start();
+    // Never submits a job: the thread must be parked on the condvar and exit on
+    // the stop signal alone.
+    w.stopAndJoin();
+    try std.testing.expect(w.thread == null);
+}
+
+test "WebSeedWorker stopAndJoin frees an uncollected result" {
+    // Shutdown can land between the worker publishing and the session
+    // collecting; the leftover buffer (and the job URL) must not leak.
+    const a = std.testing.allocator;
+    var w: WebSeedWorker = .{ .allocator = a };
+
+    const url = try a.dupe(u8, "http://example.invalid/f.bin");
+    try std.testing.expect(w.submit(.{ .piece = 1, .url = url, .start = 0, .len = 2 }));
+    _ = w.awaitJob().?;
+    w.publish(try a.dupe(u8, "hi"));
+
+    w.stopAndJoin();
+    try std.testing.expect(w.res_data == null);
 }
 
 test "sampleRate counts block bytes as progress before a piece verifies" {

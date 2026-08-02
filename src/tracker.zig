@@ -202,33 +202,28 @@ pub fn announce(
     defer allocator.free(url);
 
     if (proxy) |px| return announceThroughProxy(allocator, px, url);
+    return announceDirect(allocator, url);
+}
 
-    var client: std.http.Client = .{ .allocator = allocator };
-    defer client.deinit();
-
-    var response_body: std.ArrayList(u8) = .empty;
-    defer response_body.deinit(allocator);
-
-    var adapt_buf: [4096]u8 = undefined;
-    const deprecated_writer = response_body.writer(allocator);
-    var adapter = deprecated_writer.adaptToNewApi(&adapt_buf);
-
-    const result = client.fetch(.{
-        .location = .{ .url = url },
-        .response_writer = &adapter.new_interface,
-    }) catch return error.HttpError;
-
-    if (result.status != .ok) return error.HttpError;
-
-    // Flush the adapter's buffered tail: a response smaller than the adapter
-    // buffer (announce responses almost always are) would otherwise never
-    // reach `response_body` and parse as empty.
-    const buffered = adapter.new_interface.buffered();
-    if (buffered.len > 0) {
-        response_body.appendSlice(allocator, buffered) catch return error.OutOfMemory;
-    }
-
-    return parseAnnounceResponse(allocator, response_body.items);
+/// Announce straight to the tracker (no proxy), via `proxy.httpGetDirect`.
+///
+/// We deliberately do not use `std.http.Client` here: it has no timeout knobs
+/// (0.15), so a black-holed or very slow tracker blocked this call -- which runs
+/// on the session's event-loop thread -- for the OS TCP default, stalling every
+/// peer connection with it. `httpGetDirect` bounds the connect and the socket
+/// I/O by the same `http_get_timeout_secs` the proxied path already used, and a
+/// timeout surfaces as a plain `HttpError` so the announce backoff handles it.
+/// `https://` is not downgraded: it runs TLS with certificate verification over
+/// the same bounded stream. Like the proxied path, a 3xx is a failure rather
+/// than a followed redirect -- announce endpoints are expected to answer
+/// directly, and BEP 12 already gives us other tiers to fall back on.
+fn announceDirect(allocator: Allocator, url: []const u8) TrackerError!AnnounceResponse {
+    const body = proxy_mod.httpGetDirect(allocator, url, null) catch |err| {
+        log.debug("tracker announce failed: {}", .{err});
+        return error.HttpError;
+    };
+    defer allocator.free(body);
+    return parseAnnounceResponse(allocator, body);
 }
 
 /// Announce by tunneling the GET through the proxy. `http://` goes in plaintext,
@@ -477,6 +472,110 @@ test "percent encode" {
     // Binary data gets encoded
     try percentEncode(allocator, &buf, &[_]u8{ 0x00, 0xFF, 0x20 });
     try std.testing.expectEqualStrings("%00%FF%20", buf.items);
+}
+
+// --- Direct (unproxied) announce against a mock tracker ---
+
+const MockTracker = struct {
+    server: *std.net.Server,
+    stop: std.atomic.Value(bool),
+    body: []const u8,
+};
+
+fn mockTrackerRun(ctx: *MockTracker) void {
+    // Poll-with-timeout accept so the thread can observe `stop` and exit.
+    var pfd = [_]std.posix.pollfd{.{ .fd = ctx.server.stream.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    while (!ctx.stop.load(.acquire)) {
+        const ready = std.posix.poll(&pfd, 200) catch 0;
+        if (ready == 0) continue;
+        const conn = ctx.server.accept() catch continue;
+        defer conn.stream.close();
+        var buf: [4096]u8 = undefined;
+        var len: usize = 0;
+        while (len < buf.len) {
+            const n = conn.stream.read(buf[len..]) catch break;
+            if (n == 0) break;
+            len += n;
+            if (std.mem.indexOf(u8, buf[0..len], "\r\n\r\n") != null) break;
+        }
+        var head_buf: [64]u8 = undefined;
+        const head = std.fmt.bufPrint(
+            &head_buf,
+            "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n",
+            .{ctx.body.len},
+        ) catch return;
+        _ = conn.stream.write(head) catch return;
+        var sent: usize = 0;
+        while (sent < ctx.body.len) {
+            const n = conn.stream.write(ctx.body[sent..]) catch break;
+            if (n == 0) break;
+            sent += n;
+        }
+    }
+}
+
+test "direct announce parses a live response" {
+    const allocator = std.testing.allocator;
+    var server = try std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0).listen(.{ .reuse_address = true });
+    const port = server.listen_address.getPort();
+
+    const ctx = try allocator.create(MockTracker);
+    ctx.* = .{
+        .server = &server,
+        .stop = std.atomic.Value(bool).init(false),
+        // interval 900, one compact peer 10.0.0.1:80
+        .body = "d8:intervali900e5:peers6:\n\x00\x00\x01\x00P" ++ "e",
+    };
+    const thread = try std.Thread.spawn(.{}, mockTrackerRun, .{ctx});
+    defer {
+        server.deinit();
+        allocator.destroy(ctx);
+    }
+
+    var url_buf: [64]u8 = undefined;
+    const announce_url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/announce", .{port});
+    const resp = announce(allocator, announce_url, .{
+        .info_hash = [_]u8{0x12} ** 20,
+        .peer_id = [_]u8{0xAB} ** 20,
+        .port = 6881,
+        .uploaded = 0,
+        .downloaded = 0,
+        .left = 1024,
+        .compact = true,
+        .event = .started,
+    }, null);
+
+    ctx.stop.store(true, .release);
+    thread.join();
+
+    const r = try resp;
+    defer r.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 900), r.interval);
+    try std.testing.expectEqual(@as(usize, 1), r.peers.len);
+    try std.testing.expectEqual([4]u8{ 10, 0, 0, 1 }, r.peers[0].ip);
+    try std.testing.expectEqual(@as(u16, 80), r.peers[0].port);
+}
+
+test "direct announce on a dead tracker fails fast with HttpError" {
+    const allocator = std.testing.allocator;
+    // Bind to grab a free port, then close it so the connect is refused --
+    // a tracker failure must surface as an error, never a hang.
+    var server = try std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0).listen(.{ .reuse_address = true });
+    const port = server.listen_address.getPort();
+    server.deinit();
+
+    var url_buf: [64]u8 = undefined;
+    const announce_url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/announce", .{port});
+    try std.testing.expectError(error.HttpError, announce(allocator, announce_url, .{
+        .info_hash = [_]u8{0} ** 20,
+        .peer_id = [_]u8{0} ** 20,
+        .port = 6881,
+        .uploaded = 0,
+        .downloaded = 0,
+        .left = 0,
+        .compact = true,
+        .event = .none,
+    }, null));
 }
 
 test "parse IPv4" {

@@ -17,6 +17,12 @@
 /// SO_RCVTIMEO), matching the blocking-connect model in peer.zig: by the time
 /// `connectThroughProxyAddr` returns, the stream is a transparent tunnel to the
 /// target and is ready for the BitTorrent handshake.
+///
+/// This module also owns the small blocking HTTP/1.1 client used for tracker
+/// announces (`httpGet` proxied, `httpGetDirect` not). Both share one request
+/// builder, TLS layer and response parser -- they differ only in how the stream
+/// is obtained -- so the direct path cannot drift out of sync with the proxied
+/// one, and in particular is bounded by the same timeouts.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const tls = std.crypto.tls;
@@ -84,7 +90,12 @@ pub const Header = struct {
 
 /// Connect + handshake timeout for proxy operations, in seconds.
 const proxy_timeout_secs: u32 = 10;
-/// Longer timeout for tracker GETs, which traverse the proxy to a remote host.
+/// Longer timeout for tracker GETs, which reach a remote host (through the
+/// proxy, or directly). It bounds the connect *and* every read/write, because a
+/// black-holed tracker -- common now that tracker-less magnets fall back to a
+/// tier of public trackers -- would otherwise park the caller for the OS TCP
+/// default (~75 s on the connect alone, minutes in total). Announces run on the
+/// session's event-loop thread, so that stalls every peer connection with them.
 const http_get_timeout_secs: u32 = 20;
 /// Cap on a single proxied HTTP response body (trackers are small).
 const max_response_bytes: usize = 4 * 1024 * 1024;
@@ -231,6 +242,30 @@ pub fn httpGet(allocator: Allocator, proxy: Proxy, url: []const u8, extra_header
     var stream = try connectThroughProxyHost(allocator, proxy, u.host, u.port);
     defer stream.close();
 
+    return httpExchange(allocator, stream, u, extra_headers);
+}
+
+/// Perform an HTTP(S) GET straight to the origin (no proxy) and return the
+/// response body (owned by the caller). Same request/TLS/parse path as
+/// `httpGet` -- only the stream differs -- so `https://` is never silently
+/// downgraded and both routes get the same `http_get_timeout_secs` bound.
+///
+/// We do not use `std.http.Client` here: in 0.15 it exposes no timeout knobs,
+/// so a dead tracker hangs the caller for the OS TCP default instead of failing
+/// fast enough for the announce backoff to take over. (DNS resolution is still
+/// the resolver's own affair; only the connect and the socket I/O are bounded.)
+pub fn httpGetDirect(allocator: Allocator, url: []const u8, extra_headers: ?[]const Header) ProxyError![]u8 {
+    const u = parseHttpUrl(url) orelse return error.InvalidUrl;
+
+    var stream = try dialDirect(allocator, u.host, u.port, http_get_timeout_secs);
+    defer stream.close();
+
+    return httpExchange(allocator, stream, u, extra_headers);
+}
+
+/// Send the GET for `u` over an already-connected `stream` and return the parsed
+/// body. Shared by the proxied and direct entry points.
+fn httpExchange(allocator: Allocator, stream: std.net.Stream, u: HttpUrl, extra_headers: ?[]const Header) ProxyError![]u8 {
     // Build the request by appending directly (tracker paths can be long --
     // info_hash, peer_id, and private-tracker passkeys -- so avoid fixed buffers).
     var req: std.ArrayList(u8) = .empty;
@@ -352,21 +387,60 @@ fn contentLength(head: []const u8) ?usize {
 
 fn dialProxy(allocator: Allocator, proxy: Proxy, timeout_secs: u32) ProxyError!std.net.Stream {
     const proxy_addr = try resolveIp4(allocator, proxy.host, proxy.port);
+    return connectWithTimeout(proxy_addr, timeout_secs);
+}
 
+/// Open a direct TCP connection to `host:port`, bounded by `timeout_secs`.
+/// Used by `httpGetDirect` when no proxy is configured.
+fn dialDirect(allocator: Allocator, host: []const u8, port: u16, timeout_secs: u32) ProxyError!std.net.Stream {
+    const addr = try resolveHost(allocator, host, port);
+    return connectWithTimeout(addr, timeout_secs);
+}
+
+/// Connect to `addr` with a hard upper bound on the connect *and* on every
+/// subsequent blocking read/write.
+///
+/// SO_SNDTIMEO does not bound connect() (notably on macOS), so we do a
+/// non-blocking connect + poll(POLLOUT) -- the same pattern peer.zig uses for
+/// peer dials -- then restore blocking mode and set SO_SNDTIMEO/SO_RCVTIMEO so
+/// a host that accepts and then goes silent cannot hang us either.
+fn connectWithTimeout(addr: std.net.Address, timeout_secs: u32) ProxyError!std.net.Stream {
     const sock = std.posix.socket(
-        std.posix.AF.INET,
+        addr.any.family,
         std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
         std.posix.IPPROTO.TCP,
     ) catch return error.SocketFailed;
     errdefer std.posix.close(sock);
 
-    // Bound both directions so a malicious/broken proxy cannot hang us forever.
+    const flags = std.posix.fcntl(sock, std.posix.F.GETFL, 0) catch return error.SocketFailed;
+    var o: std.posix.O = @bitCast(@as(u32, @truncate(flags)));
+    o.NONBLOCK = true;
+    _ = std.posix.fcntl(sock, std.posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
+
+    // poll() takes an i32 millisecond timeout; clamp so a pathological
+    // `timeout_secs` can't overflow the cast (callers pass small values).
+    const timeout_ms: i32 = if (timeout_secs > 600) 600_000 else @intCast(timeout_secs * 1000);
+
+    std.posix.connect(sock, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
+        // EINPROGRESS: wait for the socket to become writable (success) or to
+        // error out, bounded by our timeout.
+        error.WouldBlock => {
+            var pfd = [_]std.posix.pollfd{.{ .fd = sock, .events = std.posix.POLL.OUT, .revents = 0 }};
+            const ready = std.posix.poll(&pfd, timeout_ms) catch return error.ConnectFailed;
+            if (ready == 0) return error.ConnectFailed; // timed out
+            // Surface the asynchronous connect result (refused, unreachable, …)
+            // instead of treating a writable socket as connected.
+            std.posix.getsockoptError(sock) catch return error.ConnectFailed;
+        },
+        else => return error.ConnectFailed,
+    };
+
+    // Back to blocking, with both directions bounded.
+    o.NONBLOCK = false;
+    _ = std.posix.fcntl(sock, std.posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
     const tv = std.posix.timeval{ .sec = @intCast(timeout_secs), .usec = 0 };
     std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
     std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
-
-    std.posix.connect(sock, &proxy_addr.any, proxy_addr.getOsSockLen()) catch
-        return error.ConnectFailed;
 
     return std.net.Stream{ .handle = sock };
 }
@@ -377,6 +451,20 @@ fn resolveIp4(allocator: Allocator, host: []const u8, port: u16) ProxyError!std.
     for (list.addrs) |a| {
         if (a.any.family == std.posix.AF.INET) return a;
     }
+    return error.DnsResolveFailed;
+}
+
+/// Resolve `host` for a direct connection: prefer IPv4 (what the swarm and
+/// nearly every tracker speak), but fall back to whatever the resolver returned
+/// so an IPv6-only tracker still works -- unlike the proxy paths, nothing here
+/// requires an IPv4 literal.
+fn resolveHost(allocator: Allocator, host: []const u8, port: u16) ProxyError!std.net.Address {
+    const list = std.net.getAddressList(allocator, host, port) catch return error.DnsResolveFailed;
+    defer list.deinit();
+    for (list.addrs) |a| {
+        if (a.any.family == std.posix.AF.INET) return a;
+    }
+    if (list.addrs.len > 0) return list.addrs[0];
     return error.DnsResolveFailed;
 }
 
@@ -997,6 +1085,89 @@ test "classifySocks5: non-SOCKS5 version => rejected" {
     const probe = classifySocks5(a, .{ .scheme = .socks5, .host = "127.0.0.1", .port = port }, 2);
     try std.testing.expectEqual(ProxyState.rejected, probe.state);
     try std.testing.expectEqual(@as(?u8, 0x04), probe.reply);
+}
+
+// --- httpGetDirect against a mock origin server ---
+
+const MockHttp = struct {
+    server: *std.net.Server,
+    stop: std.atomic.Value(bool),
+    response: []const u8,
+    request: [1024]u8 = undefined,
+    request_len: usize = 0,
+};
+
+fn mockHttpRun(ctx: *MockHttp) void {
+    // Poll-with-timeout accept so the thread can observe `stop` and exit.
+    var pfd = [_]std.posix.pollfd{.{ .fd = ctx.server.stream.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    while (!ctx.stop.load(.acquire)) {
+        const ready = std.posix.poll(&pfd, 200) catch 0;
+        if (ready == 0) continue;
+        const conn = ctx.server.accept() catch continue;
+        defer conn.stream.close();
+        while (ctx.request_len < ctx.request.len) {
+            const n = conn.stream.read(ctx.request[ctx.request_len..]) catch break;
+            if (n == 0) break;
+            ctx.request_len += n;
+            if (std.mem.indexOf(u8, ctx.request[0..ctx.request_len], "\r\n\r\n") != null) break;
+        }
+        var sent: usize = 0;
+        while (sent < ctx.response.len) {
+            const n = conn.stream.write(ctx.response[sent..]) catch break;
+            if (n == 0) break;
+            sent += n;
+        }
+    }
+}
+
+test "httpGetDirect fetches a body and sends an origin-form request" {
+    const a = std.testing.allocator;
+    var server = try std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0).listen(.{ .reuse_address = true });
+    const port = server.listen_address.getPort();
+
+    const ctx = try a.create(MockHttp);
+    ctx.* = .{
+        .server = &server,
+        .stop = std.atomic.Value(bool).init(false),
+        .response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nd1:xe",
+    };
+    const thread = try std.Thread.spawn(.{}, mockHttpRun, .{ctx});
+    defer {
+        server.deinit();
+        a.destroy(ctx);
+    }
+
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/announce?info_hash=x", .{port});
+    defer a.free(url);
+    const body = try httpGetDirect(a, url, null);
+    defer a.free(body);
+
+    ctx.stop.store(true, .release);
+    thread.join();
+
+    try std.testing.expectEqualStrings("d1:xe", body);
+    const req = ctx.request[0..ctx.request_len];
+    try std.testing.expect(std.mem.startsWith(u8, req, "GET /announce?info_hash=x HTTP/1.1\r\n"));
+    // Non-default port must appear in Host, per RFC 9110.
+    var host_buf: [64]u8 = undefined;
+    const host_hdr = try std.fmt.bufPrint(&host_buf, "Host: 127.0.0.1:{d}\r\n", .{port});
+    try std.testing.expect(std.mem.indexOf(u8, req, host_hdr) != null);
+}
+
+test "httpGetDirect surfaces a refused connect instead of hanging" {
+    const a = std.testing.allocator;
+    // Bind to grab a free port, then close it so the connect is refused.
+    var server = try std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0).listen(.{ .reuse_address = true });
+    const port = server.listen_address.getPort();
+    server.deinit();
+
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/announce", .{port});
+    defer a.free(url);
+    try std.testing.expectError(error.ConnectFailed, httpGetDirect(a, url, null));
+}
+
+test "httpGetDirect rejects a non-HTTP url" {
+    try std.testing.expectError(error.InvalidUrl, httpGetDirect(std.testing.allocator, "udp://tracker:6969", null));
 }
 
 test "redactUrl masks SOCKS credentials" {

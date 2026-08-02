@@ -91,6 +91,10 @@ pub const PeerConnection = struct {
     /// last sample, both owned by `updatePipelineLimit`.
     down_rate: u64 = 0,
     rate_last_bytes: u64 = 0,
+    /// Whether O_NONBLOCK has been set on `stream`. Streams reach us from four
+    /// places (direct connect, SOCKS proxy, I2P SAM, and inbound accept), so
+    /// rather than have every producer remember, the first read/write flips it.
+    nonblocking: bool = false,
 
     // Stats for choking algorithm
     bytes_downloaded: u64,
@@ -248,8 +252,8 @@ pub const PeerConnection = struct {
         // macOS, so a dead or filtered peer (e.g. a stale nostr peer-announce)
         // could block the whole session in connect() for the OS default ~75 s.
         // Use a non-blocking connect + poll(POLLOUT) so connect_timeout_secs is
-        // a real upper bound on every platform, then restore blocking mode for
-        // the session's normal poll-driven I/O.
+        // a real upper bound on every platform. The socket then stays
+        // non-blocking for the session's poll-driven I/O (see below).
         const flags = std.posix.fcntl(sock, std.posix.F.GETFL, 0) catch {
             self.state = .disconnected;
             return error.ConnectionFailed;
@@ -288,10 +292,13 @@ pub const PeerConnection = struct {
             },
         };
 
-        // Back to blocking: the session multiplexes peers with poll() and then
-        // does blocking reads/writes on ready sockets.
-        o.NONBLOCK = false;
-        _ = std.posix.fcntl(sock, std.posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
+        // Stay non-blocking. A blocking socket caps each peer at ONE buffer per
+        // poll wake (a second read would stall every other peer), which made
+        // peer throughput `peers x 64 KiB x loop_rate` — measured at 384 KB/s on
+        // a 50-peer swarm. Non-blocking lets `readIncoming`/`flushSend` drain to
+        // EAGAIN, and stops a slow leecher's large piece send from freezing the
+        // whole session mid-write.
+        self.nonblocking = true;
 
         self.stream = .{ .handle = sock };
         setNoDelay(self.stream.?);
@@ -318,17 +325,44 @@ pub const PeerConnection = struct {
         self.send_buf.appendSlice(self.allocator, serialized) catch return error.OutOfMemory;
     }
 
-    /// Flush send buffer to socket. Returns bytes written.
+    /// Ensure the socket is non-blocking. Idempotent; see the `nonblocking`
+    /// field for why this is done lazily at the I/O sites.
+    fn ensureNonBlocking(self: *PeerConnection) void {
+        if (self.nonblocking) return;
+        const s = self.stream orelse return;
+        const flags = std.posix.fcntl(s.handle, std.posix.F.GETFL, 0) catch return;
+        var o: std.posix.O = @bitCast(@as(u32, @truncate(flags)));
+        o.NONBLOCK = true;
+        _ = std.posix.fcntl(s.handle, std.posix.F.SETFL, @as(u32, @bitCast(o))) catch return;
+        self.nonblocking = true;
+    }
+
+    /// Flush the send buffer, writing until the socket says EAGAIN or the
+    /// buffer empties. A single write() left the rest queued until the next
+    /// poll wake, which delayed every `interested`/`request`/`piece` by a full
+    /// loop iteration; on a blocking socket it could also stall the session
+    /// inside one large piece send. Returns total bytes written.
     pub fn flushSend(self: *PeerConnection) !usize {
         const s = self.stream orelse return 0;
-        const remaining = self.send_buf.items[self.send_pos..];
-        if (remaining.len == 0) return 0;
+        self.ensureNonBlocking();
 
-        const written = s.write(remaining) catch {
-            self.state = .disconnected;
-            return error.IoError;
-        };
-        self.send_pos += written;
+        var written: usize = 0;
+        while (self.send_pos < self.send_buf.items.len) {
+            const remaining = self.send_buf.items[self.send_pos..];
+            const n = s.write(remaining) catch |err| switch (err) {
+                // Kernel buffer full: keep the remainder queued for the next
+                // POLLOUT rather than treating backpressure as a failure.
+                error.WouldBlock => break,
+                else => {
+                    self.state = .disconnected;
+                    return error.IoError;
+                },
+            };
+            if (n == 0) break;
+            self.send_pos += n;
+            written += n;
+        }
+        if (written == 0) return 0;
         self.last_send_time = std.time.timestamp();
 
         // Compact send buffer when half consumed
@@ -342,23 +376,45 @@ pub const PeerConnection = struct {
         return written;
     }
 
-    /// Read available data from socket into recv_buf. The buffer is sized to
-    /// drain several piece messages per poll wake — a 16 KiB read forced one
-    /// syscall + poll round per block.
+    /// Largest amount `readIncoming` will drain from one peer in one call.
+    /// Without a bound, a peer that streams faster than we process could hold
+    /// the loop indefinitely and starve the others; poll reports the socket
+    /// readable again next iteration, so nothing is lost by stopping here.
+    const max_read_per_call: usize = 1 << 20;
+
+    /// Read available data from socket into recv_buf, draining until the socket
+    /// reports EAGAIN (or `max_read_per_call`). Reading a single buffer per poll
+    /// wake capped each peer at 64 KiB per loop iteration — the dominant limit
+    /// on peer throughput. Returns total bytes read.
     pub fn readIncoming(self: *PeerConnection) !usize {
         const s = self.stream orelse return 0;
+        self.ensureNonBlocking();
+
         var buf: [65536]u8 = undefined;
-        const n = s.read(&buf) catch {
-            self.state = .disconnected;
-            return error.IoError;
-        };
-        if (n == 0) {
-            self.state = .disconnected;
-            return 0;
+        var total: usize = 0;
+        while (total < max_read_per_call) {
+            const n = s.read(&buf) catch |err| switch (err) {
+                // Socket drained; what we already appended still counts.
+                error.WouldBlock => break,
+                else => {
+                    self.state = .disconnected;
+                    return error.IoError;
+                },
+            };
+            if (n == 0) {
+                // Orderly EOF: the peer closed. Report the disconnect, but keep
+                // any bytes read in this call — they may hold whole messages.
+                self.state = .disconnected;
+                break;
+            }
+            self.recv_buf.appendSlice(self.allocator, buf[0..n]) catch return error.OutOfMemory;
+            total += n;
+            // A short read means the socket is drained; another read would only
+            // return EAGAIN.
+            if (n < buf.len) break;
         }
-        self.recv_buf.appendSlice(self.allocator, buf[0..n]) catch return error.OutOfMemory;
-        self.last_recv_time = std.time.timestamp();
-        return n;
+        if (total > 0) self.last_recv_time = std.time.timestamp();
+        return total;
     }
 
     /// Drop consumed bytes from the front of recv_buf. Amortized: a no-op

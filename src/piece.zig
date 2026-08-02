@@ -10,12 +10,19 @@ pub const block_size: u32 = 16384;
 pub const Bitfield = struct {
     bytes: []u8,
     num_pieces: u32,
+    /// Number of set bits within `num_pieces`, maintained incrementally.
+    /// The session's poll loop asks `isComplete()` on every wake and reports
+    /// `count()` on every completed piece; recomputing either from the bytes
+    /// is O(num_pieces), which on a 10k-piece torrent burns real CPU for an
+    /// answer that only changes when a bit changes. Every mutation path in
+    /// this struct keeps this field in sync, so both are O(1).
+    have_count: u32,
 
     pub fn init(allocator: Allocator, num_pieces: u32) error{OutOfMemory}!Bitfield {
         const byte_count = (num_pieces + 7) / 8;
         const bytes = allocator.alloc(u8, byte_count) catch return error.OutOfMemory;
         @memset(bytes, 0);
-        return .{ .bytes = bytes, .num_pieces = num_pieces };
+        return .{ .bytes = bytes, .num_pieces = num_pieces, .have_count = 0 };
     }
 
     pub fn deinit(self: Bitfield, allocator: Allocator) void {
@@ -33,26 +40,35 @@ pub const Bitfield = struct {
         if (index >= self.num_pieces) return;
         const byte_idx = index / 8;
         const bit_idx: u3 = @intCast(7 - (index % 8));
-        self.bytes[byte_idx] |= @as(u8, 1) << bit_idx;
+        const mask = @as(u8, 1) << bit_idx;
+        // Only move the cached count when the bit actually flips, so repeated
+        // `have` messages for the same piece can't inflate it.
+        if (self.bytes[byte_idx] & mask == 0) self.have_count += 1;
+        self.bytes[byte_idx] |= mask;
     }
 
     pub fn clearPiece(self: *Bitfield, index: u32) void {
         if (index >= self.num_pieces) return;
         const byte_idx = index / 8;
         const bit_idx: u3 = @intCast(7 - (index % 8));
-        self.bytes[byte_idx] &= ~(@as(u8, 1) << bit_idx);
+        const mask = @as(u8, 1) << bit_idx;
+        if (self.bytes[byte_idx] & mask != 0) self.have_count -= 1;
+        self.bytes[byte_idx] &= ~mask;
     }
 
     pub fn count(self: Bitfield) u32 {
-        var n: u32 = 0;
-        for (0..self.num_pieces) |i| {
-            if (self.hasPiece(@intCast(i))) n += 1;
-        }
-        return n;
+        return self.have_count;
     }
 
     pub fn isComplete(self: Bitfield) bool {
-        return self.count() == self.num_pieces;
+        return self.have_count == self.num_pieces;
+    }
+
+    /// Recompute the set-bit count from the bytes. Only used when a bitfield
+    /// is built from raw bytes (and by the tests, to prove the incremental
+    /// count never drifts from the truth).
+    fn recount(self: Bitfield) u32 {
+        return popCountPrefix(self.bytes, self.num_pieces);
     }
 
     pub fn rawBytes(self: Bitfield) []const u8 {
@@ -64,9 +80,74 @@ pub const Bitfield = struct {
         if (raw.len != expected) return error.InvalidLength;
         const bytes = allocator.alloc(u8, expected) catch return error.OutOfMemory;
         @memcpy(bytes, raw);
-        return .{ .bytes = bytes, .num_pieces = num_pieces };
+        // The peer's spare bits (past `num_pieces`) are theirs to get wrong;
+        // popCountPrefix ignores them, matching `hasPiece`, which refuses any
+        // index at or past `num_pieces`.
+        return .{ .bytes = bytes, .num_pieces = num_pieces, .have_count = popCountPrefix(bytes, num_pieces) };
     }
 };
+
+/// Count set bits among the first `num_bits` bits of `bytes`, in BEP 3 order
+/// (bit 7 of byte 0 is bit 0). Whole 64-bit words go through `@popCount` --
+/// one instruction per 64 pieces instead of one branch per piece -- and the
+/// trailing partial byte is masked so bits past `num_bits` never count.
+fn popCountPrefix(bytes: []const u8, num_bits: u32) u32 {
+    const full_bytes = num_bits / 8;
+    var n: u32 = 0;
+    var i: usize = 0;
+    while (i + 8 <= full_bytes) : (i += 8) {
+        // Bit order within the word is irrelevant to a population count, so
+        // the raw byte-array reinterpretation is fine (and alignment-safe).
+        const word: u64 = @bitCast(bytes[i..][0..8].*);
+        n += @popCount(word);
+    }
+    while (i < full_bytes) : (i += 1) n += @popCount(bytes[i]);
+
+    const rem = num_bits % 8;
+    if (rem != 0) {
+        const shift: u3 = @intCast(8 - rem);
+        n += @popCount(bytes[full_bytes] & (@as(u8, 0xFF) << shift));
+    }
+    return n;
+}
+
+/// Index of the first bit that is set in neither `primary` nor `in_flight`,
+/// limited to `num_bits`, or null when every bit is covered. Scanning 64 bits
+/// at a time with `@clz` keeps the scheduler's per-block "what's next" lookup
+/// off the one-branch-per-block path; `in_flight` is null for callers that
+/// only care about what has actually arrived.
+fn firstMissingBit(primary: []const u8, in_flight: ?[]const u8, num_bits: u32) ?u32 {
+    const all_ones = ~@as(u64, 0);
+    const full_words = num_bits / 64;
+
+    var w: usize = 0;
+    while (w < full_words) : (w += 1) {
+        const off = w * 8;
+        // Big-endian read so the word's most significant bit is the lowest
+        // block index -- that is what makes `@clz` the missing bit's index.
+        var word = std.mem.readInt(u64, primary[off..][0..8], .big);
+        if (in_flight) |f| word |= std.mem.readInt(u64, f[off..][0..8], .big);
+        if (word != all_ones) return @intCast(w * 64 + @clz(~word));
+    }
+
+    var base: u32 = @intCast(full_words * 64);
+    var byte_idx: usize = full_words * 8;
+    while (base < num_bits) : ({
+        base += 8;
+        byte_idx += 1;
+    }) {
+        var b = primary[byte_idx];
+        if (in_flight) |f| b |= f[byte_idx];
+        if (b != 0xFF) {
+            const idx = base + @clz(~b);
+            // Only reachable in the trailing partial byte: its spare bits read
+            // as missing, but there is no such block.
+            if (idx >= num_bits) return null;
+            return idx;
+        }
+    }
+    return null;
+}
 
 /// Tracks received blocks for a single in-progress piece.
 pub const PieceProgress = struct {
@@ -141,18 +222,12 @@ pub const PieceProgress = struct {
     }
 
     pub fn isComplete(self: PieceProgress) bool {
-        for (0..self.num_blocks) |i| {
-            if (!self.hasBlock(@intCast(i))) return false;
-        }
-        return true;
+        return firstMissingBit(self.received, null, self.num_blocks) == null;
     }
 
     /// Return the next un-received block index, or null.
     pub fn nextMissingBlock(self: PieceProgress) ?u32 {
-        for (0..self.num_blocks) |i| {
-            if (!self.hasBlock(@intCast(i))) return @intCast(i);
-        }
-        return null;
+        return firstMissingBit(self.received, null, self.num_blocks);
     }
 
     pub fn isRequested(self: PieceProgress, block_idx: u32) bool {
@@ -182,11 +257,7 @@ pub const PieceProgress = struct {
     /// This is what the scheduler uses; `nextMissingBlock` (received-only) is
     /// for completeness checks where in-flight state must not hide a block.
     pub fn nextUnrequestedBlock(self: PieceProgress) ?u32 {
-        for (0..self.num_blocks) |i| {
-            const idx: u32 = @intCast(i);
-            if (!self.hasBlock(idx) and !self.isRequested(idx)) return idx;
-        }
-        return null;
+        return firstMissingBit(self.received, self.requested, self.num_blocks);
     }
 
     /// Compute begin offset and length for a given block index.
@@ -303,6 +374,93 @@ test "bitfield fromRaw roundtrip" {
     try std.testing.expect(!bf2.hasPiece(1));
 }
 
+test "bitfield count ignores spare bits in the trailing byte" {
+    const allocator = std.testing.allocator;
+    // 12 pieces occupy 1.5 bytes: a peer that sets the 4 spare bits (or just
+    // sends 0xFF padding) must not read as 16 pieces, and must not read as
+    // complete before we actually have all 12.
+    const raw = [_]u8{ 0xFF, 0xFF };
+    var bf = try Bitfield.fromRaw(allocator, &raw, 12);
+    defer bf.deinit(allocator);
+    try std.testing.expectEqual(@as(u32, 12), bf.count());
+    try std.testing.expectEqual(bf.recount(), bf.count());
+    try std.testing.expect(bf.isComplete());
+    try std.testing.expect(!bf.hasPiece(12));
+
+    // The same shape from the other direction: a partial trailing byte where
+    // only some live bits are set.
+    const partial = [_]u8{ 0b1010_0000, 0b1100_1111 };
+    var bf2 = try Bitfield.fromRaw(allocator, &partial, 12);
+    defer bf2.deinit(allocator);
+    try std.testing.expectEqual(@as(u32, 4), bf2.count()); // 2 + 2, spare bits dropped
+    try std.testing.expectEqual(bf2.recount(), bf2.count());
+    try std.testing.expect(!bf2.isComplete());
+}
+
+test "bitfield cached count survives every mutation path" {
+    const allocator = std.testing.allocator;
+    // Not a multiple of 8, and larger than one 64-bit word, so the word-at-a-
+    // time popcount and the masked tail are both exercised.
+    const num_pieces: u32 = 3020;
+    var bf = try Bitfield.init(allocator, num_pieces);
+    defer bf.deinit(allocator);
+    try std.testing.expectEqual(bf.recount(), bf.count());
+
+    // set: including a repeat (a duplicate `have`) and an out-of-range index,
+    // neither of which may move the count.
+    var i: u32 = 0;
+    while (i < num_pieces) : (i += 3) bf.setPiece(i);
+    bf.setPiece(0);
+    bf.setPiece(num_pieces);
+    bf.setPiece(num_pieces + 1000);
+    try std.testing.expectEqual(bf.recount(), bf.count());
+
+    // clear: same deal in reverse.
+    i = 0;
+    while (i < num_pieces) : (i += 7) bf.clearPiece(i);
+    bf.clearPiece(7);
+    bf.clearPiece(num_pieces);
+    try std.testing.expectEqual(bf.recount(), bf.count());
+
+    // fromRaw: a bitfield rebuilt from the wire agrees with the original.
+    var bf2 = try Bitfield.fromRaw(allocator, bf.rawBytes(), num_pieces);
+    defer bf2.deinit(allocator);
+    try std.testing.expectEqual(bf.count(), bf2.count());
+    try std.testing.expectEqual(bf2.recount(), bf2.count());
+
+    // ...and filling it completely lands exactly on num_pieces.
+    i = 0;
+    while (i < num_pieces) : (i += 1) bf2.setPiece(i);
+    try std.testing.expectEqual(num_pieces, bf2.count());
+    try std.testing.expectEqual(bf2.recount(), bf2.count());
+    try std.testing.expect(bf2.isComplete());
+
+    // A single clear anywhere makes it incomplete again.
+    bf2.clearPiece(num_pieces - 1);
+    try std.testing.expect(!bf2.isComplete());
+    try std.testing.expectEqual(num_pieces - 1, bf2.count());
+}
+
+test "bitfield count at every length around a byte boundary" {
+    const allocator = std.testing.allocator;
+    // Lengths 0..17 cover empty, sub-byte, exact-byte and multi-byte cases.
+    for (0..18) |n| {
+        const num_pieces: u32 = @intCast(n);
+        var bf = try Bitfield.init(allocator, num_pieces);
+        defer bf.deinit(allocator);
+        try std.testing.expectEqual(@as(u32, 0), bf.count());
+        try std.testing.expectEqual(num_pieces == 0, bf.isComplete());
+
+        var i: u32 = 0;
+        while (i < num_pieces) : (i += 1) {
+            bf.setPiece(i);
+            try std.testing.expectEqual(i + 1, bf.count());
+            try std.testing.expectEqual(bf.recount(), bf.count());
+        }
+        try std.testing.expect(bf.isComplete());
+    }
+}
+
 test "piece progress block assembly" {
     const allocator = std.testing.allocator;
     // 32KB piece = 2 blocks of 16KB
@@ -371,6 +529,59 @@ test "piece progress requested tracking" {
     // reset() clears in-flight state too.
     pp.reset();
     try std.testing.expectEqual(@as(?u32, 0), pp.nextUnrequestedBlock());
+}
+
+test "piece progress scans agree with a per-block reference" {
+    const allocator = std.testing.allocator;
+    // 100 blocks: more than one 64-bit word, and not a multiple of 8, so the
+    // word scan and the masked tail byte both get hit.
+    const num_blocks: u32 = 100;
+    var pp = try PieceProgress.init(allocator, 0, num_blocks * block_size);
+    defer pp.deinit(allocator);
+    try std.testing.expectEqual(num_blocks, pp.num_blocks);
+
+    const ref = struct {
+        fn firstMissing(p: PieceProgress) ?u32 {
+            for (0..p.num_blocks) |i| {
+                if (!p.hasBlock(@intCast(i))) return @intCast(i);
+            }
+            return null;
+        }
+        fn firstUnrequested(p: PieceProgress) ?u32 {
+            for (0..p.num_blocks) |i| {
+                const idx: u32 = @intCast(i);
+                if (!p.hasBlock(idx) and !p.isRequested(idx)) return idx;
+            }
+            return null;
+        }
+    };
+
+    // Walk a mixed state: some blocks received, some only in flight, in an
+    // order that leaves holes in the middle of words and in the tail byte.
+    var seed: u32 = 12345;
+    var step: u32 = 0;
+    while (step < num_blocks * 2) : (step += 1) {
+        seed = seed *% 1664525 +% 1013904223;
+        const idx = seed % num_blocks;
+        if (seed & 1 == 0) {
+            pp.markRequested(idx);
+        } else {
+            pp.markRequested(idx);
+            _ = pp.addBlock(idx * block_size, &([_]u8{0} ** block_size));
+        }
+        try std.testing.expectEqual(ref.firstMissing(pp), pp.nextMissingBlock());
+        try std.testing.expectEqual(ref.firstUnrequested(pp), pp.nextUnrequestedBlock());
+        try std.testing.expectEqual(ref.firstMissing(pp) == null, pp.isComplete());
+    }
+
+    // Finish it off: only the very last block missing, then none.
+    var i: u32 = 0;
+    while (i < num_blocks - 1) : (i += 1) _ = pp.addBlock(i * block_size, &([_]u8{0} ** block_size));
+    try std.testing.expectEqual(@as(?u32, num_blocks - 1), pp.nextMissingBlock());
+    try std.testing.expect(!pp.isComplete());
+    _ = pp.addBlock((num_blocks - 1) * block_size, &([_]u8{0} ** block_size));
+    try std.testing.expectEqual(@as(?u32, null), pp.nextMissingBlock());
+    try std.testing.expect(pp.isComplete());
 }
 
 test "piece progress block spec" {
