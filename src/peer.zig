@@ -99,6 +99,10 @@ pub const PeerConnection = struct {
     // Timestamps
     last_recv_time: i64,
     last_send_time: i64,
+    /// Wall-clock second a clearnet non-blocking connect was started.
+    /// `maintenance` disconnects a `.connecting` peer that exceeds the connect
+    /// timeout, so a dead host can't squat a poll slot forever.
+    connect_started_at: i64 = 0,
 
     pub fn init(allocator: Allocator, address: std.net.Address) PeerConnection {
         return .{
@@ -178,8 +182,10 @@ pub const PeerConnection = struct {
         self.pending_requests.deinit(self.allocator);
     }
 
-    /// Connect timeout in seconds.
-    pub const connect_timeout_secs: u32 = 5;
+    /// Connect timeout in seconds. Generous: a non-blocking connect integrated
+    /// into the poll loop costs nothing while waiting, and international /
+    /// congested peers routinely need 5-10 s to complete a TCP handshake.
+    pub const connect_timeout_secs: u32 = 15;
 
     /// Disable Nagle on a peer socket (best-effort). Wire requests are tiny
     /// and latency-sensitive; letting the kernel coalesce them behind delayed
@@ -193,6 +199,15 @@ pub const PeerConnection = struct {
             std.posix.TCP.NODELAY,
             std.mem.asBytes(&one),
         ) catch {};
+    }
+
+    /// Raise SO_RCVBUF/SO_SNDBUF so high-bandwidth block traffic doesn't
+    /// overflow the kernel's default buffers (often 64–256 KiB) and drop under
+    /// bursts. Best-effort: silently ignored if the OS denies the raise.
+    pub fn setSocketBuffers(sock_fd: std.posix.fd_t) void {
+        const sz: c_int = 512 * 1024;
+        std.posix.setsockopt(sock_fd, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&sz)) catch {};
+        std.posix.setsockopt(sock_fd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&sz)) catch {};
     }
 
     /// Initiate TCP connection with a timeout.
@@ -243,6 +258,7 @@ pub const PeerConnection = struct {
             return error.ConnectionFailed;
         };
         errdefer std.posix.close(sock);
+        setSocketBuffers(sock);
 
         // Connect with a hard timeout. SO_SNDTIMEO does NOT bound connect() on
         // macOS, so a dead or filtered peer (e.g. a stale nostr peer-announce)
@@ -296,6 +312,90 @@ pub const PeerConnection = struct {
         self.stream = .{ .handle = sock };
         setNoDelay(self.stream.?);
         self.state = .handshaking;
+    }
+
+    /// Begin connecting without blocking the single event-loop thread.
+    ///
+    /// For a clearnet peer this issues a non-blocking connect() and returns
+    /// immediately on EINPROGRESS. The peer stays `.connecting`; the session's
+    /// poll loop watches the socket for POLLOUT and calls `finishConnect` to
+    /// complete it. This lets one tracker announce (hundreds of peers) kick off
+    /// dozens of connections in microseconds instead of blocking the event loop
+    /// for up to N × connect_timeout_secs while dead/firewalled peers each burn
+    /// their full timeout serially.
+    ///
+    /// Proxied (SOCKS/Tor) and native-I2P peers finish their handshake here
+    /// synchronously (the caller caps how many it attempts per call); the BT
+    /// handshake is queued right after.
+    pub fn startConnect(self: *PeerConnection, info_hash: [20]u8, peer_id: [20]u8) !void {
+        if (self.proxy != null or self.i2p != null) {
+            try self.connect();
+            try self.sendHandshake(info_hash, peer_id);
+            return;
+        }
+
+        // Clearnet: non-blocking connect, return on EINPROGRESS.
+        const sock = std.posix.socket(
+            std.posix.AF.INET,
+            std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
+            std.posix.IPPROTO.TCP,
+        ) catch {
+            self.state = .disconnected;
+            return error.ConnectionFailed;
+        };
+        errdefer std.posix.close(sock);
+        setSocketBuffers(sock);
+
+        const flags = std.posix.fcntl(sock, std.posix.F.GETFL, 0) catch {
+            self.state = .disconnected;
+            return error.ConnectionFailed;
+        };
+        var o: std.posix.O = @bitCast(@as(u32, @truncate(flags)));
+        o.NONBLOCK = true;
+        _ = std.posix.fcntl(sock, std.posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
+
+        std.posix.connect(sock, &self.address.any, @sizeOf(std.posix.sockaddr.in)) catch |err| switch (err) {
+            // EINPROGRESS: connect underway — the session poll loop completes it.
+            error.WouldBlock => {
+                self.stream = .{ .handle = sock };
+                self.state = .connecting;
+                self.connect_started_at = std.time.timestamp();
+                return;
+            },
+            else => {
+                self.state = .disconnected;
+                return error.ConnectionFailed;
+            },
+        };
+
+        // Immediate success (loopback / same host): finish without blocking.
+        o.NONBLOCK = false;
+        _ = std.posix.fcntl(sock, std.posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
+        self.stream = .{ .handle = sock };
+        setNoDelay(self.stream.?);
+        self.state = .handshaking;
+        try self.sendHandshake(info_hash, peer_id);
+    }
+
+    /// Complete a clearnet non-blocking connect whose socket became writable.
+    /// Surfaces any asynchronous connect error via SO_ERROR; on success
+    /// restores blocking mode and queues the BitTorrent handshake.
+    pub fn finishConnect(self: *PeerConnection, info_hash: [20]u8, peer_id: [20]u8) !void {
+        const s = self.stream orelse return error.ConnectionFailed;
+        std.posix.getsockoptError(s.handle) catch {
+            self.state = .disconnected;
+            return error.ConnectionFailed;
+        };
+        const flags = std.posix.fcntl(s.handle, std.posix.F.GETFL, 0) catch {
+            self.state = .disconnected;
+            return error.ConnectionFailed;
+        };
+        var o: std.posix.O = @bitCast(@as(u32, @truncate(flags)));
+        o.NONBLOCK = false;
+        _ = std.posix.fcntl(s.handle, std.posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
+        setNoDelay(s);
+        self.state = .handshaking;
+        try self.sendHandshake(info_hash, peer_id);
     }
 
     /// Queue the handshake for sending.

@@ -142,6 +142,15 @@ pub const Session = struct {
     // Last second `maintenance` ran the per-peer tick (pipeline resize +
     // request expiry). Gates that work to 1 Hz like `sampleRate`.
     peer_tick_last_s: i64 = 0,
+    // Cached tracker peer list for replenishment. In a mostly-NAT'd public
+    // swarm most tracker peers are unreachable, so a single connect burst finds
+    // almost nothing. The session cycles through the cached list (skipping
+    // already-connected peers) until the pool fills with reachable peers.
+    // Freed in deinit.
+    cached_peers: []tracker_mod.Peer = &.{},
+    // Throttle for peer replenishment (maintenance). Connecting is cheap (async),
+    // but rate-limiting avoids hammering the same unreachable hosts every tick.
+    last_replenish_s: i64 = 0,
     // BEP 9 metadata bytes received this session. Counted toward the download
     // rate (and progress timestamp) so the metadata-fetch phase shows real speed
     // even though piece `downloaded` is still 0 then.
@@ -359,6 +368,7 @@ pub const Session = struct {
             self.allocator.destroy(p);
         }
         self.peers.deinit(self.allocator);
+        if (self.cached_peers.len > 0) self.allocator.free(self.cached_peers);
 
         if (self.dht_instance) |*d| d.deinit();
         if (self.metadata_download) |*md| md.deinit();
@@ -700,7 +710,13 @@ pub const Session = struct {
             if (n >= fds.len) break;
 
             var events: i16 = std.posix.POLL.IN;
-            if (p.wantsSend()) events |= std.posix.POLL.OUT;
+            // A clearnet peer mid non-blocking connect becomes writable (POLLOUT)
+            // exactly when the connect resolves — poll for that, not POLLIN.
+            if (p.state == .connecting) {
+                events = std.posix.POLL.OUT;
+            } else if (p.wantsSend()) {
+                events |= std.posix.POLL.OUT;
+            }
 
             fds[n] = .{ .fd = p.fd(), .events = events, .revents = 0 };
             n += 1;
@@ -726,13 +742,32 @@ pub const Session = struct {
             const revents = fds[fd_idx].revents;
 
             if (revents & (std.posix.POLL.HUP | std.posix.POLL.ERR) != 0) {
+                if (p.state == .active) log.debug("peer dropped (HUP/ERR), idle {d}s", .{std.time.timestamp() - p.last_recv_time});
                 p.disconnect();
+                fd_idx += 1;
+                continue;
+            }
+
+            // Clearnet non-blocking connect just resolved (socket is writable).
+            if (p.state == .connecting) {
+                if (revents & std.posix.POLL.OUT != 0) {
+                    p.finishConnect(self.info_hash, self.peer_id) catch {
+                        p.disconnect();
+                        fd_idx += 1;
+                        continue;
+                    };
+                    // Flush the just-queued handshake without waiting a poll cycle.
+                    _ = p.flushSend() catch {
+                        p.disconnect();
+                    };
+                }
                 fd_idx += 1;
                 continue;
             }
 
             if (revents & std.posix.POLL.IN != 0) {
                 _ = p.readIncoming() catch {
+                    if (p.state == .active) log.debug("peer read-err, idle {d}s", .{std.time.timestamp() - p.last_recv_time});
                     p.disconnect();
                     fd_idx += 1;
                     continue;
@@ -762,11 +797,20 @@ pub const Session = struct {
                             }
                         }
 
-                        if (self.our_bitfield.count() > 0) {
+                        // BEP 3: send a bitfield right after the handshake — even
+                        // all-zero for a fresh leecher. Some strict clients stall
+                        // (never unchoke) waiting for a bitfield that never comes.
+                        if (self.num_pieces > 0) {
                             p.enqueueMessage(.{ .bitfield = self.our_bitfield.rawBytes() }) catch {};
                         }
 
-                        if (self.mode == .download) {
+                        // Only express interest once we know the piece layout
+                        // (post-metadata) and can send a bitfield with it.
+                        // During the magnet metadata phase num_pieces is 0, so we
+                        // have no bitfield — sending interested alone (BEP 3 says
+                        // bitfield must precede it) confuses strict peers into
+                        // never unchoking us. onMetadataComplete sends both later.
+                        if (self.mode == .download and self.num_pieces > 0) {
                             p.am_interested = true;
                             p.enqueueMessage(.interested) catch {};
                         }
@@ -803,6 +847,7 @@ pub const Session = struct {
             },
             .unchoke => {
                 p.peer_choking = false;
+                log.debug("peer unchoked us", .{});
             },
             .interested => {
                 p.peer_interested = true;
@@ -847,6 +892,7 @@ pub const Session = struct {
                     p.peer_bitfield = piece_mod.Bitfield.fromRaw(self.allocator, data, self.num_pieces) catch null;
                     if (p.peer_bitfield) |*bf| {
                         self.addAvailability(bf);
+                        log.debug("peer bitfield: {d}/{d} pieces", .{ bf.count(), self.num_pieces });
                     }
                 }
 
@@ -1300,10 +1346,13 @@ pub const Session = struct {
                 p.peer_bitfield = piece_mod.Bitfield.fromRaw(self.allocator, raw, self.num_pieces) catch null;
                 if (p.peer_bitfield) |*bf| self.addAvailability(bf);
             }
-            if (!p.am_interested and self.peerHasNeededPieces(p)) {
-                p.am_interested = true;
-                p.enqueueMessage(.interested) catch {};
-            }
+            // Peers that connected during the metadata phase never received our
+            // bitfield (we had no piece count yet) and may not have registered our
+            // interest. Send our (all-zero) bitfield and re-express interest so
+            // they unchoke us for the data phase.
+            p.enqueueMessage(.{ .bitfield = self.our_bitfield.rawBytes() }) catch {};
+            p.am_interested = true;
+            p.enqueueMessage(.interested) catch {};
         }
 
         log.info("metadata complete: '{s}', {d} pieces, {d} bytes", .{ name, self.num_pieces, self.total_length });
@@ -1655,6 +1704,14 @@ pub const Session = struct {
                 self.allocator.destroy(p);
                 _ = self.peers.orderedRemove(i);
             } else {
+                // A clearnet peer stuck in the non-blocking connect phase past
+                // the connect timeout is a dead host — reclaim its poll slot so
+                // it doesn't squat against the max_peers cap.
+                if (p.state == .connecting and now - p.connect_started_at > peer_mod.PeerConnection.connect_timeout_secs) {
+                    p.disconnect();
+                    i += 1;
+                    continue;
+                }
                 if (now - p.last_send_time > 60) {
                     p.enqueueMessage(.keep_alive) catch {};
                 }
@@ -1693,6 +1750,15 @@ pub const Session = struct {
             if (self.peers.items.len == 0 and now - self.last_announce_time > 30) {
                 self.tryDhtPeerDiscovery() catch {};
             }
+        }
+
+        // Peer replenishment: keep the pool topped up. In a mostly-NAT'd public
+        // swarm most tracker peers are unreachable, so a single connect burst
+        // leaves us with almost nothing. Cycle through the cached list (skipping
+        // peers already connected) until the pool reaches a healthy count.
+        if (self.mode == .download and self.peers.items.len < 30 and self.cached_peers.len > 0 and now - self.last_replenish_s >= 3) {
+            self.last_replenish_s = now;
+            self.connectToPeers(self.cached_peers) catch {};
         }
 
         // Nostr: while DOWNLOADING with zero peers, periodically re-query the
@@ -1841,6 +1907,13 @@ pub const Session = struct {
         if (resp.incomplete) |ic| stderr.print(", {d} leechers", .{ic}) catch {};
         stderr.print("\n", .{}) catch {};
 
+        // Cache the peer list so maintenance can replenish the pool as
+        // unreachable peers are pruned (a single connect burst finds only the
+        // reachable subset of a mostly-NAT'd swarm).
+        if (resp.peers.len > 0) {
+            if (self.cached_peers.len > 0) self.allocator.free(self.cached_peers);
+            self.cached_peers = self.allocator.dupe(tracker_mod.Peer, resp.peers) catch &.{};
+        }
         self.connectToPeers(resp.peers) catch {};
     }
 
@@ -1862,7 +1935,11 @@ pub const Session = struct {
         // handshake + circuit). Trying all 50 peers serially would block
         // the session thread for minutes. Cap attempts per call; the
         // tracker re-announce cycle gradually fills the peer pool.
-        const max_attempts: usize = if (self.proxy != null) 10 else 50;
+        // Clearnet connects are now non-blocking (startConnect returns on
+        // EINPROGRESS), so attempting the whole tracker response is cheap —
+        // the peer-pool cap (max_peers) bounds how many sockets we hold. Proxied
+        // connects still block per attempt, so keep that cap small.
+        const max_attempts: usize = if (self.proxy != null) 10 else 200;
         var attempts: usize = 0;
 
         // Rotate start offset so repeated announces don't always retry
@@ -1893,13 +1970,12 @@ pub const Session = struct {
             p.* = peer_mod.PeerConnection.init(self.allocator, addr);
             p.proxy = self.proxy;
 
-            p.connect() catch {
-                p.deinit();
-                self.allocator.destroy(p);
-                continue;
-            };
-
-            p.sendHandshake(self.info_hash, self.peer_id) catch {
+            // Non-blocking for clearnet: startConnect issues connect() and
+            // returns on EINPROGRESS, so a swarm full of dead peers can't stall
+            // the single event-loop thread. The poll loop completes each connect
+            // via finishConnect on POLLOUT. Proxied/I2P connects still block
+            // here (synchronous handshake) but are capped by max_attempts.
+            p.startConnect(self.info_hash, self.peer_id) catch {
                 p.deinit();
                 self.allocator.destroy(p);
                 continue;
