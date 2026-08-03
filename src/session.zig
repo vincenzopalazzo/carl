@@ -1952,6 +1952,10 @@ pub const Session = struct {
             self.cached_peers = self.allocator.dupe(tracker_mod.Peer, resp.peers) catch &.{};
         }
         self.connectToPeers(resp.peers) catch {};
+        // Update peer_count immediately so the API snapshot reflects the new
+        // peers without waiting for the next maintenance() cycle (critical for
+        // Tor where the announce blocks the loop for 10-30s before it starts).
+        self.peer_count.store(self.peers.items.len, .monotonic);
     }
 
     fn computeLeft(self: *Session) u64 {
