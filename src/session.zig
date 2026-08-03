@@ -179,6 +179,18 @@ pub const Session = struct {
     file_snap: ?[]FileSnap = null,
     peer_snap_mutex: std.Thread.Mutex = .{},
     peer_snap: ?[]PeerInfo = null,
+    /// Primary tracker URL (owned), captured at init and re-captured on
+    /// metadata completion. Guarded by `snapshot_mutex`. Freed in deinit.
+    src_tracker_url: ?[]u8 = null,
+    /// Source snapshot atomics — updated by the session thread, read lock-free
+    /// by `progressSnapshot`.
+    src_seeders: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    src_leechers: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// 0 = not announced yet, 1 = last announce ok.
+    src_tracker_state: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    src_dht_nodes: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    src_announce_interval_s: std.atomic.Value(i64) = std.atomic.Value(i64).init(1800),
+    src_last_announce_s: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
 
     // Choking state
     last_unchoke_time: i64,
@@ -264,6 +276,12 @@ pub const Session = struct {
         // magnet resolves (storage re-init). Freed in deinit.
         const output_dir_owned = try allocator.dupe(u8, output_dir);
         errdefer allocator.free(output_dir_owned);
+
+        const tracker_url = if (meta.announce.len > 0)
+            allocator.dupe(u8, meta.announce) catch null
+        else
+            null;
+        errdefer if (tracker_url) |u| allocator.free(u);
 
         var peer_id: [20]u8 = undefined;
         @memcpy(peer_id[0..8], "-CA0010-");
@@ -361,6 +379,7 @@ pub const Session = struct {
             // before its first poll tick. `now` here is seconds (timestamp()).
             .last_progress_s = std.atomic.Value(i64).init(now),
             .rate_last_s = now,
+            .src_tracker_url = tracker_url,
         };
     }
 
@@ -386,6 +405,7 @@ pub const Session = struct {
         if (self.torrent_blob) |b| self.allocator.free(b);
         self.freeFileSnapSlice(self.file_snap);
         self.freePeerSnapSlice(self.peer_snap);
+        if (self.src_tracker_url) |u| self.allocator.free(u);
         self.allocator.free(self.output_dir);
         self.our_bitfield.deinit(self.allocator);
         self.store.deinit();
@@ -417,6 +437,17 @@ pub const Session = struct {
         /// Seconds since the last byte of real progress arrived. Lets the snapshot
         /// distinguish active "downloading" from "stalled" without a delta.
         idle_secs: i64,
+        // ---- Source snapshot (published via atomics + snapshot_mutex) ----
+        tracker_url: []const u8,
+        seeders: u32,
+        leechers: u32,
+        /// 0 = not announced, 1 = last announce ok.
+        tracker_state: u32,
+        dht_nodes: u32,
+        dht_active: bool,
+        nostr_active: bool,
+        announce_interval_s: i64,
+        last_announce_s: i64,
     };
 
     /// One file's summary, published by the session thread for cross-thread
@@ -471,6 +502,15 @@ pub const Session = struct {
             .meta_have = self.meta_have.load(.monotonic),
             .meta_total = self.meta_total.load(.monotonic),
             .idle_secs = @max(0, std.time.timestamp() - last_prog),
+            .tracker_url = if (self.src_tracker_url) |u| u else "",
+            .seeders = self.src_seeders.load(.monotonic),
+            .leechers = self.src_leechers.load(.monotonic),
+            .tracker_state = self.src_tracker_state.load(.monotonic),
+            .dht_nodes = self.src_dht_nodes.load(.monotonic),
+            .dht_active = !self.anonymized() and !self.tor_hidden,
+            .nostr_active = self.peer_discovery != null,
+            .announce_interval_s = self.src_announce_interval_s.load(.monotonic),
+            .last_announce_s = self.src_last_announce_s.load(.monotonic),
         };
     }
 
@@ -1477,6 +1517,12 @@ pub const Session = struct {
         {
             self.snapshot_mutex.lock();
             defer self.snapshot_mutex.unlock();
+            // Update the published tracker URL from the resolved metadata.
+            if (self.src_tracker_url) |old| self.allocator.free(old);
+            self.src_tracker_url = if (self.meta.announce.len > 0)
+                self.allocator.dupe(u8, self.meta.announce) catch null
+            else
+                null;
             self.metadata_only = false;
         }
         if (self.metadata_download) |*md| md.deinit();
@@ -1916,6 +1962,12 @@ pub const Session = struct {
             }
             // Publish per-file snapshot for the daemon's cross-thread reads.
             self.publishFileSnap();
+            // Update DHT node count for the source snapshot.
+            if (self.dht_instance) |*d| {
+                var node_count: u32 = 0;
+                for (&d.buckets) |*b| node_count += @intCast(b.items.len);
+                self.src_dht_nodes.store(node_count, .monotonic);
+            }
         }
 
         // Run choking algorithm
@@ -2082,6 +2134,13 @@ pub const Session = struct {
 
         self.tracker_interval = resp.interval;
         self.last_announce_time = std.time.timestamp();
+
+        // Publish source snapshot data for cross-thread reads.
+        self.src_tracker_state.store(1, .monotonic);
+        self.src_seeders.store(@intCast(resp.complete orelse 0), .monotonic);
+        self.src_leechers.store(@intCast(resp.incomplete orelse 0), .monotonic);
+        self.src_announce_interval_s.store(@intCast(resp.interval), .monotonic);
+        self.src_last_announce_s.store(self.last_announce_time, .monotonic);
 
         const stderr = std.fs.File.stderr().deprecatedWriter();
         stderr.print("tracker: {d} peers", .{resp.peers.len}) catch {};

@@ -234,6 +234,7 @@ daemon does not read client frames; closing the socket ends the push.
   "ratio": <float>|null, "onion": "<addr>"|null,
   "fileRows": [FileEntry],
   "peerRows": [Peer]
+  "sourceRows": [Source]
 }
 ```
 
@@ -257,6 +258,11 @@ These are part of the contract but return empty / derived values until later PRs
   `maintenance`), surfaced as `Transfer.fileRows` and `Transfer.peerRows` in
   `GET /api/state` and the WebSocket push. The piece heatmap remains a
   follow-up.
+- **Per-transfer detail tabs** — `Source` rows are now wired: the session
+  publishes tracker seeders/leechers, DHT node count, and announce interval via
+  atomics in the Progress snapshot, surfaced as `Transfer.sourceRows` in
+  `GET /api/state` and the WebSocket push. `Peer` rows, the piece heatmap, and
+  per-file progress remain follow-ups.
 - **"Seed a file" creation flow** — creating a torrent from a local file and Tor
   hidden-service generation. `seeds()` currently reflects transfers that have
   reached the seeding state.

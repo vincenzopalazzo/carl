@@ -34,6 +34,7 @@ export interface Transfer {
   onion: string | null;
   fileRows: FileEntry[];
   peerRows: Peer[];
+  sourceRows: Source[];
 }
 
 /** One peer in a transfer's Peers detail tab. */
@@ -54,6 +55,15 @@ export interface FileEntry {
   size: number;
   pct: number;
   prio: "normal" | "high" | "skip";
+}
+
+/** One source row in the Sources detail tab (tracker / DHT / Nostr). */
+export interface Source {
+  kind: SourceKind;
+  label: string;
+  state: string;
+  detail: string;
+  interval: string;
 }
 
 export interface Relay {
