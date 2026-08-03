@@ -808,6 +808,13 @@ pub const Session = struct {
                         p.state = .active;
                         p.supports_extensions = extension.supportsExtensions(hs.reserved);
 
+                        // BEP 3: send a bitfield as the FIRST message after the
+                        // handshake (before extension handshake) — strict peers
+                        // reject or stall on a delayed bitfield.
+                        if (self.num_pieces > 0) {
+                            p.enqueueMessage(.{ .bitfield = self.our_bitfield.rawBytes() }) catch {};
+                        }
+
                         // Send BEP 10 extension handshake if peer supports it
                         if (p.supports_extensions) {
                             const ms = if (self.meta.raw_info.len > 0)
@@ -821,8 +828,7 @@ pub const Session = struct {
                             }
                         }
 
-                        // BEP 3: send a bitfield right after the handshake — even
-                        // all-zero for a fresh leecher. Some strict clients stall
+                        // Some strict clients stall
                         // (never unchoke) waiting for a bitfield that never comes.
                         if (self.num_pieces > 0) {
                             p.enqueueMessage(.{ .bitfield = self.our_bitfield.rawBytes() }) catch {};
@@ -1373,11 +1379,11 @@ pub const Session = struct {
                 p.peer_bitfield = piece_mod.Bitfield.fromRaw(self.allocator, raw, self.num_pieces) catch null;
                 if (p.peer_bitfield) |*bf| self.addAvailability(bf);
             }
-            // Peers that connected during the metadata phase never received our
-            // bitfield (we had no piece count yet) and may not have registered our
-            // interest. Send our (all-zero) bitfield and re-express interest so
-            // they unchoke us for the data phase.
-            p.enqueueMessage(.{ .bitfield = self.our_bitfield.rawBytes() }) catch {};
+            // Peers that connected during the metadata phase never registered our
+            // interest. Re-express interest so they unchoke us for the data phase.
+            // Do NOT send a bitfield here — BEP 3 requires it only immediately
+            // after the handshake; a delayed bitfield can cause strict peers to
+            // reject the connection.
             p.am_interested = true;
             p.enqueueMessage(.interested) catch {};
         }
@@ -1536,7 +1542,20 @@ pub const Session = struct {
                 // have max_concurrent_pieces in progress. Concentrating blocks
                 // on fewer pieces lets them complete (verify + write + share)
                 // instead of spreading thin across dozens that never finish.
-                if (self.active_pieces.count() >= max_concurrent_pieces) continue;
+                // Override: if NO existing active piece is requestable by this
+                // peer (all supplied by disconnected peers), allow a new piece
+                // so the download doesn't stall.
+                if (self.active_pieces.count() >= max_concurrent_pieces) {
+                    var any_requestable = false;
+                    var it = self.active_pieces.iterator();
+                    while (it.next()) |entry| {
+                        if (p.hasPiece(entry.key_ptr.*) and entry.value_ptr.*.nextUnrequestedBlock() != null) {
+                            any_requestable = true;
+                            break;
+                        }
+                    }
+                    if (!any_requestable) continue;
+                }
             }
 
             const avail = if (idx < self.piece_availability.len) self.piece_availability[idx] else 0;
