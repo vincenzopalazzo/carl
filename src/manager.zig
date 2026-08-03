@@ -1401,6 +1401,9 @@ fn snapshotTransfer(mt: *ManagedTransfer, arena: Allocator, now: i64) Allocator.
             .onion = pi.onion,
         };
     }
+    // Per-source rows with real detail (tracker seed/leecher counts, DHT
+    // node count, announce interval) from the session's Progress snapshot.
+    const source_rows = try buildSourceRows(arena, p, mt, now);
 
     var eta_buf: [24]u8 = undefined;
     const remaining: u64 = if (p.total_length > 0 and pct < 100)
@@ -1439,6 +1442,7 @@ fn snapshotTransfer(mt: *ManagedTransfer, arena: Allocator, now: i64) Allocator.
         .onion = null,
         .file_rows = file_rows,
         .peer_rows = peer_rows,
+        .source_rows = source_rows,
     };
 }
 
@@ -1529,6 +1533,77 @@ pub fn deriveSources(
         },
     }
     return out[0..n];
+}
+
+/// Build `api.Source` rows from the session's Progress snapshot and the
+/// transfer's route config. Mirrors `deriveSources` for which sources appear,
+/// but enriches each row with real tracker/DHT/Nostr detail.
+fn buildSourceRows(
+    arena: Allocator,
+    p: session_mod.Session.Progress,
+    mt: *ManagedTransfer,
+    now_ms: i64,
+) Allocator.Error![]api.Source {
+    var rows: std.ArrayList(api.Source) = .empty;
+    const now_s = @divTrunc(now_ms, 1000);
+
+    var src_buf: [3]api.SourceKind = undefined;
+    const kinds = deriveSources(&src_buf, mt.route, mt.has_tracker, mt.want_nostr);
+
+    for (kinds) |kind| {
+        switch (kind) {
+            .tracker => {
+                const label = if (p.tracker_url.len > 0) p.tracker_url else "tracker";
+                const state = if (p.tracker_state == 1) "working" else "connecting";
+                var detail_buf: [128]u8 = undefined;
+                const detail = if (p.tracker_state == 1)
+                    std.fmt.bufPrint(&detail_buf, "{d} seeds · {d} leechers", .{ p.seeders, p.leechers }) catch ""
+                else
+                    "";
+                var interval_buf: [24]u8 = undefined;
+                const interval: []const u8 = if (p.tracker_state == 1) blk: {
+                    const elapsed = now_s - p.last_announce_s;
+                    const remaining = p.announce_interval_s - elapsed;
+                    if (remaining > 60) {
+                        break :blk std.fmt.bufPrint(&interval_buf, "next in {d}m", .{@divTrunc(remaining, 60)}) catch "—";
+                    } else if (remaining > 0) {
+                        break :blk std.fmt.bufPrint(&interval_buf, "next in {d}s", .{remaining}) catch "—";
+                    }
+                    break :blk "due now";
+                } else "—";
+                try rows.append(arena, .{
+                    .kind = .tracker,
+                    .label = try arena.dupe(u8, label),
+                    .state = try arena.dupe(u8, state),
+                    .detail = try arena.dupe(u8, detail),
+                    .interval = try arena.dupe(u8, interval),
+                });
+            },
+            .dht => {
+                var detail_buf: [64]u8 = undefined;
+                const detail = if (p.dht_nodes > 0)
+                    std.fmt.bufPrint(&detail_buf, "{d} nodes", .{p.dht_nodes}) catch ""
+                else
+                    "bootstrapping…";
+                try rows.append(arena, .{
+                    .kind = .dht,
+                    .label = "Distributed Hash Table",
+                    .state = if (p.dht_nodes > 0) "working" else "connecting",
+                    .detail = try arena.dupe(u8, detail),
+                });
+            },
+            .nostr => {
+                try rows.append(arena, .{
+                    .kind = .nostr,
+                    .label = "Nostr peer-announce (NIP-35)",
+                    .state = "working",
+                    .detail = "peer-announce active",
+                });
+            },
+        }
+    }
+
+    return rows.toOwnedSlice(arena);
 }
 
 /// Format a human ETA into `buf`. Returns "—" when stalled/idle/complete.

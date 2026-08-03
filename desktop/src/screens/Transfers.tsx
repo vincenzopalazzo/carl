@@ -105,21 +105,32 @@ function DetailTabs({ t }: { t: Transfer }) {
 
         {tab === "sources" && (
           <div className="sources-tab">
-            {t.sources.map((kind, i) => (
-              <div className="source-row" key={i}>
-                <SourceChip kind={kind} />
-                <span className="src-label mono">{SOURCE_LABELS[kind]}</span>
-                <span className="src-detail dim" />
-                <span className="src-state">
-                  <span className="src-state-dot" /> active
-                </span>
-              </div>
-            ))}
+            {t.sourceRows.length > 0
+              ? t.sourceRows.map((s, i) => (
+                  <div className="source-row" key={i}>
+                    <SourceChip kind={s.kind} />
+                    <span className="src-label mono">{s.label}</span>
+                    <span className="src-detail dim">{s.detail}</span>
+                    <span className="src-state">
+                      <span className="src-state-dot" /> {s.interval}
+                    </span>
+                  </div>
+                ))
+              : t.sources.map((kind, i) => (
+                  <div className="source-row" key={i}>
+                    <SourceChip kind={kind} />
+                    <span className="src-label mono">{SOURCE_LABELS[kind]}</span>
+                    <span className="src-detail dim" />
+                    <span className="src-state">
+                      <span className="src-state-dot" /> active
+                    </span>
+                  </div>
+                ))}
             <div className="sources-note">
               Peers discovered across <strong>{t.sources.length}</strong>{" "}
               source{t.sources.length === 1 ? "" : "s"}. With a proxy or Tor
-              route set, UDP trackers and DHT are disabled — Nostr peer-announce
-              keeps working over the tunnel.
+              route set, UDP trackers and DHT are disabled — Nostr
+              peer-announce keeps working over the tunnel.
             </div>
           </div>
         )}

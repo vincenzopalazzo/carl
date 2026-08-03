@@ -103,6 +103,9 @@ pub const Transfer = struct {
     /// torrents until metadata resolves.
     file_rows: []const FileEntry = &.{},
     peer_rows: []const Peer = &.{},
+    /// Per-source rows for the Sources detail tab. Populated from the
+    /// session's Progress snapshot (tracker seeders/leechers, DHT node count).
+    source_rows: []const Source = &.{},
 };
 
 /// One peer in a transfer's Peers detail tab.
@@ -427,6 +430,10 @@ pub fn writeTransfer(j: *Json, t: Transfer) Allocator.Error!void {
     try j.key("peerRows");
     try j.beginArray();
     for (t.peer_rows) |pr| try writePeer(j, pr);
+    try j.endArray();
+    try j.key("sourceRows");
+    try j.beginArray();
+    for (t.source_rows) |sr| try writeSource(j, sr);
     try j.endArray();
     try j.endObject();
 }
