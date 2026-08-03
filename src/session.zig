@@ -497,20 +497,18 @@ pub const Session = struct {
                 name_len += cl;
             }
 
-            // Per-file completion from the bitfield.
+            // Per-file completion, weighted by byte overlap for boundary
+            // pieces (a file occupying 1 byte of a piece shouldn't count
+            // that piece as fully complete for this file).
             const fstart = self.store.file_map.file_starts[fi];
             const flen = self.store.file_map.file_lengths[fi];
-            const first_p: u32 = @intCast(fstart / self.piece_len);
-            const last_p: u32 = @intCast((fstart + flen -| 1) / self.piece_len);
-            const total: u32 = last_p - first_p + 1;
-            var have: u32 = 0;
-            for (first_p..last_p + 1) |p| {
-                if (self.our_bitfield.hasPiece(@intCast(p))) have += 1;
-            }
-            const pct: u8 = if (total > 0)
-                @intCast(@min(@as(u64, have) * 100 / total, 100))
-            else
-                0;
+            const pct: u8 = computeFilePct(
+                self.our_bitfield,
+                fstart,
+                flen,
+                self.piece_len,
+                self.num_pieces,
+            );
 
             snap[written] = .{
                 .name = self.allocator.dupe(u8, name_buf[0..name_len]) catch continue,
@@ -2208,6 +2206,33 @@ pub const Session = struct {
         }
     }
 };
+
+/// Compute per-file completion percentage, weighted by byte overlap for
+/// boundary pieces. Returns 100 for zero-length files (no pieces needed).
+fn computeFilePct(
+    bf: piece_mod.Bitfield,
+    fstart: u64,
+    flen: u64,
+    piece_len: u64,
+    num_pieces: u32,
+) u8 {
+    if (flen == 0) return 100;
+    const first_p: u32 = @intCast(fstart / piece_len);
+    const fend = fstart + flen;
+    const last_p_raw = (fend - 1) / piece_len;
+    const last_p: u32 = @intCast(@min(last_p_raw, @as(u64, num_pieces) -| 1));
+
+    var have_bytes: u64 = 0;
+    for (first_p..last_p + 1) |p_idx| {
+        if (!bf.hasPiece(@intCast(p_idx))) continue;
+        const piece_start = @as(u64, p_idx) * piece_len;
+        const piece_end = piece_start + piece_len;
+        const overlap_start = @max(piece_start, fstart);
+        const overlap_end = @min(piece_end, fend);
+        if (overlap_end > overlap_start) have_bytes += overlap_end - overlap_start;
+    }
+    return @intCast(@min(have_bytes * 100 / flen, 100));
+}
 
 test "sampleRate counts block bytes as progress before a piece verifies" {
     // Regression: on a slow link (single I2P peer) a piece can take far longer
