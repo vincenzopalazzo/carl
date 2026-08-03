@@ -33,6 +33,19 @@ export interface Transfer {
   ratio: number | null;
   onion: string | null;
   fileRows: FileEntry[];
+  peerRows: Peer[];
+}
+
+/** One peer in a transfer's Peers detail tab. */
+export interface Peer {
+  addr: string;
+  port: number;
+  client: string;
+  down: number;
+  up: number;
+  pct: number;
+  flags: string;
+  onion: boolean;
 }
 
 /** One file in a transfer's Files detail tab. */

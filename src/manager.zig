@@ -1386,6 +1386,22 @@ fn snapshotTransfer(mt: *ManagedTransfer, arena: Allocator, now: i64) Allocator.
         };
     }
 
+    // Per-peer rows from the session's published snapshot (1 Hz, race-safe).
+    const peer_infos = mt.session.peerSnapshot(arena) catch &.{};
+    const peer_rows = try arena.alloc(api.Peer, peer_infos.len);
+    for (peer_infos, 0..) |pi, i| {
+        peer_rows[i] = .{
+            .addr = pi.addr,
+            .port = pi.port,
+            .client = pi.client,
+            .down = pi.down,
+            .up = pi.up,
+            .pct = pi.pct,
+            .flags = pi.flags,
+            .onion = pi.onion,
+        };
+    }
+
     var eta_buf: [24]u8 = undefined;
     const remaining: u64 = if (p.total_length > 0 and pct < 100)
         p.total_length - (p.total_length * pct / 100)
@@ -1422,6 +1438,7 @@ fn snapshotTransfer(mt: *ManagedTransfer, arena: Allocator, now: i64) Allocator.
         .ratio = if (status == .seeding or status == .complete) ratio else null,
         .onion = null,
         .file_rows = file_rows,
+        .peer_rows = peer_rows,
     };
 }
 

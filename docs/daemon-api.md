@@ -232,7 +232,8 @@ daemon does not read client frames; closing the socket ends the push.
   // BEP 9 metadata bootstrap progress (magnet only); both 0 once metadata is in.
   "metaHave": <n>, "metaTotal": <n>,
   "ratio": <float>|null, "onion": "<addr>"|null,
-  "fileRows": [FileEntry]
+  "fileRows": [FileEntry],
+  "peerRows": [Peer]
 }
 ```
 
@@ -251,11 +252,11 @@ daemon does not read client frames; closing the socket ends the push.
 
 These are part of the contract but return empty / derived values until later PRs:
 
-- **Per-transfer detail tabs** — `FileEntry` rows are now wired: the session
-  publishes a per-file snapshot (1 Hz from `maintenance`) with name, size, and
-  per-file completion from the bitfield, surfaced as `Transfer.fileRows` in
-  `GET /api/state` and the WebSocket push. `Peer` rows and the piece heatmap
-  remain follow-ups.
+- **Per-transfer detail tabs** — `FileEntry` and `Peer` rows are now wired:
+  the session publishes per-file and per-peer snapshots (1 Hz from
+  `maintenance`), surfaced as `Transfer.fileRows` and `Transfer.peerRows` in
+  `GET /api/state` and the WebSocket push. The piece heatmap remains a
+  follow-up.
 - **"Seed a file" creation flow** — creating a torrent from a local file and Tor
   hidden-service generation. `seeds()` currently reflects transfers that have
   reached the seeding state.
