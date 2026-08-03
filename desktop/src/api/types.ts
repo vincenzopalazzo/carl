@@ -32,6 +32,15 @@ export interface Transfer {
   metaTotal: number;
   ratio: number | null;
   onion: string | null;
+  fileRows: FileEntry[];
+}
+
+/** One file in a transfer's Files detail tab. */
+export interface FileEntry {
+  name: string;
+  size: number;
+  pct: number;
+  prio: "normal" | "high" | "skip";
 }
 
 export interface Relay {

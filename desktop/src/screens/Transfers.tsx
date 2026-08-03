@@ -134,12 +134,44 @@ function DetailTabs({ t }: { t: Transfer }) {
           </div>
         )}
 
-        {tab === "files" && (
-          <div className="sources-note">
-            The per-file list isn't exposed by the daemon yet. Total size:{" "}
-            <span className="mono">{fmtBytes(t.size)}</span>.
-          </div>
-        )}
+        {tab === "files" &&
+          (t.fileRows.length > 0 ? (
+            <table className="files-table">
+              <thead>
+                <tr>
+                  <th>File</th>
+                  <th className="num">Size</th>
+                  <th className="num">Done</th>
+                  <th>Priority</th>
+                </tr>
+              </thead>
+              <tbody>
+                {t.fileRows.map((f, i) => (
+                  <tr key={i}>
+                    <td className="file-name">
+                      <Icon
+                        name="file"
+                        size={14}
+                        style={{ color: "var(--fg-faint)" }}
+                      />
+                      <span className="mono">{f.name}</span>
+                    </td>
+                    <td className="num mono">{fmtBytes(f.size)}</td>
+                    <td className="num">{f.pct}%</td>
+                    <td>
+                      <span className={"prio prio-" + f.prio}>{f.prio}</span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <div className="sources-note">
+              {t.size != null
+                ? `Total size: ${fmtBytes(t.size)}.`
+                : "No file info yet."}
+            </div>
+          ))}
 
         <div style={{ marginTop: 14 }}>
           <CopyField value={t.magnet || `magnet:?xt=urn:btih:${t.hash}`} full />

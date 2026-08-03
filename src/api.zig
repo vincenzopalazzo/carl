@@ -98,6 +98,10 @@ pub const Transfer = struct {
     ratio: ?f64 = null,
     /// .onion address when seeding as a hidden service; null otherwise.
     onion: ?[]const u8 = null,
+    /// Per-file rows for the Files detail tab. Populated from the session's
+    /// published file snapshot (1 Hz from maintenance). Empty for magnet
+    /// torrents until metadata resolves.
+    file_rows: []const FileEntry = &.{},
 };
 
 /// One peer in a transfer's Peers detail tab.
@@ -415,6 +419,10 @@ pub fn writeTransfer(j: *Json, t: Transfer) Allocator.Error!void {
     if (t.ratio) |r| try j.float(r) else try j.nullValue();
     try j.key("onion");
     if (t.onion) |o| try j.string(o) else try j.nullValue();
+    try j.key("fileRows");
+    try j.beginArray();
+    for (t.file_rows) |fr| try writeFileEntry(j, fr);
+    try j.endArray();
     try j.endObject();
 }
 

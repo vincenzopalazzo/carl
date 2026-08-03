@@ -154,6 +154,13 @@ pub const Session = struct {
     // pieces flaps the status between downloading and stalled.
     block_bytes_in: u64 = 0,
 
+    /// Guards the published per-file snapshot. Written by the session thread
+    /// in `maintenance` (1 Hz), read by `fileSnapshot` from the daemon thread.
+    file_snap_mutex: std.Thread.Mutex = .{},
+    /// Published per-file snapshot, or null before metadata is in. Owned by
+    /// the session; freed before each re-publish and in `deinit`.
+    file_snap: ?[]FileSnap = null,
+
     // Choking state
     last_unchoke_time: i64,
     last_optimistic_time: i64,
@@ -357,6 +364,7 @@ pub const Session = struct {
         if (self.metadata_download) |*md| md.deinit();
         if (self.listener) |*l| l.deinit();
         if (self.torrent_blob) |b| self.allocator.free(b);
+        self.freeFileSnapSlice(self.file_snap);
         self.allocator.free(self.output_dir);
         self.our_bitfield.deinit(self.allocator);
         self.store.deinit();
@@ -388,6 +396,14 @@ pub const Session = struct {
         /// Seconds since the last byte of real progress arrived. Lets the snapshot
         /// distinguish active "downloading" from "stalled" without a delta.
         idle_secs: i64,
+    };
+
+    /// One file's summary, published by the session thread for cross-thread
+    /// reads (the daemon's per-tick snapshot). Owned by `file_snap`.
+    pub const FileSnap = struct {
+        name: []u8,
+        size: u64,
+        pct: u8,
     };
 
     /// A copy of the resolved `.torrent` bytes, or null if metadata isn't in
@@ -424,6 +440,89 @@ pub const Session = struct {
             .meta_total = self.meta_total.load(.monotonic),
             .idle_secs = @max(0, std.time.timestamp() - last_prog),
         };
+    }
+
+    // ---- Per-file snapshot (published for cross-thread reads) ----
+
+    fn freeFileSnapSlice(self: *Session, snap: ?[]FileSnap) void {
+        if (snap) |s| {
+            for (s) |f| self.allocator.free(f.name);
+            self.allocator.free(s);
+        }
+    }
+
+    /// Copy the session's published per-file snapshot for cross-thread reads.
+    pub fn fileSnapshot(self: *Session, a: Allocator) Allocator.Error![]FileSnap {
+        self.file_snap_mutex.lock();
+        defer self.file_snap_mutex.unlock();
+        const snap = self.file_snap orelse return try a.alloc(FileSnap, 0);
+        const out = try a.alloc(FileSnap, snap.len);
+        for (snap, 0..) |f, i| {
+            out[i] = .{
+                .name = try a.dupe(u8, f.name),
+                .size = f.size,
+                .pct = f.pct,
+            };
+        }
+        return out;
+    }
+
+    /// Build and publish a per-file snapshot from `meta.files` + the bitfield.
+    /// Called from `maintenance` (1 Hz). For magnet torrents this is empty
+    /// until metadata resolves, then picks up the real file list.
+    fn publishFileSnap(self: *Session) void {
+        const count = self.meta.files.len;
+        if (count == 0 or self.piece_len == 0) {
+            self.file_snap_mutex.lock();
+            const old = self.file_snap;
+            self.file_snap = null;
+            self.file_snap_mutex.unlock();
+            self.freeFileSnapSlice(old);
+            return;
+        }
+
+        const snap = self.allocator.alloc(FileSnap, count) catch return;
+        var written: usize = 0;
+        for (self.meta.files, 0..) |file, fi| {
+            // Join path components with "/".
+            var name_buf: [1024]u8 = undefined;
+            var name_len: usize = 0;
+            for (file.path) |comp| {
+                if (name_len > 0 and name_len < name_buf.len) {
+                    name_buf[name_len] = '/';
+                    name_len += 1;
+                }
+                const cl = @min(comp.len, name_buf.len - name_len);
+                @memcpy(name_buf[name_len..][0..cl], comp[0..cl]);
+                name_len += cl;
+            }
+
+            // Per-file completion, weighted by byte overlap for boundary
+            // pieces (a file occupying 1 byte of a piece shouldn't count
+            // that piece as fully complete for this file).
+            const fstart = self.store.file_map.file_starts[fi];
+            const flen = self.store.file_map.file_lengths[fi];
+            const pct: u8 = computeFilePct(
+                self.our_bitfield,
+                fstart,
+                flen,
+                self.piece_len,
+                self.num_pieces,
+            );
+
+            snap[written] = .{
+                .name = self.allocator.dupe(u8, name_buf[0..name_len]) catch continue,
+                .size = file.length,
+                .pct = pct,
+            };
+            written += 1;
+        }
+
+        self.file_snap_mutex.lock();
+        const old = self.file_snap;
+        self.file_snap = snap[0..written];
+        self.file_snap_mutex.unlock();
+        self.freeFileSnapSlice(old);
     }
 
     /// Resample the download/upload rate. Called once per second from the
@@ -1576,6 +1675,8 @@ pub const Session = struct {
                 p.updatePipelineLimit(peer_dt);
                 self.expireStaleRequests(p, now);
             }
+            // Publish per-file snapshot for the daemon's cross-thread reads.
+            self.publishFileSnap();
         }
 
         // Run choking algorithm
@@ -2105,6 +2206,33 @@ pub const Session = struct {
         }
     }
 };
+
+/// Compute per-file completion percentage, weighted by byte overlap for
+/// boundary pieces. Returns 100 for zero-length files (no pieces needed).
+fn computeFilePct(
+    bf: piece_mod.Bitfield,
+    fstart: u64,
+    flen: u64,
+    piece_len: u64,
+    num_pieces: u32,
+) u8 {
+    if (flen == 0) return 100;
+    const first_p: u32 = @intCast(fstart / piece_len);
+    const fend = fstart + flen;
+    const last_p_raw = (fend - 1) / piece_len;
+    const last_p: u32 = @intCast(@min(last_p_raw, @as(u64, num_pieces) -| 1));
+
+    var have_bytes: u64 = 0;
+    for (first_p..last_p + 1) |p_idx| {
+        if (!bf.hasPiece(@intCast(p_idx))) continue;
+        const piece_start = @as(u64, p_idx) * piece_len;
+        const piece_end = piece_start + piece_len;
+        const overlap_start = @max(piece_start, fstart);
+        const overlap_end = @min(piece_end, fend);
+        if (overlap_end > overlap_start) have_bytes += overlap_end - overlap_start;
+    }
+    return @intCast(@min(have_bytes * 100 / flen, 100));
+}
 
 test "sampleRate counts block bytes as progress before a piece verifies" {
     // Regression: on a slow link (single I2P peer) a piece can take far longer
