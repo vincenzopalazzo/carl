@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Icon } from "../components/icons";
+import { Icon, OnionIcon } from "../components/icons";
 import {
   RouteBadge,
   StatusPill,
@@ -8,7 +8,7 @@ import {
   CopyField,
   SourceChip,
 } from "../components/atoms";
-import { fmtBytes, fmtSpeed } from "../components/format";
+import { fmtBytes, fmtSpeed, trunc } from "../components/format";
 import { useCarl } from "../api/store";
 import type { SourceKind, Status, Transfer } from "../api/types";
 
@@ -124,15 +124,51 @@ function DetailTabs({ t }: { t: Transfer }) {
           </div>
         )}
 
-        {tab === "peers" && (
-          <div className="sources-note">
-            {t.peers} peer{t.peers === 1 ? "" : "s"} connected. Per-peer rows
-            (address, client, rates, <span className="mono">.onion</span> flag)
-            aren't exposed by the daemon yet — that needs a session-published
-            snapshot (tracked in <span className="mono">docs/daemon-api.md</span>
-            ).
-          </div>
-        )}
+        {tab === "peers" &&
+          (t.peerRows.length > 0 ? (
+            <table className="peers-table">
+              <thead>
+                <tr>
+                  <th>Address</th>
+                  <th>Client</th>
+                  <th className="num">Done</th>
+                  <th className="num">{"\u2193"} Down</th>
+                  <th className="num">{"\u2191"} Up</th>
+                  <th>Flags</th>
+                </tr>
+              </thead>
+              <tbody>
+                {t.peerRows.map((p, i) => (
+                  <tr key={i} className={p.onion ? "peer-onion" : ""}>
+                    <td className="mono peer-addr">
+                      {p.onion && (
+                        <span className="onion-tag">
+                          <OnionIcon size={11} />
+                        </span>
+                      )}
+                      <span className="peer-addr-txt">
+                        {p.onion ? trunc(p.addr, 10) : p.addr}
+                        {p.port ? ":" + p.port : ""}
+                      </span>
+                    </td>
+                    <td className="mono dim">{p.client}</td>
+                    <td className="num">{p.pct}%</td>
+                    <td className="num mono">
+                      {p.down ? fmtSpeed(p.down) : "—"}
+                    </td>
+                    <td className="num mono">{p.up ? fmtSpeed(p.up) : "—"}</td>
+                    <td className="mono dim peer-flags">{p.flags}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <div className="sources-note">
+              {t.peers > 0
+                ? `${t.peers} peer${t.peers === 1 ? "" : "s"} connecting…`
+                : "No peers connected."}
+            </div>
+          ))}
 
         {tab === "files" &&
           (t.fileRows.length > 0 ? (

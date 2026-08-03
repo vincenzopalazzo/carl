@@ -67,6 +67,7 @@ pub const PeerConnection = struct {
     /// Owned by the connection. Defaulted so struct literals can omit it.
     raw_bitfield: ?[]u8 = null,
     peer_id: ?[20]u8,
+    client_name: ?[]u8 = null,
 
     // BEP 10 extension state
     supports_extensions: bool,
@@ -92,6 +93,8 @@ pub const PeerConnection = struct {
     /// last sample, both owned by `updatePipelineLimit`.
     down_rate: u64 = 0,
     rate_last_bytes: u64 = 0,
+    up_rate: u64 = 0,
+    rate_last_up_bytes: u64 = 0,
 
     // Stats for choking algorithm
     bytes_downloaded: u64,
@@ -176,6 +179,7 @@ pub const PeerConnection = struct {
     pub fn deinit(self: *PeerConnection) void {
         if (self.stream) |s| s.close();
         if (self.connect_host) |h| self.allocator.free(h);
+        if (self.client_name) |n| self.allocator.free(n);
         if (self.peer_bitfield) |*bf| bf.deinit(self.allocator);
         if (self.raw_bitfield) |rb| self.allocator.free(rb);
         self.recv_buf.deinit(self.allocator);
@@ -609,6 +613,11 @@ pub const PeerConnection = struct {
         self.rate_last_bytes = self.bytes_downloaded;
         const inst = delta / @as(u64, @intCast(dt));
         self.down_rate = (self.down_rate * 3 + inst) / 4;
+
+        const up_delta = self.bytes_uploaded -| self.rate_last_up_bytes;
+        self.rate_last_up_bytes = self.bytes_uploaded;
+        const up_inst = up_delta / @as(u64, @intCast(dt));
+        self.up_rate = (self.up_rate * 3 + up_inst) / 4;
 
         const target = self.down_rate * pipeline_queue_secs / piece_mod.block_size;
         self.pipeline_limit = @intCast(std.math.clamp(target, min_pipeline, max_pipeline));

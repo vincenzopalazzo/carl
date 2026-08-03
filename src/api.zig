@@ -102,6 +102,7 @@ pub const Transfer = struct {
     /// published file snapshot (1 Hz from maintenance). Empty for magnet
     /// torrents until metadata resolves.
     file_rows: []const FileEntry = &.{},
+    peer_rows: []const Peer = &.{},
 };
 
 /// One peer in a transfer's Peers detail tab.
@@ -422,6 +423,10 @@ pub fn writeTransfer(j: *Json, t: Transfer) Allocator.Error!void {
     try j.key("fileRows");
     try j.beginArray();
     for (t.file_rows) |fr| try writeFileEntry(j, fr);
+    try j.endArray();
+    try j.key("peerRows");
+    try j.beginArray();
+    for (t.peer_rows) |pr| try writePeer(j, pr);
     try j.endArray();
     try j.endObject();
 }

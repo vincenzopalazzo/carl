@@ -177,6 +177,8 @@ pub const Session = struct {
     /// Published per-file snapshot, or null before metadata is in. Owned by
     /// the session; freed before each re-publish and in `deinit`.
     file_snap: ?[]FileSnap = null,
+    peer_snap_mutex: std.Thread.Mutex = .{},
+    peer_snap: ?[]PeerInfo = null,
 
     // Choking state
     last_unchoke_time: i64,
@@ -383,6 +385,7 @@ pub const Session = struct {
         if (self.listener) |*l| l.deinit();
         if (self.torrent_blob) |b| self.allocator.free(b);
         self.freeFileSnapSlice(self.file_snap);
+        self.freePeerSnapSlice(self.peer_snap);
         self.allocator.free(self.output_dir);
         self.our_bitfield.deinit(self.allocator);
         self.store.deinit();
@@ -422,6 +425,17 @@ pub const Session = struct {
         name: []u8,
         size: u64,
         pct: u8,
+    };
+
+    pub const PeerInfo = struct {
+        addr: []u8,
+        port: u16,
+        client: []u8,
+        down: u64,
+        up: u64,
+        pct: u8,
+        flags: []u8,
+        onion: bool,
     };
 
     /// A copy of the resolved `.torrent` bytes, or null if metadata isn't in
@@ -541,6 +555,118 @@ pub const Session = struct {
         self.file_snap = snap[0..written];
         self.file_snap_mutex.unlock();
         self.freeFileSnapSlice(old);
+    }
+
+    // ---- Per-peer snapshot (published for cross-thread reads) ----
+
+    fn freePeerSnapSlice(self: *Session, snap: ?[]PeerInfo) void {
+        if (snap) |s| {
+            for (s) |p| {
+                self.allocator.free(p.addr);
+                self.allocator.free(p.client);
+                self.allocator.free(p.flags);
+            }
+            self.allocator.free(s);
+        }
+    }
+
+    pub fn peerSnapshot(self: *Session, a: Allocator) Allocator.Error![]PeerInfo {
+        self.peer_snap_mutex.lock();
+        defer self.peer_snap_mutex.unlock();
+        const snap = self.peer_snap orelse return try a.alloc(PeerInfo, 0);
+        const out = try a.alloc(PeerInfo, snap.len);
+        for (snap, 0..) |p, i| {
+            out[i] = .{
+                .addr = try a.dupe(u8, p.addr),
+                .client = try a.dupe(u8, p.client),
+                .flags = try a.dupe(u8, p.flags),
+                .port = p.port,
+                .down = p.down,
+                .up = p.up,
+                .pct = p.pct,
+                .onion = p.onion,
+            };
+        }
+        return out;
+    }
+
+    fn publishPeerSnap(self: *Session) void {
+        const count = self.peers.items.len;
+        if (count == 0) {
+            self.peer_snap_mutex.lock();
+            const old = self.peer_snap;
+            self.peer_snap = null;
+            self.peer_snap_mutex.unlock();
+            self.freePeerSnapSlice(old);
+            return;
+        }
+
+        const snap = self.allocator.alloc(PeerInfo, count) catch return;
+        var written: usize = 0;
+        for (self.peers.items) |p| {
+            if (p.state == .disconnected) continue;
+            snap[written] = self.buildPeerInfo(p) catch continue;
+            written += 1;
+        }
+
+        const published = self.allocator.realloc(snap, written) catch snap[0..written];
+        self.peer_snap_mutex.lock();
+        const old = self.peer_snap;
+        self.peer_snap = published;
+        self.peer_snap_mutex.unlock();
+        self.freePeerSnapSlice(old);
+    }
+
+    fn buildPeerInfo(self: *Session, p: *peer_mod.PeerConnection) Allocator.Error!PeerInfo {
+        var addr_owned: []u8 = undefined;
+        var port: u16 = 0;
+        var is_onion = false;
+
+        if (p.connect_host) |host| {
+            if (std.mem.endsWith(u8, host, ".onion")) {
+                is_onion = true;
+                addr_owned = try self.allocator.dupe(u8, host);
+                port = p.address.getPort();
+            } else {
+                addr_owned = try self.allocator.dupe(u8, host);
+                port = p.address.getPort();
+            }
+        } else {
+            const ip: *const [4]u8 = @ptrCast(&p.address.in.sa.addr);
+            var buf: [32]u8 = undefined;
+            const formatted = std.fmt.bufPrint(&buf, "{d}.{d}.{d}.{d}", .{
+                ip[0], ip[1], ip[2], ip[3],
+            }) catch unreachable;
+            addr_owned = try self.allocator.dupe(u8, formatted);
+            port = p.address.getPort();
+        }
+
+        var client_buf: [64]u8 = undefined;
+        const client_src: []const u8 = if (p.client_name) |name|
+            if (std.unicode.utf8ValidateSlice(name)) name else "unknown"
+        else
+            decodeClientName(&client_buf, p.peer_id);
+        const client_owned = try self.allocator.dupe(u8, client_src);
+
+        const peer_pct: u8 = if (p.peer_bitfield) |bf| blk: {
+            if (self.num_pieces == 0) break :blk 0;
+            const pct = @as(u64, bf.count()) * 100 / self.num_pieces;
+            break :blk @intCast(@min(pct, 100));
+        } else 0;
+
+        var flags_buf: [4]u8 = undefined;
+        const flags_owned = try self.allocator.dupe(u8, peerFlags(&flags_buf, p));
+
+        return .{
+            .addr = addr_owned,
+            .port = port,
+            .client = client_owned,
+            .down = p.down_rate,
+            .up = p.up_rate,
+            .pct = peer_pct,
+            .flags = flags_owned,
+            .onion = is_onion,
+        };
     }
 
     /// Resample the download/upload rate. Called once per second from the
@@ -2342,6 +2468,39 @@ pub const Session = struct {
         }
     }
 };
+
+// ---- Per-peer snapshot helpers ----
+
+fn peerFlags(buf: []u8, p: *peer_mod.PeerConnection) []const u8 {
+    var len: usize = 0;
+    if (p.am_interested) {
+        buf[len] = if (!p.peer_choking) 'D' else 'd';
+        len += 1;
+    }
+    if (p.peer_interested) {
+        buf[len] = if (!p.am_choking) 'U' else 'u';
+        len += 1;
+    }
+    if (p.supports_extensions) {
+        buf[len] = 'E';
+        len += 1;
+    }
+    return buf[0..len];
+}
+
+fn decodeClientName(buf: []u8, peer_id: ?[20]u8) []const u8 {
+    const id = peer_id orelse return "unknown";
+    if (id[0] == '-' and id[7] == '-') {
+        const name = clientNameFromCode(id[1..3]);
+        const v = id[3..7];
+        return std.fmt.bufPrint(buf, "{s} {c}.{c}.{c}", .{ name, v[0], v[1], v[2] }) catch name;
+    }
+    return "unknown";
+}
+
+fn clientNameFromCode(code: []const u8) []const u8 {
+    return if (std.mem.eql(u8, code, "TR")) "Transmission" else if (std.mem.eql(u8, code, "qB")) "qBittorrent" else if (std.mem.eql(u8, code, "UT") or std.mem.eql(u8, code, "UM")) "µTorrent" else if (std.mem.eql(u8, code, "DE")) "Deluge" else if (std.mem.eql(u8, code, "AZ")) "Azureus" else if (std.mem.eql(u8, code, "LT") or std.mem.eql(u8, code, "lt")) "libtorrent" else if (std.mem.eql(u8, code, "BT")) "BitTorrent" else if (std.mem.eql(u8, code, "CA")) "carl" else if (std.mem.eql(u8, code, "BC")) "BitComet" else if (std.mem.eql(u8, code, "FL")) "Folx" else if (std.mem.eql(u8, code, "SZ")) "Shareaza" else if (std.mem.eql(u8, code, "TL")) "Tribler" else if (std.mem.eql(u8, code, "XL") or std.mem.eql(u8, code, "XD")) "Xunlei" else "unknown";
+}
 
 /// Compute per-file completion percentage, weighted by byte overlap for
 /// boundary pieces. Returns 100 for zero-length files (no pieces needed).
