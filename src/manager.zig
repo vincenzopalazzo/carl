@@ -1375,6 +1375,17 @@ fn snapshotTransfer(mt: *ManagedTransfer, arena: Allocator, now: i64) Allocator.
     const src = deriveSources(&src_buf, mt.route, mt.has_tracker, mt.want_nostr);
     const sources = try arena.dupe(api.SourceKind, src);
 
+    // Per-file rows from the session's published file snapshot.
+    const file_infos = mt.session.fileSnapshot(arena) catch &.{};
+    const file_rows = try arena.alloc(api.FileEntry, file_infos.len);
+    for (file_infos, 0..) |fi, i| {
+        file_rows[i] = .{
+            .name = fi.name,
+            .size = fi.size,
+            .pct = fi.pct,
+        };
+    }
+
     var eta_buf: [24]u8 = undefined;
     const remaining: u64 = if (p.total_length > 0 and pct < 100)
         p.total_length - (p.total_length * pct / 100)
@@ -1410,6 +1421,7 @@ fn snapshotTransfer(mt: *ManagedTransfer, arena: Allocator, now: i64) Allocator.
         .meta_total = p.meta_total,
         .ratio = if (status == .seeding or status == .complete) ratio else null,
         .onion = null,
+        .file_rows = file_rows,
     };
 }
 
