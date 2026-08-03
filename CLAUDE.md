@@ -13,6 +13,17 @@
 - BIP-340 (Schnorr): https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki
 - RFC 6455 (WebSocket): https://datatracker.ietf.org/doc/html/rfc6455
 
+## Reference implementation
+
+qBittorrent (https://github.com/qbittorrent/qBittorrent) is the reference
+implementation for client behavior. Its transfer engine is libtorrent-rasterbar
+(https://github.com/arvidn/libtorrent), so engine-level behavior — peer
+management, connection limits, request pipelining, choking/unchoking, piece
+picking, tracker/DHT retry policy — should be checked against libtorrent's
+implementation and defaults; UI/UX conventions against qBittorrent itself.
+When tuning constants (timeouts, backoff schedules, queue depths, peer caps),
+prefer values justified by what libtorrent/qBittorrent ships over invented ones.
+
 ## Build
 
 - Language: Zig 0.15
