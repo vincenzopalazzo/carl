@@ -82,6 +82,14 @@ pub const FileMap = struct {
     }
 };
 
+/// Size and last-modification time of one payload file. The resume record
+/// stamps every file with this and refuses to be believed unless both still
+/// match, so it lives here — next to the handles it is taken from.
+pub const FileStat = struct {
+    size: u64,
+    mtime_ns: i128,
+};
+
 /// Manages open file handles and performs positioned reads/writes.
 pub const Storage = struct {
     allocator: Allocator,
@@ -178,7 +186,16 @@ pub const Storage = struct {
                 // on the error path — Session.init failures don't kill the
                 // daemon, so leaked fds would accumulate.
                 opened += 1;
-                handles[i].setEndPos(file_info.length) catch return error.WriteFailed;
+                // Only resize when the file isn't already the right length.
+                // Truncating a file to the size it already has is a no-op that
+                // still bumps its mtime on some filesystems, and the resume
+                // record keys on mtime — a pointless ftruncate here would
+                // invalidate every saved bitfield and force a full re-hash on
+                // every single start.
+                const cur_len = handles[i].getEndPos() catch 0;
+                if (cur_len != file_info.length) {
+                    handles[i].setEndPos(file_info.length) catch return error.WriteFailed;
+                }
             } else {
                 // Seeding only reads: a read-only handle leaves the file free
                 // for other programs (no write lock on data we never modify).
@@ -231,6 +248,26 @@ pub const Storage = struct {
             h.* = ro;
         }
         self.read_only = true;
+    }
+
+    /// Size + mtime of payload file `index`, via `fstat` on the handle pieces
+    /// are actually read through. Deliberately not a path lookup: the resume
+    /// record's whole job is to prove the bytes we will read are the bytes we
+    /// hashed, and a path stat could describe a different file than the open
+    /// descriptor does.
+    pub fn statFile(self: *Storage, index: u32) IoError!FileStat {
+        if (self.files_closed or index >= self.handles.len) return error.ReadFailed;
+        const st = self.handles[index].stat() catch return error.ReadFailed;
+        return .{ .size = st.size, .mtime_ns = st.mtime };
+    }
+
+    /// Flush every payload file to stable storage, best-effort. Called before
+    /// the resume record is written so a power cut can never leave a record
+    /// vouching for pieces whose bytes were still only in the page cache.
+    /// A read-only store never wrote anything, so there is nothing to flush.
+    pub fn syncAll(self: *Storage) void {
+        if (self.files_closed or self.read_only) return;
+        for (self.handles) |h| h.sync() catch {};
     }
 
     /// Write a verified piece to disk.
