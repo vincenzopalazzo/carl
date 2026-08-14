@@ -79,7 +79,6 @@ pub const DecodeError = error{
     UnexpectedEnd,
     InvalidInteger,
     InvalidStringLength,
-    UnsortedDictKeys,
     DuplicateDictKey,
     LeadingZero,
     NegativeZero,
@@ -221,10 +220,13 @@ fn decodeDict(allocator: Allocator, input: []const u8, pos: *usize) DecodeError!
         if (last_key) |prev| {
             const ord = std.mem.order(u8, prev, key);
             switch (ord) {
-                .gt => {
-                    allocator.free(key);
-                    return error.UnsortedDictKeys;
-                },
+                // Unsorted keys are accepted: BEP 3 recommends alphabetical order
+                // for encoding, but real-world trackers and peers emit dicts in
+                // arbitrary order and every major client parses them. Rejecting
+                // them here made carl fail announces against trackers that
+                // work with Transmission/libtorrent (seen in loopback sims:
+                // interval-before-complete => error.InvalidResponse).
+                .gt => {},
                 .eq => {
                     allocator.free(key);
                     return error.DuplicateDictKey;
@@ -398,9 +400,30 @@ test "decode nested dict with list" {
     try std.testing.expectEqualStrings("b", items[1].string);
 }
 
-test "reject unsorted dict keys" {
+test "accept unsorted dict keys (real-world trackers emit them)" {
     const allocator = std.testing.allocator;
-    try std.testing.expectError(error.UnsortedDictKeys, decode(allocator, "d4:spam4:eggs3:cow3:mooe"));
+    const v = try decode(allocator, "d4:spam4:eggs3:cow3:mooe");
+    defer v.deinit(allocator);
+    try std.testing.expectEqualStrings("eggs", v.dictGet("spam").?.string);
+    try std.testing.expectEqualStrings("moo", v.dictGet("cow").?.string);
+}
+
+test "parse unsorted tracker announce response" {
+    const allocator = std.testing.allocator;
+    // interval first, complete/incomplete before peers — the exact ordering
+    // that used to fail every announce with error.InvalidResponse.
+    var body: [64]u8 = undefined;
+    const peer = "\x7f\x00\x00\x01\x44\x49"; // 127.0.0.1:17481
+    const prefix = "d8:intervali30e8:completei1e10:incompletei0e5:peers6:";
+    @memcpy(body[0..prefix.len], prefix);
+    @memcpy(body[prefix.len .. prefix.len + 6], peer);
+    body[prefix.len + 6] = 'e';
+    const v = try decode(allocator, body[0 .. prefix.len + 7]);
+    defer v.deinit(allocator);
+    try std.testing.expectEqual(@as(i64, 30), v.dictGet("interval").?.asInt().?);
+    try std.testing.expectEqual(@as(i64, 1), v.dictGet("complete").?.asInt().?);
+    const peers = v.dictGet("peers").?.string;
+    try std.testing.expectEqual(@as(usize, 6), peers.len);
 }
 
 test "reject duplicate dict keys" {
