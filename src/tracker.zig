@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const bencode = @import("bencode.zig");
 const proxy_mod = @import("proxy.zig");
+const udp_tracker = @import("udp_tracker.zig");
 
 const log = std.log.scoped(.tracker);
 
@@ -193,6 +194,42 @@ pub fn parseAnnounceResponse(
 /// Perform an HTTP tracker announce. Returns the parsed response. When `proxy`
 /// is set, the announce is tunneled through it (fail-closed: no direct request).
 pub fn announce(
+    allocator: Allocator,
+    announce_url: []const u8,
+    req: AnnounceRequest,
+    proxy: ?proxy_mod.Proxy,
+) TrackerError!AnnounceResponse {
+    // BEP 15: udp:// announce URLs go to the UDP tracker client. UDP cannot be
+    // tunneled through SOCKS/HTTP proxies, so with a proxy set we rewrite
+    // udp://host:port → http://host:port/announce (most public trackers serve
+    // both protocols on the same port) and tunnel that — the same fail-closed
+    // strategy Session.tryAnnounceUrl applies to session announces. This used
+    // to be session-only: `carl announce` (CLI) sent udp:// URLs down the HTTP
+    // path and failed with error.HttpError.
+    if (std.mem.startsWith(u8, announce_url, "udp://")) {
+        if (proxy != null) {
+            var buf: [512]u8 = undefined;
+            const http_url = udpAsHttpUrl(&buf, announce_url) orelse return error.HttpError;
+            return announceHttp(allocator, http_url, req, proxy);
+        }
+        return udp_tracker.announce(allocator, announce_url, req) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.HttpError,
+        };
+    }
+    return announceHttp(allocator, announce_url, req, proxy);
+}
+
+/// udp://host:port[/anything] → http://host:port/announce
+fn udpAsHttpUrl(buf: []u8, udp_url: []const u8) ?[]const u8 {
+    const rest = udp_url["udp://".len..];
+    const slash_pos = std.mem.indexOfScalar(u8, rest, '/');
+    const host_port = rest[0 .. slash_pos orelse rest.len];
+    const url = std.fmt.bufPrint(buf, "http://{s}/announce", .{host_port}) catch return null;
+    return url;
+}
+
+fn announceHttp(
     allocator: Allocator,
     announce_url: []const u8,
     req: AnnounceRequest,
@@ -486,4 +523,16 @@ test "parse IPv4" {
     try std.testing.expect(parseIpv4("invalid") == null);
     try std.testing.expect(parseIpv4("1.2.3") == null);
     try std.testing.expect(parseIpv4("1.2.3.4.5") == null);
+}
+
+test "udp as http url rewrite" {
+    var buf: [512]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "http://tracker.example.com:1337/announce",
+        udpAsHttpUrl(&buf, "udp://tracker.example.com:1337/announce").?,
+    );
+    try std.testing.expectEqualStrings(
+        "http://tracker.example.com:1337/announce",
+        udpAsHttpUrl(&buf, "udp://tracker.example.com:1337").?,
+    );
 }
