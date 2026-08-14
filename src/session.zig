@@ -30,6 +30,11 @@ const max_peers: usize = 50;
 const max_concurrent_pieces: usize = 4;
 const unchoke_slots: usize = 4;
 const unchoke_interval_secs: i64 = 10;
+
+/// Max pieces one web-seed batch may fetch per event-loop pass. Bounded so
+/// peer/tracker socket events are always serviced between batches even when
+/// the web seed is the only source and the server is infinitely fast.
+const web_seed_batch_max: usize = 16;
 const optimistic_interval_secs: i64 = 30;
 /// How often to re-run Nostr peer discovery while a transfer has zero peers.
 /// One-shot discovery at startup isn't enough — a download whose only seed
@@ -83,6 +88,14 @@ pub const Session = struct {
 
     peers: std.ArrayList(*peer_mod.PeerConnection),
     active_pieces: std.AutoHashMap(u32, *piece_mod.PieceProgress),
+
+    // Web seeding (BEP 19): a shared HTTP client so consecutive piece fetches
+    // reuse keep-alive connections instead of paying TCP setup per piece, and
+    // a progress flag that collapses the run loop's poll timeout to 0ms while
+    // a web-seed batch is making progress (otherwise the 1s poll caps web
+    // seeding at ~1 piece/s no matter how fast the server is).
+    web_seed_client: ?std.http.Client = null,
+    web_seed_progress: bool = false,
 
     // Piece availability counts (how many peers have each piece)
     piece_availability: []u32,
@@ -401,6 +414,7 @@ pub const Session = struct {
 
         if (self.dht_instance) |*d| d.deinit();
         if (self.metadata_download) |*md| md.deinit();
+        if (self.web_seed_client) |*c| c.deinit();
         if (self.listener) |*l| l.deinit();
         if (self.torrent_blob) |b| self.allocator.free(b);
         self.freeFileSnapSlice(self.file_snap);
@@ -844,7 +858,13 @@ pub const Session = struct {
             var fds: [max_peers + 1]std.posix.pollfd = undefined;
             const nfds = self.buildPollFds(&fds);
 
-            _ = std.posix.poll(fds[0..nfds], 1000) catch 0;
+            // 0ms while a web-seed batch just made progress: the loop then
+            // spins back to tryWebSeedDownload immediately (socket events are
+            // still serviced every pass), so web-seed throughput is bounded
+            // by the server, not by the poll period. Otherwise 1s as before.
+            const poll_timeout: i32 = if (self.web_seed_progress) 0 else 1000;
+            self.web_seed_progress = false;
+            _ = std.posix.poll(fds[0..nfds], poll_timeout) catch 0;
 
             self.processPollResults(fds[0..nfds]) catch {};
 
@@ -2373,21 +2393,38 @@ pub const Session = struct {
         if (urls.len == 0) return;
         if (self.num_pieces == 0) return;
 
-        // Find a piece we need
-        for (0..self.num_pieces) |i| {
-            const idx: u32 = @intCast(i);
-            if (self.our_bitfield.hasPiece(idx)) continue;
-            if (self.active_pieces.contains(idx)) continue;
+        // Fetch up to web_seed_batch_max pieces per event-loop pass while no
+        // peer is connected; between pieces the loop returns to poll(0), so
+        // incoming peers and tracker announces are still serviced promptly.
+        // When peers ARE connected the web seed stays a low-rate fallback:
+        // exactly one piece per pass, as before (peers are usually faster and
+        // must not be starved of the event loop).
+        var fetched: usize = 0;
+        while (fetched < web_seed_batch_max) : (fetched += 1) {
+            // Find a piece we need
+            var piece_idx: ?u32 = null;
+            for (0..self.num_pieces) |i| {
+                const idx: u32 = @intCast(i);
+                if (self.our_bitfield.hasPiece(idx)) continue;
+                if (self.active_pieces.contains(idx)) continue;
+                piece_idx = idx;
+                break;
+            }
+            const idx = piece_idx orelse return; // nothing left to fetch
 
             // Try each web seed URL
+            var ok = false;
             for (urls) |base_url| {
                 if (self.downloadWebSeedPiece(base_url, idx) catch false) {
-                    return;
-                } else {
-                    continue; // Try next URL
+                    ok = true;
+                    break;
                 }
             }
-            return; // Don't try more pieces if all URLs failed
+            if (!ok) return; // all URLs failed for this piece — retry next pass
+
+            self.web_seed_progress = true; // keep the run loop polling fast
+
+            if (self.peers.items.len > 0) return; // fallback mode: 1 piece/pass
         }
     }
 
@@ -2419,9 +2456,12 @@ pub const Session = struct {
         var range_buf: [64]u8 = undefined;
         const range_str = std.fmt.bufPrint(&range_buf, "bytes={d}-{d}", .{ start, end }) catch return false;
 
-        // HTTP request with Range header
-        var client: std.http.Client = .{ .allocator = self.allocator };
-        defer client.deinit();
+        // HTTP request with Range header. The client is session-scoped so
+        // consecutive piece fetches reuse keep-alive connections from the
+        // client's connection pool instead of paying a fresh TCP handshake
+        // (and TLS, for https web seeds) per piece.
+        if (self.web_seed_client == null) self.web_seed_client = .{ .allocator = self.allocator };
+        const client = &self.web_seed_client.?;
 
         var response_body: std.ArrayList(u8) = .empty;
         defer response_body.deinit(self.allocator);
