@@ -1047,6 +1047,23 @@ pub const Session = struct {
             },
             .interested => {
                 p.peer_interested = true;
+                // Opportunistic unchoke: if an upload slot is free, start
+                // uploading immediately instead of waiting up to
+                // unchoke_interval_secs (10s) for the next periodic
+                // recompute. Small swarms (a lone interested leecher) used to
+                // sit idle for as much as 10s before the first byte — the
+                // periodic tit-for-tat sort still re-evaluates every cycle
+                // and can choke this peer again if better peers appear.
+                if (p.am_choking and p.state == .active) {
+                    var unchoked: usize = 0;
+                    for (self.peers.items) |o| {
+                        if (o.state == .active and !o.am_choking) unchoked += 1;
+                    }
+                    if (unchoked < unchoke_slots) {
+                        p.am_choking = false;
+                        p.enqueueMessage(.unchoke) catch {};
+                    }
+                }
             },
             .not_interested => {
                 p.peer_interested = false;
