@@ -24,11 +24,20 @@ pub const Node = struct {
     address: std.net.Address,
 };
 
-/// Well-known bootstrap nodes.
+/// Well-known bootstrap nodes. Kept deliberately broad: routers die or
+/// degrade (observed in the wild: router.bittorrent.com and router.utorrent.com
+/// timing out for whole residential networks while transmissionbt answers with
+/// a single dead-end node). A client starting with an empty table needs
+/// several live, generous routers to have a chance.
 const bootstrap_nodes = [_]struct { host: []const u8, port: u16 }{
     .{ .host = "router.bittorrent.com", .port = 6881 },
     .{ .host = "dht.transmissionbt.com", .port = 6881 },
     .{ .host = "router.utorrent.com", .port = 6881 },
+    .{ .host = "dht.libtorrent.org", .port = 25401 },
+    .{ .host = "dht.bluetigers.club", .port = 6881 },
+    .{ .host = "dht.anacrolix.link", .port = 6881 },
+    .{ .host = "router.silotis.us", .port = 6881 },
+    .{ .host = "dht.aelitis.com", .port = 6881 },
 };
 
 /// XOR distance between two node IDs.
@@ -192,7 +201,7 @@ pub const Dht = struct {
         const sock = self.sock orelse return peers.toOwnedSlice(allocator) catch return error.OutOfMemory;
 
         var iterations: usize = 0;
-        while (iterations < 3) : (iterations += 1) {
+        while (iterations < 8) : (iterations += 1) {
             if (cancelled(cancel)) break;
             // Drain responses for this iteration
             var rounds: usize = 0;
@@ -437,4 +446,175 @@ test "add compact nodes" {
         total += b.items.len;
     }
     try std.testing.expectEqual(@as(usize, 1), total);
+}
+
+// --- Routing-table persistence ------------------------------------------------
+//
+// A fresh client with an empty table is at the mercy of the well-known
+// routers; several of them are chronically dead or answer with a single
+// dead-end node (observed in the wild). Persisting learned nodes across
+// sessions gives every later lookup a warm table, exactly like libtorrent's
+// dht_state. Format: u32 LE count, then per node 20B id + 4B IPv4 + 2B BE port.
+//
+// All file I/O here goes through raw syscalls (std.posix.system) instead of
+// std.fs: the cache is a pure optimization and must never be able to abort
+// the process. std.fs wrappers contain `unreachable` branches for errno paths
+// they consider impossible (EFAULT/BADF) and an inline length assert in
+// toPosixPath — under the detached DHT worker a corrupted slice hit exactly
+// that assert once and killed a seeder mid-lookup. Raw syscalls let us treat
+// every failure as "no cache this time".
+
+/// Max nodes written to the cache file.
+pub const node_cache_max: usize = 64;
+
+/// NUL-terminate `path` into `buf`; null when it does not fit.
+fn pathZ(buf: []u8, path: []const u8) ?[*:0]const u8 {
+    if (path.len + 1 > buf.len) return null;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    return @ptrCast(buf.ptr);
+}
+
+/// Write up to `node_cache_max` routing-table nodes to `path`. Best-effort:
+/// every failure is silently ignored.
+pub fn saveNodeCache(self: *const Dht, path: []const u8) void {
+    const c = std.posix.system;
+
+    var buf: [4 + node_cache_max * 26]u8 = undefined;
+    var n: usize = 0;
+    outer: for (&self.buckets) |*b| {
+        for (b.items) |node| {
+            if (n >= node_cache_max) break :outer;
+            if (node.address.any.family != std.posix.AF.INET) continue;
+            @memcpy(buf[4 + n * 26 ..][0..20], &node.id);
+            const ip4: [4]u8 = @bitCast(node.address.in.sa.addr);
+            buf[4 + n * 26 + 20] = ip4[0];
+            buf[4 + n * 26 + 21] = ip4[1];
+            buf[4 + n * 26 + 22] = ip4[2];
+            buf[4 + n * 26 + 23] = ip4[3];
+            const port = node.address.getPort();
+            buf[4 + n * 26 + 24] = @intCast(port >> 8);
+            buf[4 + n * 26 + 25] = @intCast(port & 0xff);
+            n += 1;
+        }
+    }
+    if (n == 0) return;
+    std.mem.writeInt(u32, buf[0..4], @intCast(n), .little);
+
+    const total = 4 + n * 26;
+
+    // Write to "<path>.tmp" and rename over the destination. Opening the real
+    // path with TRUNC would destroy a good cache the moment anything after the
+    // open fails, leaving the next session to cold-start — the opposite of
+    // what the cache is for.
+    var tpbuf: [512]u8 = undefined;
+    var tmp_path_buf: [512]u8 = undefined;
+    const tmp_path = std.fmt.bufPrint(&tmp_path_buf, "{s}.tmp", .{path}) catch return;
+    const tp = pathZ(&tpbuf, tmp_path) orelse return;
+
+    var pbuf: [512]u8 = undefined;
+    const p = pathZ(&pbuf, path) orelse return;
+
+    const oflags: c.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true };
+    const fd = c.openat(std.posix.AT.FDCWD, tp, oflags, @as(c.mode_t, 0o644));
+    if (fd < 0) return;
+    var ok = false;
+    defer {
+        _ = c.close(fd);
+        if (!ok) _ = c.unlinkat(std.posix.AT.FDCWD, tp, 0);
+    }
+
+    var off: usize = 0;
+    while (off < total) {
+        // `total - off`, NOT `buf[off..].len`: buf is `undefined` past the
+        // payload, so writing its full length would append the uninitialized
+        // tail of a stack buffer to a file on disk.
+        const rc = c.write(fd, buf[off..].ptr, total - off);
+        if (rc <= 0) return; // error or nothing written; best-effort
+        off += @intCast(rc);
+    }
+    if (c.renameat(std.posix.AT.FDCWD, tp, std.posix.AT.FDCWD, p) != 0) return;
+    ok = true;
+}
+
+/// Load a previously saved node cache into the routing table. Returns how
+/// many nodes were inserted. Missing/corrupt file is not an error.
+pub fn loadNodeCache(self: *Dht, path: []const u8) usize {
+    const c = std.posix.system;
+
+    var pbuf: [512]u8 = undefined;
+    const p = pathZ(&pbuf, path) orelse return 0;
+    const oflags: c.O = .{ .ACCMODE = .RDONLY };
+    const fd = c.openat(std.posix.AT.FDCWD, p, oflags, @as(c.mode_t, 0));
+    if (fd < 0) return 0;
+    defer _ = c.close(fd);
+
+    var hdr: [4]u8 = undefined;
+    if (!readFull(c, fd, &hdr)) return 0;
+    const count = std.mem.readInt(u32, &hdr, .little);
+    if (count == 0 or count > 4096) return 0;
+
+    var inserted: usize = 0;
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        var entry: [26]u8 = undefined;
+        if (!readFull(c, fd, &entry)) break;
+        const port = (@as(u16, entry[24]) << 8) | @as(u16, entry[25]);
+        if (port == 0) continue;
+        var id: [id_len]u8 = undefined;
+        @memcpy(&id, entry[0..20]);
+        const addr = std.net.Address.initIp4(.{ entry[20], entry[21], entry[22], entry[23] }, port);
+        self.addNode(.{ .id = id, .address = addr });
+        inserted += 1;
+    }
+    return inserted;
+}
+
+fn readFull(c: anytype, fd: c_int, buf: []u8) bool {
+    var off: usize = 0;
+    while (off < buf.len) {
+        const rc = c.read(fd, buf[off..].ptr, buf[off..].len);
+        if (rc <= 0) return false;
+        off += @intCast(rc);
+    }
+    return true;
+}
+
+test "saveNodeCache writes only the payload, not the stack tail" {
+    const a = std.testing.allocator;
+    var d = Dht.init(a, 16999);
+    defer d.deinit();
+
+    // Two IPv4 nodes -> header(4) + 2*26 = 56 bytes on disk. Writing
+    // buf[off..].len instead of total-off produced the full 1668-byte buffer,
+    // i.e. 1612 bytes of uninitialized stack memory appended to the file.
+    const id1: [id_len]u8 = [_]u8{1} ** id_len;
+    const id2: [id_len]u8 = [_]u8{2} ** id_len;
+    d.buckets[0].append(a, .{
+        .id = id1,
+        .address = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 6881),
+    }) catch unreachable;
+    d.buckets[0].append(a, .{
+        .id = id2,
+        .address = std.net.Address.initIp4(.{ 10, 0, 0, 2 }, 6882),
+    }) catch unreachable;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+    const path = try std.fmt.allocPrint(a, "{s}/nodes.dat", .{dir});
+    defer a.free(path);
+
+    saveNodeCache(&d, path);
+
+    const f = try std.fs.openFileAbsolute(path, .{});
+    defer f.close();
+    const size = (try f.stat()).size;
+    try std.testing.expectEqual(@as(u64, 4 + 2 * 26), size);
+
+    // And it round-trips back into an empty table.
+    var d2 = Dht.init(a, 16998);
+    defer d2.deinit();
+    try std.testing.expectEqual(@as(usize, 2), loadNodeCache(&d2, path));
 }
