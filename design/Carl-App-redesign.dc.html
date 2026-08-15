@@ -1,0 +1,2114 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=IBM+Plex+Sans:wght@400;450;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+*{ box-sizing:border-box; margin:0; padding:0; }
+html,body{ height:100%; }
+body{ font-family:"IBM Plex Sans",-apple-system,BlinkMacSystemFont,sans-serif; background:#0c0d11; color:#e8eaf0;
+  font-size:14px; line-height:1.45; -webkit-font-smoothing:antialiased; font-feature-settings:"cv05" 1,"ss01" 1; }
+button{ font-family:inherit; cursor:pointer; border:none; background:none; color:inherit; }
+input,textarea{ font-family:inherit; }
+a{ color:#a99ff8; text-decoration:none; }
+a:hover{ color:#8b7cf6; text-decoration:underline; }
+::selection{ background:rgba(139,124,246,0.14); }
+::-webkit-scrollbar{ width:11px; height:11px; }
+::-webkit-scrollbar-thumb{ background:#2a2f3b; border-radius:6px; border:3px solid #0c0d11; }
+::-webkit-scrollbar-thumb:hover{ background:#363c49; }
+@keyframes pulse{ 0%,100%{ opacity:1; } 50%{ opacity:.3; } }
+@keyframes pcpulse{ 0%,100%{ opacity:.4; } 50%{ opacity:1; } }
+@keyframes metaslide{ 0%{ margin-left:0; } 50%{ margin-left:60%; } 100%{ margin-left:0; } }
+@keyframes relaypulse{ 0%{ box-shadow:0 0 0 0 rgba(70,192,138,.45); } 70%,100%{ box-shadow:0 0 0 6px rgba(70,192,138,0); } }
+@keyframes fadein{ from{ opacity:0; } }
+@keyframes rowflash{ 0%{ background:rgba(139,124,246,0.16); } 100%{ background:transparent; } }
+@keyframes rise{ from{ transform:translateY(10px); opacity:0; } }
+@media (max-width:1080px){
+  [data-sidebar]{ width:200px!important; flex-basis:200px!important; }
+  [data-tstat]:nth-last-child(2),[data-thstat]:nth-last-child(2){ display:none!important; }
+  [data-rblabel]{ display:none!important; }
+  [data-rbadge]{ padding:3px!important; }
+}
+@media (max-width:1000px){
+  [data-tstat]:nth-last-child(3),[data-thstat]:nth-last-child(3){ display:none!important; }
+}
+@media (max-width:900px){
+  [data-sset]{ grid-template-columns:1fr!important; gap:14px!important; }
+  [data-dmhash]{ display:none!important; }
+}
+@media (prefers-reduced-motion:reduce){ *{ animation:none!important; } }
+</style>
+</helmet>
+
+<div style="display:flex;height:100vh;overflow:hidden;background:#0c0d11;color:#e8eaf0;font-family:'IBM Plex Sans',-apple-system,BlinkMacSystemFont,sans-serif;font-size:14px;line-height:1.45">
+
+  <aside data-sidebar="1" style="width:236px;flex:0 0 236px;background:#111319;border-right:1px solid #1c212b;display:flex;flex-direction:column;padding:18px 14px">
+    <div style="display:flex;align-items:baseline;gap:9px;padding:4px 6px 0">
+      <span style="color:#8b7cf6;align-self:center;display:flex">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" style="display:block;flex:0 0 auto"><circle cx="12" cy="12" r="8.5"></circle><circle cx="12" cy="12" r="5"></circle><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"></circle></svg>
+      </span>
+      <span style="font-family:Newsreader,Georgia,serif;font-size:28px;font-weight:500;letter-spacing:-0.01em;line-height:1">carl</span>
+      <span style="font-size:10.5px;color:#666e7e;margin-left:-2px;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">0.9.2</span>
+    </div>
+    <div style="font-size:11.5px;color:#666e7e;padding:5px 6px 0;letter-spacing:0.01em">curl, but for torrents</div>
+
+    <nav style="display:flex;flex-direction:column;gap:2px;margin-top:26px">
+      <sc-for list="{{ nav }}" as="n" hint-placeholder-count="4">
+        <button onClick="{{ n.go }}" style="{{ n.style }}">
+          <span style="{{ n.icStyle }}"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="{{ n.icon }}"></path></svg></span>
+          <span style="flex:1">{{ n.label }}</span>
+          <sc-if value="{{ n.hasCount }}" hint-placeholder-val="{{ true }}"><span style="{{ n.countStyle }}">{{ n.count }}</span></sc-if>
+        </button>
+      </sc-for>
+    </nav>
+
+    <div style="margin-top:auto">
+      <div style="background:#161922;border:1px solid #1c212b;border-radius:8px;padding:11px 12px;display:flex;flex-direction:column;gap:8px">
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <span style="font-size:11.5px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em">Route</span>
+          <span style="display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border-radius:20px;font-size:10.5px;font-weight:500;line-height:1;white-space:nowrap;color:#46c08a;background:rgba(70,192,138,0.1);border:1px solid rgba(70,192,138,0.28)">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" style="display:block;flex:0 0 auto"><circle cx="12" cy="12" r="8.5"></circle><circle cx="12" cy="12" r="5"></circle><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"></circle></svg>
+            <span>tor</span>
+          </span>
+        </div>
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <span style="font-size:11.5px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em">Relays</span>
+          <span style="display:flex;align-items:center;gap:6px;font-size:12px;color:#9aa1b1">
+            <span style="width:7px;height:7px;border-radius:50%;flex:0 0 auto;background:#46c08a;animation:relaypulse 2.4s ease-out infinite"></span>
+            <span style="font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ relayRatio }}</span>
+          </span>
+        </div>
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <span style="font-size:11.5px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em">Identity</span>
+          <span style="font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;font-size:11.5px;color:#9aa1b1">npub1carl…v3sba</span>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <main style="flex:1;min-width:0;display:flex;flex-direction:column;overflow:hidden;background:#0c0d11">
+
+    <sc-if value="{{ isTransfers }}" hint-placeholder-val="{{ true }}">
+    <div data-screen-label="Transfers" style="display:flex;flex-direction:column;height:100%;overflow:hidden">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 24px 16px;border-bottom:1px solid #1c212b;flex:0 0 auto">
+        <div style="display:flex;align-items:center;gap:18px">
+          <h1 style="font-family:Newsreader,Georgia,serif;font-size:25px;font-weight:500;letter-spacing:-0.015em">Transfers</h1>
+          <div style="display:flex;gap:2px;background:#161922;padding:3px;border-radius:6px;border:1px solid #1c212b">
+            <sc-for list="{{ segs }}" as="s" hint-placeholder-count="4">
+              <button onClick="{{ s.go }}" style="{{ s.style }}">{{ s.label }}<span style="{{ s.countStyle }}">{{ s.count }}</span></button>
+            </sc-for>
+          </div>
+        </div>
+        <div style="display:flex;align-items:center;gap:14px">
+          <div style="display:flex;align-items:center;gap:14px;font-size:13px">
+            <span style="font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;color:#5aa6db">↓ {{ totalDown }}</span>
+            <span style="font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;color:#46c08a">↑ {{ totalUp }}</span>
+          </div>
+          <button onClick="{{ openAdd }}" style="display:inline-flex;align-items:center;gap:7px;padding:8px 14px;border-radius:6px;background:#8b7cf6;border:1px solid transparent;color:#0c0d11;font-size:13px;font-weight:600;transition:.12s" style-hover="background:#a99ff8">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="M12 5v14M5 12h14"></path></svg> Add
+          </button>
+        </div>
+      </div>
+
+      <div style="flex:1;overflow-y:auto;padding:14px 24px 40px">
+        <div style="display:flex;align-items:center;gap:16px;padding:0 14px 8px;font-size:10.5px;color:#666e7e;text-transform:uppercase;letter-spacing:0.06em">
+          <span style="width:16px;flex:0 0 16px"></span>
+          <span style="flex:1">Name</span>
+          <span data-thstat="1" style="width:88px;flex:0 0 88px;text-align:right">Size</span>
+          <span data-thstat="1" style="width:88px;flex:0 0 88px;text-align:right">Down</span>
+          <span data-thstat="1" style="width:88px;flex:0 0 88px;text-align:right">Up</span>
+          <span data-thstat="1" style="width:88px;flex:0 0 88px;text-align:right">ETA</span>
+          <span data-thstat="1" style="width:88px;flex:0 0 88px;text-align:right">Peers</span>
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:5px">
+          <sc-for list="{{ rows }}" as="t" hint-placeholder-count="7">
+            <div style="{{ t.wrapStyle }}">
+              <div onClick="{{ t.toggle }}" style="display:flex;align-items:center;gap:16px;padding:13px 14px;cursor:pointer">
+                <span style="{{ t.chevStyle }}"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="M9 6l6 6-6 6"></path></svg></span>
+                <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:7px">
+                  <div style="display:flex;align-items:center;gap:9px">
+                    <span data-rbadge="1" style="{{ t.routeStyle }}">
+                      <sc-if value="{{ t.isTor }}"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" style="display:block;flex:0 0 auto"><circle cx="12" cy="12" r="8.5"></circle><circle cx="12" cy="12" r="5"></circle><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"></circle></svg></sc-if>
+                      <sc-if value="{{ t.isProxy }}"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"></path></svg></sc-if>
+                      <sc-if value="{{ t.isDirect }}"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM3 12h18M12 3c2.5 2.5 2.5 15 0 18M12 3c-2.5 2.5-2.5 15 0 18"></path></svg></sc-if>
+                      <span data-rblabel="1">{{ t.routeLabel }}</span>
+                    </span>
+                    <span style="font-size:13px;color:#e8eaf0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ t.name }}</span>
+                    <span style="{{ t.statusStyle }}"><span style="{{ t.statusDotStyle }}"></span>{{ t.statusLabel }}</span>
+                  </div>
+                  <div style="display:flex;align-items:center;gap:10px">
+                    <div style="{{ t.barStyle }}"><div style="{{ t.fillStyle }}"></div></div>
+                    <span style="font-size:11px;color:#9aa1b1;flex:0 0 auto;min-width:34px;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ t.pctLabel }}</span>
+                  </div>
+                </div>
+                <div data-tstat="1" style="width:88px;flex:0 0 88px;display:flex;flex-direction:column;align-items:flex-end;gap:1px">
+                  <span style="font-size:12.5px;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ t.sizeLabel }}</span>
+                  <span style="font-size:9.5px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em">size</span>
+                </div>
+                <div data-tstat="1" style="width:88px;flex:0 0 88px;display:flex;flex-direction:column;align-items:flex-end;gap:1px">
+                  <span style="font-size:12.5px;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;color:#5aa6db">{{ t.downLabel }}</span>
+                  <span style="font-size:9.5px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em">↓ down</span>
+                </div>
+                <div data-tstat="1" style="width:88px;flex:0 0 88px;display:flex;flex-direction:column;align-items:flex-end;gap:1px">
+                  <span style="font-size:12.5px;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;color:#46c08a">{{ t.upLabel }}</span>
+                  <span style="font-size:9.5px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em">↑ up</span>
+                </div>
+                <div data-tstat="1" style="width:88px;flex:0 0 88px;display:flex;flex-direction:column;align-items:flex-end;gap:1px">
+                  <span style="font-size:12.5px;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ t.eta }}</span>
+                  <span style="font-size:9.5px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em">eta</span>
+                </div>
+                <div data-tstat="1" style="width:88px;flex:0 0 88px;display:flex;flex-direction:column;align-items:flex-end;gap:1px">
+                  <span style="font-size:12.5px;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ t.peers }}</span>
+                  <span style="font-size:9.5px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em">peers</span>
+                </div>
+              </div>
+
+              <sc-if value="{{ t.expanded }}">
+                <div style="border-top:1px solid #262b36;background:#111319">
+                  <div style="display:flex;gap:2px;padding:10px 14px 0;border-bottom:1px solid #1c212b">
+                    <sc-for list="{{ dtabs }}" as="d" hint-placeholder-count="4">
+                      <button onClick="{{ d.go }}" style="{{ d.style }}">{{ d.label }}<sc-if value="{{ d.hasCount }}"><span style="font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;font-size:10px;background:#1c2029;color:#666e7e;padding:1px 6px;border-radius:8px">{{ d.count }}</span></sc-if></button>
+                    </sc-for>
+                  </div>
+                  <div style="padding:14px">
+
+                    <sc-if value="{{ isPeersTab }}">
+                      <table style="width:100%;border-collapse:collapse;font-size:12px">
+                        <thead>
+                          <tr>
+                            <th style="text-align:left;font-size:10px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em;font-weight:500;padding:0 12px 8px">Address</th>
+                            <th style="text-align:left;font-size:10px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em;font-weight:500;padding:0 12px 8px">Client</th>
+                            <th style="text-align:right;font-size:10px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em;font-weight:500;padding:0 12px 8px">Done</th>
+                            <th style="text-align:right;font-size:10px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em;font-weight:500;padding:0 12px 8px">↓ Down</th>
+                            <th style="text-align:right;font-size:10px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em;font-weight:500;padding:0 12px 8px">↑ Up</th>
+                            <th style="text-align:left;font-size:10px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em;font-weight:500;padding:0 12px 8px">Flags</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <sc-for list="{{ peers }}" as="p" hint-placeholder-count="6">
+                            <tr style="{{ p.rowStyle }}">
+                              <td style="padding:6px 12px;border-top:1px solid #1c212b;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;font-feature-settings:'zero' 1">
+                                <span style="display:flex;align-items:center;gap:7px;color:#e8eaf0">
+                                  <sc-if value="{{ p.onion }}"><span style="color:#46c08a;display:flex"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" style="display:block;flex:0 0 auto"><circle cx="12" cy="12" r="8.5"></circle><circle cx="12" cy="12" r="5"></circle><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"></circle></svg></span></sc-if>
+                                  <span>{{ p.addr }}</span>
+                                </span>
+                              </td>
+                              <td style="padding:6px 12px;border-top:1px solid #1c212b;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;color:#9aa1b1">{{ p.client }}</td>
+                              <td style="padding:6px 12px;border-top:1px solid #1c212b;text-align:right">{{ p.pct }}%</td>
+                              <td style="padding:6px 12px;border-top:1px solid #1c212b;text-align:right;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ p.down }}</td>
+                              <td style="padding:6px 12px;border-top:1px solid #1c212b;text-align:right;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ p.up }}</td>
+                              <td style="padding:6px 12px;border-top:1px solid #1c212b;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;color:#9aa1b1;letter-spacing:0.08em;font-size:11px">{{ p.flags }}</td>
+                            </tr>
+                          </sc-for>
+                        </tbody>
+                      </table>
+                    </sc-if>
+
+                    <sc-if value="{{ isPiecesTab }}">
+                      <div>
+                        <div style="display:flex;align-items:center;gap:16px;margin-bottom:12px;font-size:11.5px;color:#9aa1b1">
+                          <span style="display:flex;align-items:center;gap:6px"><span style="width:10px;height:10px;border-radius:2px;background:#8b7cf6"></span> have</span>
+                          <span style="display:flex;align-items:center;gap:6px"><span style="width:10px;height:10px;border-radius:2px;background:#a99ff8"></span> downloading</span>
+                          <span style="display:flex;align-items:center;gap:6px"><span style="width:10px;height:10px;border-radius:2px;background:#1c2029"></span> missing</span>
+                          <span style="flex:1"></span>
+                          <span style="font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;color:#9aa1b1">{{ pieceLabel }}</span>
+                        </div>
+                        <div style="display:grid;grid-template-columns:repeat(auto-fill,11px);gap:2px">
+                          <sc-for list="{{ pieces }}" as="pc" hint-placeholder-count="60">
+                            <span style="{{ pc.style }}"></span>
+                          </sc-for>
+                        </div>
+                      </div>
+                    </sc-if>
+
+                    <sc-if value="{{ isSourcesTab }}">
+                      <div style="display:flex;flex-direction:column;gap:2px">
+                        <sc-for list="{{ sources }}" as="s" hint-placeholder-count="4">
+                          <div style="display:flex;align-items:center;gap:12px;padding:9px 10px;border-radius:6px" style-hover="background:#161922">
+                            <span style="{{ s.chipStyle }}">{{ s.chipLabel }}</span>
+                            <span style="font-size:12px;color:#e8eaf0;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ s.label }}</span>
+                            <span style="font-size:11.5px;margin-left:auto;color:#9aa1b1">{{ s.detail }}</span>
+                            <span style="display:flex;align-items:center;gap:6px;font-size:11px;color:#666e7e;min-width:90px;justify-content:flex-end">
+                              <span style="width:6px;height:6px;border-radius:50%;background:#46c08a"></span> {{ s.interval }}
+                            </span>
+                          </div>
+                        </sc-for>
+                        <div style="margin-top:12px;padding:11px 13px;background:#161922;border:1px solid #1c212b;border-radius:6px;font-size:11.5px;color:#9aa1b1;line-height:1.55">
+                          Peers discovered across <strong>3 sources</strong>. With a proxy or Tor route set, UDP trackers and DHT are disabled — Nostr peer-announce keeps working over the tunnel.
+                        </div>
+                      </div>
+                    </sc-if>
+
+                    <sc-if value="{{ isFilesTab }}">
+                      <table style="width:100%;border-collapse:collapse;font-size:12px">
+                        <thead>
+                          <tr>
+                            <th style="text-align:left;font-size:10px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em;font-weight:500;padding:0 12px 8px">File</th>
+                            <th style="text-align:right;font-size:10px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em;font-weight:500;padding:0 12px 8px">Size</th>
+                            <th style="text-align:right;font-size:10px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em;font-weight:500;padding:0 12px 8px">Done</th>
+                            <th style="text-align:left;font-size:10px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em;font-weight:500;padding:0 12px 8px">Priority</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <sc-for list="{{ files }}" as="f" hint-placeholder-count="3">
+                            <tr>
+                              <td style="padding:6px 12px;border-top:1px solid #1c212b">
+                                <span style="display:flex;align-items:center;gap:9px">
+                                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto;color:#666e7e"><path d="M14 3v5h5M7 3h8l4 4v14H7z"></path></svg>
+                                  <span style="font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;font-size:11.5px">{{ f.name }}</span>
+                                </span>
+                              </td>
+                              <td style="padding:6px 12px;border-top:1px solid #1c212b;text-align:right;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ f.size }}</td>
+                              <td style="padding:6px 12px;border-top:1px solid #1c212b;text-align:right">{{ f.pct }}%</td>
+                              <td style="padding:6px 12px;border-top:1px solid #1c212b"><span style="{{ f.prioStyle }}">{{ f.prio }}</span></td>
+                            </tr>
+                          </sc-for>
+                        </tbody>
+                      </table>
+                    </sc-if>
+
+                  </div>
+                </div>
+              </sc-if>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+    </div>
+    </sc-if>
+
+    <sc-if value="{{ isDiscover }}">
+    <div data-screen-label="Discover" style="display:flex;flex-direction:column;height:100%;overflow:hidden">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 24px 8px;flex:0 0 auto">
+        <div style="display:flex;align-items:center;gap:18px">
+          <h1 style="font-family:Newsreader,Georgia,serif;font-size:25px;font-weight:500;letter-spacing:-0.015em">Discover</h1>
+        </div>
+        <div style="display:flex;align-items:center;gap:14px">
+          <div title="Route queries &amp; downloads through" style="display:flex;gap:2px;background:#161922;padding:3px;border-radius:6px;border:1px solid #1c212b">
+            <sc-for list="{{ dRoutes }}" as="r" hint-placeholder-count="3">
+              <button onClick="{{ r.go }}" style="{{ r.style }}">{{ r.label }}</button>
+            </sc-for>
+          </div>
+        </div>
+      </div>
+
+      <div style="padding:6px 24px 0;display:flex;flex-direction:column;gap:12px">
+        <div style="display:flex;align-items:center;gap:11px;background:#111319;border:1px solid #262b36;border-radius:8px;padding:12px 15px">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto;color:#666e7e"><path d="M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14zM20 20l-3.5-3.5"></path></svg>
+          <input value="{{ q }}" onChange="{{ setQ }}" placeholder="Search torrents over Nostr — title, info-hash, or keyword (NIP-35)" style="flex:1;background:none;border:none;outline:none;color:#e8eaf0;font-size:14px" />
+          <sc-if value="{{ hasQ }}"><button onClick="{{ clearQ }}" style="display:flex;color:#666e7e" style-hover="color:#e8eaf0"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="M6 6l12 12M18 6L6 18"></path></svg></button></sc-if>
+        </div>
+
+        <div style="display:flex;align-items:center;gap:14px;padding:0 2px;flex-wrap:wrap">
+          <span style="display:flex;align-items:center;gap:7px;font-size:11px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em">Relays<span style="font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;color:#9aa1b1">{{ relayRatio }}</span></span>
+          <div style="display:flex;align-items:center;gap:13px;flex-wrap:wrap">
+            <sc-for list="{{ relays }}" as="r" hint-placeholder-count="6">
+              <span title="{{ r.title }}" style="display:flex;align-items:center;gap:6px;font-size:11.5px;color:#9aa1b1">
+                <span style="{{ r.dotStyle }}"></span>
+                <span style="font-size:11px;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ r.host }}</span>
+              </span>
+            </sc-for>
+          </div>
+        </div>
+      </div>
+
+      <div style="flex:1;overflow-y:auto;padding:14px 24px 40px">
+        <div style="display:flex;align-items:baseline;gap:12px;padding:4px 2px 12px;font-size:11.5px;color:#666e7e">
+          <span style="color:#9aa1b1;white-space:nowrap;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ resultCount }} events</span>
+          <span style="white-space:nowrap">sorted by <strong>recent</strong></span>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:10px">
+          <sc-for list="{{ results }}" as="d" hint-placeholder-count="5">
+            <div style="background:#111319;border:1px solid #1c212b;border-radius:12px;padding:17px 18px;transition:border-color .12s" style-hover="border-color:#262b36">
+              <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:14px">
+                <div>
+                  <h3 style="font-family:Newsreader,Georgia,serif;font-size:18px;font-weight:500;letter-spacing:-0.01em;line-height:1.25">{{ d.title }}</h3>
+                  <div style="display:flex;align-items:center;gap:11px;margin-top:7px">
+                    <sc-if value="{{ d.verified }}">
+                      <span title="Schnorr signature verified" style="display:inline-flex;align-items:center;gap:4px;font-size:11px;font-weight:500;padding:2px 7px;border-radius:5px;color:#46c08a;background:rgba(70,192,138,0.1)">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="M5 12l4 4 10-10"></path></svg> signed
+                      </span>
+                    </sc-if>
+                    <sc-if value="{{ d.unverified }}">
+                      <span title="Signature could not be verified" style="display:inline-flex;align-items:center;gap:4px;font-size:11px;font-weight:500;padding:2px 7px;border-radius:5px;color:#d6a44e;background:rgba(214,164,78,0.1)">unverified</span>
+                    </sc-if>
+                    <span style="font-size:11px;color:#666e7e;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ d.author }}</span>
+                    <span style="font-size:11px;color:#666e7e">{{ d.age }}</span>
+                  </div>
+                </div>
+              </div>
+
+              <p style="font-size:13px;color:#9aa1b1;line-height:1.55;margin-top:11px;max-width:78ch;text-wrap:pretty">{{ d.desc }}</p>
+
+              <div style="display:flex;align-items:center;gap:26px;margin-top:14px">
+                <div style="display:flex;flex-direction:column;gap:1px">
+                  <span style="font-size:14px;color:#e8eaf0;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ d.size }}</span>
+                  <span style="font-size:9.5px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em">size</span>
+                </div>
+                <div style="display:flex;flex-direction:column;gap:1px">
+                  <span style="font-size:14px;color:#e8eaf0;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ d.files }}</span>
+                  <span style="font-size:9.5px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em">files</span>
+                </div>
+                <div style="display:flex;flex-direction:column;gap:1px">
+                  <span style="font-size:14px;color:#e8eaf0;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ d.trackers }}</span>
+                  <span style="font-size:9.5px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em">trackers</span>
+                </div>
+                <div data-dmhash="1" style="display:flex;flex-direction:column;gap:1px;margin-left:auto">
+                  <button onClick="{{ d.copyHash }}" title="Copy" style="display:inline-flex;align-items:center;gap:8px;padding:4px 9px;border-radius:6px;background:#161922;border:1px solid #1c212b;color:#9aa1b1;font-size:12px;transition:.12s;max-width:100%" style-hover="background:#1c2029;color:#e8eaf0;border-color:#262b36">
+                    <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ d.hashLabel }}</span>
+                    <span style="display:flex;color:#666e7e;flex:0 0 auto"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="{{ d.hashIcon }}"></path></svg></span>
+                  </button>
+                </div>
+              </div>
+
+              <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;margin-top:16px;padding-top:14px;border-top:1px solid #1c212b">
+                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                  <span style="font-size:11px;color:#666e7e">found on</span>
+                  <sc-for list="{{ d.relays }}" as="r" hint-placeholder-count="2">
+                    <span style="display:inline-flex;align-items:center;gap:5px;font-size:11px;color:#9aa1b1;background:#161922;padding:2.5px 8px;border-radius:14px;border:1px solid #1c212b;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">
+                      <sc-if value="{{ r.isOnion }}"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#46c08a" stroke-width="1.6" style="display:block;flex:0 0 auto"><circle cx="12" cy="12" r="8.5"></circle><circle cx="12" cy="12" r="5"></circle><circle cx="12" cy="12" r="1.6" fill="#46c08a" stroke="none"></circle></svg></sc-if>
+                      <sc-if value="{{ r.isPlain }}"><span style="width:5px;height:5px;border-radius:50%;background:#46c08a"></span></sc-if>
+                      {{ r.name }}
+                    </span>
+                  </sc-for>
+                </div>
+                <div style="display:flex;align-items:center;gap:10px;flex:0 0 auto">
+                  <button onClick="{{ d.copyMagnet }}" title="Copy" style="display:inline-flex;align-items:center;gap:8px;padding:4px 9px;border-radius:6px;background:#161922;border:1px solid #1c212b;color:#9aa1b1;font-size:12px;transition:.12s" style-hover="background:#1c2029;color:#e8eaf0;border-color:#262b36">
+                    <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ d.magnetLabel }}</span>
+                    <span style="display:flex;color:#666e7e;flex:0 0 auto"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="{{ d.magnetIcon }}"></path></svg></span>
+                  </button>
+                  <button onClick="{{ d.add }}" style="{{ d.btnStyle }}">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="{{ d.btnIcon }}"></path></svg>
+                    {{ d.btnLabel }}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </sc-for>
+
+          <sc-if value="{{ noResults }}">
+            <div style="display:flex;flex-direction:column;align-items:center;gap:9px;padding:70px 20px;text-align:center">
+              <div style="width:56px;height:56px;border-radius:14px;background:#161922;border:1px solid #1c212b;display:flex;align-items:center;justify-content:center;color:#666e7e;margin-bottom:4px">
+                <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14zM20 20l-3.5-3.5"></path></svg>
+              </div>
+              <div style="font-size:15px;font-weight:600">No matching events</div>
+              <div style="font-size:12.5px;color:#9aa1b1;max-width:44ch;line-height:1.55">{{ emptyMsg }}</div>
+            </div>
+          </sc-if>
+        </div>
+      </div>
+    </div>
+    </sc-if>
+
+    <sc-if value="{{ isSeeding }}">
+    <div data-screen-label="Seeding" style="display:flex;flex-direction:column;height:100%;overflow:hidden">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 24px 16px;border-bottom:1px solid #1c212b;flex:0 0 auto">
+        <div style="display:flex;align-items:center;gap:18px">
+          <h1 style="font-family:Newsreader,Georgia,serif;font-size:25px;font-weight:500;letter-spacing:-0.015em">Seeding</h1>
+          <div style="display:flex;align-items:center;gap:14px;font-size:13px">
+            <span style="font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;color:#46c08a">↑ {{ seedUpTotal }}</span>
+            <span style="color:#9aa1b1;font-size:12px">{{ seedCountLabel }}</span>
+          </div>
+        </div>
+        <div style="display:flex;align-items:center;gap:14px">
+          <button onClick="{{ openSeed }}" style="display:inline-flex;align-items:center;gap:7px;padding:8px 14px;border-radius:6px;background:#8b7cf6;border:1px solid transparent;color:#0c0d11;font-size:13px;font-weight:600" style-hover="background:#a99ff8">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="M12 5v14M5 12h14"></path></svg> Seed a file
+          </button>
+        </div>
+      </div>
+
+      <div style="flex:1;overflow-y:auto;padding:14px 24px 40px">
+        <div style="background:linear-gradient(160deg,rgba(70,192,138,0.08),rgba(70,192,138,0.02));border:1px solid rgba(70,192,138,0.28);border-radius:12px;padding:16px 18px;margin-bottom:18px">
+          <div style="display:flex;align-items:center;gap:13px;margin-bottom:13px">
+            <span style="width:38px;height:38px;border-radius:10px;background:rgba(70,192,138,0.14);color:#46c08a;display:flex;align-items:center;justify-content:center;flex:0 0 auto">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" style="display:block;flex:0 0 auto"><circle cx="12" cy="12" r="8.5"></circle><circle cx="12" cy="12" r="5"></circle><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"></circle></svg>
+            </span>
+            <div>
+              <div style="font-size:14px;font-weight:600;color:#e8eaf0">Seeding as a Tor hidden service</div>
+              <div style="font-size:12px;color:#9aa1b1;margin-top:1px">Peers reach you over this .onion address. Share it via Discover or directly.</div>
+            </div>
+            <span style="margin-left:auto;display:flex;align-items:center;gap:6px;font-size:11.5px;color:#46c08a;font-weight:500">
+              <span style="width:7px;height:7px;border-radius:50%;background:#46c08a;animation:relaypulse 2.4s ease-out infinite"></span> online
+            </span>
+          </div>
+          <button onClick="{{ copySeedOnion }}" title="Copy" style="display:inline-flex;align-items:center;gap:8px;border-radius:6px;background:#161922;border:1px solid #1c212b;color:#9aa1b1;transition:.12s;width:100%;justify-content:space-between;padding:9px 12px" style-hover="background:#1c2029;border-color:#262b36">
+            <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;color:#e8eaf0;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ seedOnion }}</span>
+            <span style="display:flex;color:#666e7e;flex:0 0 auto"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="{{ seedOnionIcon }}"></path></svg></span>
+          </button>
+          <div style="display:flex;align-items:center;gap:18px;margin-top:13px;flex-wrap:wrap">
+            <span style="display:flex;align-items:center;gap:7px;font-size:11.5px;color:#9aa1b1">
+              <span style="width:6px;height:6px;border-radius:50%;background:#a99ff8"></span> published to <strong>4 relays</strong> over Nostr
+            </span>
+            <span style="display:flex;align-items:center;gap:7px;font-size:11.5px;color:#46c08a">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"></path></svg> no IP leaked · tracker &amp; DHT announces disabled
+            </span>
+          </div>
+        </div>
+
+        <div style="display:flex;align-items:center;gap:16px;padding:0 14px 8px;font-size:10.5px;color:#666e7e;text-transform:uppercase;letter-spacing:0.06em">
+          <span style="width:78px;flex:0 0 78px">Route</span>
+          <span style="flex:1">File</span>
+          <span data-thstat="1" style="width:88px;flex:0 0 88px;text-align:right">Size</span>
+          <span data-thstat="1" style="width:88px;flex:0 0 88px;text-align:right">Uploaded</span>
+          <span data-thstat="1" style="width:88px;flex:0 0 88px;text-align:right">Rate</span>
+          <span data-thstat="1" style="width:88px;flex:0 0 88px;text-align:right">Leechers</span>
+          <span data-thstat="1" style="width:88px;flex:0 0 88px;text-align:right">Ratio</span>
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:5px">
+          <sc-for list="{{ seeds }}" as="s" hint-placeholder-count="3">
+            <div style="display:flex;align-items:center;gap:16px;padding:13px 14px;background:#111319;border:1px solid #1c212b;border-radius:8px" style-hover="border-color:#262b36">
+              <span style="width:78px;flex:0 0 78px">
+                <span style="{{ s.routeStyle }}">
+                  <sc-if value="{{ s.isTor }}"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" style="display:block;flex:0 0 auto"><circle cx="12" cy="12" r="8.5"></circle><circle cx="12" cy="12" r="5"></circle><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"></circle></svg></sc-if>
+                  <sc-if value="{{ s.isProxy }}"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"></path></svg></sc-if>
+                  <sc-if value="{{ s.isDirect }}"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM3 12h18M12 3c2.5 2.5 2.5 15 0 18M12 3c-2.5 2.5-2.5 15 0 18"></path></svg></sc-if>
+                  <span>{{ s.routeLabel }}</span>
+                </span>
+              </span>
+              <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:3px">
+                <div style="font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ s.name }}</div>
+                <sc-if value="{{ s.hasOnion }}">
+                  <div style="font-size:11px;color:#46c08a;display:flex;align-items:center;gap:5px;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">
+                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" style="display:block;flex:0 0 auto"><circle cx="12" cy="12" r="8.5"></circle><circle cx="12" cy="12" r="5"></circle><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"></circle></svg> {{ s.onionShort }}
+                  </div>
+                </sc-if>
+                <sc-if value="{{ s.noOnion }}"><div style="font-size:11px;color:#666e7e">{{ s.visLabel }}</div></sc-if>
+              </div>
+              <div data-tstat="1" style="width:88px;flex:0 0 88px;display:flex;flex-direction:column;align-items:flex-end;gap:1px">
+                <span style="font-size:12.5px;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ s.size }}</span>
+                <span style="font-size:9.5px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em">size</span>
+              </div>
+              <div data-tstat="1" style="width:88px;flex:0 0 88px;display:flex;flex-direction:column;align-items:flex-end;gap:1px">
+                <span style="font-size:12.5px;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;color:#46c08a">↑ {{ s.upTotal }}</span>
+                <span style="font-size:9.5px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em">uploaded</span>
+              </div>
+              <div data-tstat="1" style="width:88px;flex:0 0 88px;display:flex;flex-direction:column;align-items:flex-end;gap:1px">
+                <span style="font-size:12.5px;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;color:#46c08a">{{ s.rate }}</span>
+                <span style="font-size:9.5px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em">rate</span>
+              </div>
+              <div data-tstat="1" style="width:88px;flex:0 0 88px;display:flex;flex-direction:column;align-items:flex-end;gap:1px">
+                <span style="font-size:12.5px;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ s.leechers }}</span>
+                <span style="font-size:9.5px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em">leechers</span>
+              </div>
+              <div data-tstat="1" style="width:88px;flex:0 0 88px;display:flex;flex-direction:column;align-items:flex-end;gap:1px">
+                <span style="{{ s.ratioStyle }}">{{ s.ratio }}</span>
+                <span style="font-size:9.5px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em">ratio</span>
+              </div>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+    </div>
+    </sc-if>
+
+    <sc-if value="{{ isDrive }}">
+    <div data-screen-label="Drive" style="display:flex;flex-direction:column;height:100%;overflow:hidden">
+      <sc-if value="{{ driveListMode }}" hint-placeholder-val="{{ true }}">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 24px 16px;border-bottom:1px solid #1c212b;flex:0 0 auto">
+        <div style="display:flex;align-items:center;gap:18px">
+          <h1 style="font-family:Newsreader,Georgia,serif;font-size:25px;font-weight:500;letter-spacing:-0.015em">Drive</h1>
+          <span style="font-size:12px;color:#9aa1b1;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ driveSummary }}</span>
+        </div>
+        <button onClick="{{ openNewDrive }}" style="display:inline-flex;align-items:center;gap:7px;padding:8px 14px;border-radius:6px;background:#8b7cf6;border:1px solid transparent;color:#0c0d11;font-size:13px;font-weight:600;transition:.12s" style-hover="background:#a99ff8">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="M12 5v14M5 12h14"></path></svg> New drive
+        </button>
+      </div>
+
+      <div style="padding:12px 24px 0;font-size:12.5px;color:#9aa1b1">Sync a folder across your devices over Nostr relays.</div>
+
+      <div style="flex:1;overflow-y:auto;padding:14px 24px 40px">
+
+        <sc-if value="{{ driveIsError }}">
+          <div style="display:flex;align-items:center;gap:11px;padding:11px 14px;margin-bottom:14px;border-radius:8px;background:rgba(214,164,78,0.07);border:1px solid rgba(214,164,78,0.28);font-size:12.5px;color:#9aa1b1">
+            <span style="width:7px;height:7px;border-radius:50%;background:#d6a44e;flex:0 0 auto"></span>
+            <span style="flex:1">Couldn’t reach the daemon — showing cached drives.</span>
+            <button style="color:#a99ff8;font-size:12px;font-weight:500" style-hover="text-decoration:underline">Retry</button>
+          </div>
+        </sc-if>
+
+        <sc-if value="{{ driveIsLoading }}">
+          <div style="display:flex;flex-direction:column;gap:10px">
+            <sc-for list="{{ skeletons }}" as="s" hint-placeholder-count="3">
+              <div style="background:#111319;border:1px solid #1c212b;border-radius:12px;padding:17px 18px;animation:pulse 1.6s ease-in-out infinite">
+                <div style="display:flex;align-items:center;gap:11px">
+                  <span style="width:120px;height:17px;border-radius:5px;background:#1c2029"></span>
+                  <span style="width:74px;height:15px;border-radius:20px;background:#1c2029"></span>
+                  <span style="width:62px;height:15px;border-radius:20px;background:#1c2029"></span>
+                </div>
+                <div style="display:flex;gap:26px;margin-top:15px">
+                  <span style="width:54px;height:26px;border-radius:5px;background:#1c2029"></span>
+                  <span style="width:70px;height:26px;border-radius:5px;background:#1c2029"></span>
+                  <span style="width:150px;height:26px;border-radius:5px;background:#1c2029"></span>
+                </div>
+                <div style="display:flex;flex-direction:column;gap:7px;margin-top:16px">
+                  <span style="height:15px;border-radius:4px;background:#161922"></span>
+                  <span style="height:15px;border-radius:4px;background:#161922"></span>
+                  <span style="height:15px;border-radius:4px;background:#161922"></span>
+                </div>
+              </div>
+            </sc-for>
+          </div>
+        </sc-if>
+
+        <sc-if value="{{ driveIsEmpty }}">
+          <div style="display:flex;flex-direction:column;align-items:center;gap:9px;padding:74px 20px;text-align:center">
+            <div style="width:56px;height:56px;border-radius:14px;background:#161922;border:1px solid #1c212b;display:flex;align-items:center;justify-content:center;color:#666e7e;margin-bottom:4px">
+              <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="{{ folderIconPath }}"></path></svg>
+            </div>
+            <div style="font-size:15px;font-weight:600">No drives yet</div>
+            <div style="font-size:12.5px;color:#9aa1b1;max-width:46ch;line-height:1.55">Publish a folder to share it, or subscribe to someone’s npub to mirror theirs.</div>
+            <div style="display:flex;gap:10px;margin-top:12px">
+              <button onClick="{{ openNewDrive }}" style="display:inline-flex;align-items:center;gap:7px;padding:8px 14px;border-radius:6px;background:#8b7cf6;border:1px solid transparent;color:#0c0d11;font-size:13px;font-weight:600" style-hover="background:#a99ff8">Publish a folder</button>
+              <button onClick="{{ openNewDrive }}" style="display:inline-flex;align-items:center;gap:7px;padding:8px 14px;border-radius:6px;background:#161922;border:1px solid #262b36;color:#e8eaf0;font-size:13px;font-weight:500" style-hover="background:#1c2029;border-color:#333a47">Subscribe</button>
+            </div>
+            <div style="display:flex;align-items:center;gap:7px;margin-top:20px;font-size:11px;color:#666e7e">
+              <span style="width:6px;height:6px;border-radius:50%;background:#46c08a;animation:relaypulse 2.4s ease-out infinite"></span> listening for relay updates
+            </div>
+          </div>
+        </sc-if>
+
+        <sc-if value="{{ driveShowList }}">
+          <div style="display:flex;flex-direction:column;gap:10px">
+            <sc-for list="{{ driveCards }}" as="d" hint-placeholder-count="3">
+              <div style="{{ d.cardStyle }}" style-hover="border-color:#262b36">
+
+                <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:14px">
+                  <div style="flex:1;min-width:0">
+                    <button onClick="{{ d.open }}" title="Open drive" style="display:flex;align-items:center;gap:8px;font-family:Newsreader,Georgia,serif;font-size:18px;font-weight:500;letter-spacing:-0.01em;line-height:1.25;text-align:left;transition:color .12s" style-hover="color:#a99ff8">
+                      <span>{{ d.name }}</span>
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto;color:#666e7e"><path d="M9 6l6 6-6 6"></path></svg>
+                    </button>
+                    <div style="display:flex;align-items:center;gap:9px;margin-top:8px;flex-wrap:wrap">
+                      <span style="{{ d.rolePillStyle }}">{{ d.roleLabel }}</span>
+                      <span style="{{ d.routeStyle }}">
+                        <sc-if value="{{ d.isProxy }}"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"></path></svg></sc-if>
+                        <sc-if value="{{ d.isDirect }}"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM3 12h18M12 3c2.5 2.5 2.5 15 0 18M12 3c-2.5 2.5-2.5 15 0 18"></path></svg></sc-if>
+                        <span>{{ d.routeLabel }}</span>
+                      </span>
+                      <sc-if value="{{ d.hasAuthor }}">
+                        <button onClick="{{ d.copyAuthor }}" title="{{ d.authorFull }}" style="display:inline-flex;align-items:center;gap:7px;padding:2px 8px;border-radius:6px;background:#161922;border:1px solid #1c212b;color:#9aa1b1;font-size:11px;transition:.12s" style-hover="background:#1c2029;color:#e8eaf0;border-color:#262b36">
+                          <span>Mirroring <span style="font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ d.authorShort }}</span></span>
+                          <span style="display:flex;color:#666e7e;flex:0 0 auto"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="{{ d.authorIcon }}"></path></svg></span>
+                        </button>
+                      </sc-if>
+                      <sc-if value="{{ d.hasAlso }}">
+                        <span title="{{ d.alsoTitle }}" style="font-size:11px;color:#666e7e;border-bottom:1px dotted #333a47;cursor:help">{{ d.alsoLabel }}</span>
+                      </sc-if>
+                    </div>
+                  </div>
+
+                  <div style="display:flex;align-items:center;gap:6px;flex:0 0 auto">
+                    <sc-if value="{{ d.confirming }}">
+                      <div style="display:flex;align-items:center;gap:9px;padding:4px 4px 4px 11px;border-radius:6px;background:rgba(217,114,107,0.08);border:1px solid rgba(217,114,107,0.22)">
+                        <span style="font-size:11.5px;color:#9aa1b1">Remove? Files stay on disk.</span>
+                        <button onClick="{{ d.doRemove }}" style="padding:4px 10px;border-radius:5px;background:#d9726b;color:#0c0d11;font-size:11.5px;font-weight:600">Remove</button>
+                        <button onClick="{{ d.cancelRemove }}" style="padding:4px 8px;border-radius:5px;color:#9aa1b1;font-size:11.5px" style-hover="color:#e8eaf0">Cancel</button>
+                      </div>
+                    </sc-if>
+                    <sc-if value="{{ d.notConfirming }}">
+                      <button title="Open folder" style="display:inline-flex;align-items:center;gap:7px;padding:5px 10px;border-radius:6px;background:#161922;border:1px solid #1c212b;color:#9aa1b1;font-size:11.5px;transition:.12s" style-hover="background:#1c2029;color:#e8eaf0;border-color:#262b36">
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="{{ extIconPath }}"></path></svg> Open folder
+                      </button>
+                      <button onClick="{{ d.togglePause }}" title="{{ d.pauseLabel }}" style="display:inline-flex;align-items:center;gap:7px;padding:5px 10px;border-radius:6px;background:#161922;border:1px solid #1c212b;color:#9aa1b1;font-size:11.5px;transition:.12s" style-hover="background:#1c2029;color:#e8eaf0;border-color:#262b36">
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="{{ d.pauseIcon }}"></path></svg> {{ d.pauseLabel }}
+                      </button>
+                      <button onClick="{{ d.askRemove }}" title="Remove drive" style="display:flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:6px;color:#666e7e;transition:.12s" style-hover="background:rgba(217,114,107,0.08);color:#d9726b">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="{{ trashIconPath }}"></path></svg>
+                      </button>
+                    </sc-if>
+                  </div>
+                </div>
+
+                <div style="display:flex;align-items:center;gap:26px;margin-top:15px">
+                  <div style="display:flex;flex-direction:column;gap:1px">
+                    <span style="font-size:14px;color:#e8eaf0;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ d.fileCount }}</span>
+                    <span style="font-size:9.5px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em">files</span>
+                  </div>
+                  <div style="display:flex;flex-direction:column;gap:1px">
+                    <span style="font-size:14px;color:#e8eaf0;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ d.sizeLabel }}</span>
+                    <span style="font-size:9.5px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em">size</span>
+                  </div>
+                  <div style="display:flex;flex-direction:column;gap:1px;min-width:0">
+                    <span style="font-size:12px;color:#e8eaf0;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ d.dir }}</span>
+                    <span style="font-size:9.5px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em">folder</span>
+                  </div>
+                </div>
+
+                <table style="width:100%;border-collapse:collapse;font-size:12px;margin-top:15px">
+                  <thead>
+                    <tr>
+                      <th style="text-align:left;font-size:10px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em;font-weight:500;padding:0 12px 8px">File</th>
+                      <th style="text-align:right;font-size:10px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em;font-weight:500;padding:0 12px 8px">Size</th>
+                      <th style="text-align:left;font-size:10px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em;font-weight:500;padding:0 12px 8px">Phase</th>
+                      <th style="text-align:right;font-size:10px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em;font-weight:500;padding:0 12px 8px">Info-hash</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <sc-for list="{{ d.files }}" as="f" hint-placeholder-count="3">
+                      <tr style="{{ f.rowStyle }}">
+                        <td style="padding:6px 12px;border-top:1px solid #1c212b">
+                          <span style="display:flex;align-items:center;gap:9px">
+                            <span style="{{ f.iconStyle }}"></span>
+                            <span>{{ f.path }}</span>
+                          </span>
+                        </td>
+                        <td style="padding:6px 12px;border-top:1px solid #1c212b;text-align:right;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ f.size }}</td>
+                        <td style="padding:6px 12px;border-top:1px solid #1c212b">
+                          <span style="{{ f.phaseStyle }}"><span style="{{ f.dotStyle }}"></span>{{ f.phaseLabel }}</span>
+                        </td>
+                        <td title="{{ f.hashFull }}" style="padding:6px 12px;border-top:1px solid #1c212b;text-align:right;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;color:#9aa1b1;cursor:help">{{ f.hash }}</td>
+                      </tr>
+                    </sc-for>
+                  </tbody>
+                </table>
+
+                <div style="display:flex;align-items:center;gap:14px;margin-top:12px;flex-wrap:wrap">
+                  <sc-if value="{{ d.canToggle }}">
+                    <button onClick="{{ d.toggleFiles }}" style="color:#a99ff8;font-size:12px;font-weight:500" style-hover="text-decoration:underline">{{ d.toggleLabel }}</button>
+                  </sc-if>
+                  <sc-if value="{{ d.hasTrash }}">
+                    <span style="display:flex;align-items:center;gap:8px;font-size:11.5px;color:#666e7e">
+                      <span style="width:5px;height:5px;border-radius:50%;background:#666e7e"></span>
+                      {{ d.trashLabel }}
+                      <a href="#" style="color:#a99ff8;font-size:11.5px">View trash</a>
+                    </span>
+                  </sc-if>
+                </div>
+
+              </div>
+            </sc-for>
+          </div>
+        </sc-if>
+
+      </div>
+      </sc-if>
+
+      <sc-if value="{{ driveDetailOpen }}">
+      <div style="display:flex;flex-direction:column;height:100%;overflow:hidden">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 24px 16px;border-bottom:1px solid #1c212b;flex:0 0 auto">
+          <div style="display:flex;align-items:center;gap:14px;min-width:0">
+            <button onClick="{{ closeDrive }}" title="Back to Drive" style="display:flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:6px;color:#9aa1b1;flex:0 0 auto;transition:.12s" style-hover="background:#1c2029;color:#e8eaf0">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="M15 6l-6 6 6 6"></path></svg>
+            </button>
+            <h1 style="font-family:Newsreader,Georgia,serif;font-size:25px;font-weight:500;letter-spacing:-0.015em;white-space:nowrap">{{ dd.name }}</h1>
+            <span style="{{ dd.rolePillStyle }}">{{ dd.roleLabel }}</span>
+            <span style="{{ dd.routeStyle }}">
+              <sc-if value="{{ dd.isProxy }}"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"></path></svg></sc-if>
+              <sc-if value="{{ dd.isDirect }}"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM3 12h18M12 3c2.5 2.5 2.5 15 0 18M12 3c-2.5 2.5-2.5 15 0 18"></path></svg></sc-if>
+              <span>{{ dd.routeLabel }}</span>
+            </span>
+          </div>
+          <div style="display:flex;align-items:center;gap:6px;flex:0 0 auto">
+            <button title="Open folder" style="display:inline-flex;align-items:center;gap:7px;padding:6px 11px;border-radius:6px;background:#161922;border:1px solid #1c212b;color:#9aa1b1;font-size:11.5px;transition:.12s" style-hover="background:#1c2029;color:#e8eaf0;border-color:#262b36">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="{{ extIconPath }}"></path></svg> Open folder
+            </button>
+            <button onClick="{{ dd.togglePause }}" style="display:inline-flex;align-items:center;gap:7px;padding:6px 11px;border-radius:6px;background:#161922;border:1px solid #1c212b;color:#9aa1b1;font-size:11.5px;transition:.12s" style-hover="background:#1c2029;color:#e8eaf0;border-color:#262b36">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="{{ dd.pauseIcon }}"></path></svg> {{ dd.pauseLabel }}
+            </button>
+          </div>
+        </div>
+
+        <div style="display:flex;align-items:center;gap:9px;padding:12px 24px 0;flex-wrap:wrap">
+          <button onClick="{{ dd.goRoot }}" style="display:flex;align-items:center;gap:7px;font-size:12.5px;color:#9aa1b1;transition:color .12s" style-hover="color:#e8eaf0">
+            <span style="{{ dd.rootIconStyle }}"></span>
+            <span style="font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ dd.name }}</span>
+          </button>
+          <sc-for list="{{ dd.crumbs }}" as="c" hint-placeholder-count="1">
+            <span style="display:flex;align-items:center;gap:9px">
+              <span style="color:#666e7e;font-size:12px">/</span>
+              <button onClick="{{ c.go }}" style="{{ c.style }}" style-hover="color:#e8eaf0">{{ c.label }}</button>
+            </span>
+          </sc-for>
+          <span style="margin-left:auto;font-size:11.5px;color:#666e7e">{{ dd.summary }}</span>
+        </div>
+
+        <div style="flex:1;overflow-y:auto;padding:14px 24px 40px">
+          <div style="background:#111319;border:1px solid #1c212b;border-radius:12px;overflow:hidden">
+            <table style="width:100%;border-collapse:collapse;font-size:12.5px">
+              <thead>
+                <tr>
+                  <th style="text-align:left;font-size:10px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em;font-weight:500;padding:12px 16px 10px">Name</th>
+                  <th style="text-align:right;font-size:10px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em;font-weight:500;padding:12px 16px 10px">Size</th>
+                  <th style="text-align:left;font-size:10px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em;font-weight:500;padding:12px 16px 10px">Phase</th>
+                  <th style="text-align:right;font-size:10px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em;font-weight:500;padding:12px 16px 10px">Info-hash</th>
+                </tr>
+              </thead>
+              <tbody>
+                <sc-if value="{{ dd.notAtRoot }}">
+                  <tr onClick="{{ dd.goUp }}" style="cursor:pointer" style-hover="background:#161922">
+                    <td colspan="4" style="padding:9px 16px;border-top:1px solid #1c212b">
+                      <span style="display:flex;align-items:center;gap:10px;color:#9aa1b1">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto;color:#666e7e"><path d="M12 19V5m0 0-6 6m6-6 6 6"></path></svg>
+                        <span style="font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">..</span>
+                      </span>
+                    </td>
+                  </tr>
+                </sc-if>
+                <sc-for list="{{ dd.folders }}" as="fd" hint-placeholder-count="2">
+                  <tr onClick="{{ fd.open }}" style="cursor:pointer" style-hover="background:#161922">
+                    <td style="padding:9px 16px;border-top:1px solid #1c212b">
+                      <span style="display:flex;align-items:center;gap:10px">
+                        <span style="{{ fd.iconStyle }}"></span>
+                        <span>{{ fd.name }}</span>
+                        <span style="color:#666e7e;font-size:11px">{{ fd.countLabel }}</span>
+                      </span>
+                    </td>
+                    <td style="padding:9px 16px;border-top:1px solid #1c212b;text-align:right;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;color:#9aa1b1">{{ fd.size }}</td>
+                    <td style="padding:9px 16px;border-top:1px solid #1c212b"></td>
+                    <td style="padding:9px 16px;border-top:1px solid #1c212b;text-align:right;color:#666e7e">
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block"><path d="M9 6l6 6-6 6"></path></svg>
+                    </td>
+                  </tr>
+                </sc-for>
+                <sc-for list="{{ dd.files }}" as="f" hint-placeholder-count="3">
+                  <tr style-hover="background:#161922">
+                    <td style="padding:9px 16px;border-top:1px solid #1c212b">
+                      <span style="display:flex;align-items:center;gap:10px">
+                        <span style="{{ f.iconStyle }}"></span>
+                        <span>{{ f.name }}</span>
+                      </span>
+                    </td>
+                    <td style="padding:9px 16px;border-top:1px solid #1c212b;text-align:right;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ f.size }}</td>
+                    <td style="padding:9px 16px;border-top:1px solid #1c212b"><span style="{{ f.phaseStyle }}"><span style="{{ f.dotStyle }}"></span>{{ f.phaseLabel }}</span></td>
+                    <td title="{{ f.hashFull }}" style="padding:9px 16px;border-top:1px solid #1c212b;text-align:right;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;color:#9aa1b1;cursor:help">{{ f.hash }}</td>
+                  </tr>
+                </sc-for>
+              </tbody>
+            </table>
+            <sc-if value="{{ dd.isEmpty }}">
+              <div style="padding:54px 20px;text-align:center;display:flex;flex-direction:column;align-items:center;gap:8px">
+                <div style="width:48px;height:48px;border-radius:12px;background:#161922;border:1px solid #1c212b;display:flex;align-items:center;justify-content:center;color:#666e7e">
+                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="{{ folderIconPath }}"></path></svg>
+                </div>
+                <div style="font-size:13.5px;font-weight:500">This folder is empty</div>
+                <div style="font-size:12px;color:#9aa1b1">Waiting for the next signed index from the author.</div>
+              </div>
+            </sc-if>
+          </div>
+
+          <div style="display:flex;align-items:center;gap:9px;margin-top:12px;font-size:11.5px;color:#666e7e">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="{{ folderIconPath }}"></path></svg>
+            <span style="font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ dd.dir }}</span>
+          </div>
+        </div>
+      </div>
+      </sc-if>
+    </div>
+    </sc-if>
+
+    <sc-if value="{{ isSettings }}">
+    <div data-screen-label="Settings" style="display:flex;flex-direction:column;height:100%;overflow:hidden">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 24px 16px;border-bottom:1px solid #1c212b;flex:0 0 auto">
+        <div style="display:flex;align-items:center;gap:18px"><h1 style="font-family:Newsreader,Georgia,serif;font-size:25px;font-weight:500;letter-spacing:-0.015em">Settings</h1></div>
+      </div>
+
+      <div style="flex:1;overflow-y:auto;padding:14px 24px 40px;max-width:760px">
+        <section data-sset="1" style="display:grid;grid-template-columns:200px 1fr;gap:30px;padding:26px 0;border-bottom:1px solid #1c212b">
+          <div>
+            <h2 style="font-family:Newsreader,Georgia,serif;font-size:18px;font-weight:500">Anonymity</h2>
+            <p style="font-size:12px;color:#9aa1b1;margin-top:6px;line-height:1.5">How carl routes every connection. This is the single most important setting — it’s surfaced on every transfer.</p>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:16px;min-width:0">
+            <div style="display:flex;flex-direction:column;gap:8px">
+              <sc-for list="{{ setRoutes }}" as="r" hint-placeholder-count="3">
+                <button onClick="{{ r.go }}" style="{{ r.style }}">
+                  <span style="{{ r.radioStyle }}"><sc-if value="{{ r.active }}"><span style="{{ r.radioInner }}"></span></sc-if></span>
+                  <span style="{{ r.icStyle }}">
+                    <sc-if value="{{ r.isTor }}"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" style="display:block;flex:0 0 auto"><circle cx="12" cy="12" r="8.5"></circle><circle cx="12" cy="12" r="5"></circle><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"></circle></svg></sc-if>
+                    <sc-if value="{{ r.notTor }}"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="{{ r.icon }}"></path></svg></sc-if>
+                  </span>
+                  <span style="display:flex;flex-direction:column;gap:1px">
+                    <span style="font-size:13px;font-weight:500">{{ r.label }}</span>
+                    <span style="font-size:11.5px;color:#9aa1b1">{{ r.desc }}</span>
+                  </span>
+                </button>
+              </sc-for>
+            </div>
+
+            <sc-if value="{{ showSocks }}">
+              <div style="display:flex;flex-direction:column;gap:7px">
+                <label style="font-size:11.5px;color:#9aa1b1;font-weight:500">SOCKS5 endpoint</label>
+                <input value="socks5h://127.0.0.1:9050" style="background:#161922;border:1px solid #262b36;border-radius:6px;padding:10px 12px;color:#e8eaf0;font-size:13px;outline:none;width:100%;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace" />
+                <span style="font-size:11px;color:#666e7e;line-height:1.5">socks5h:// resolves DNS through the proxy — prevents DNS leaks.</span>
+              </div>
+            </sc-if>
+
+            <div style="{{ leakStyle }}">
+              <span style="{{ leakDotStyle }}"></span>
+              <div style="flex:1">
+                <div style="{{ leakTitleStyle }}">{{ leakTitle }}</div>
+                <div style="font-size:11px;color:#9aa1b1;margin-top:2px;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ leakDetail }}</div>
+              </div>
+              <button style="color:#a99ff8;font-size:12px;font-weight:500;white-space:nowrap;flex:0 0 auto" style-hover="text-decoration:underline">re-test</button>
+            </div>
+
+            <div style="display:flex;align-items:flex-start;gap:10px;padding:12px 14px;background:#161922;border:1px solid #1c212b;border-radius:8px;font-size:11.5px;color:#9aa1b1;line-height:1.55">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="display:block;color:#a99ff8;flex:0 0 auto;margin-top:1px"><path d="M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"></path></svg>
+              <span>With a proxy or Tor set, <strong>DHT, UDP trackers, and inbound connections are disabled by design</strong>. Peers are found over Nostr peer-announce.</span>
+            </div>
+          </div>
+        </section>
+
+        <section data-sset="1" style="display:grid;grid-template-columns:200px 1fr;gap:30px;padding:26px 0;border-bottom:1px solid #1c212b">
+          <div>
+            <h2 style="font-family:Newsreader,Georgia,serif;font-size:18px;font-weight:500">Nostr</h2>
+            <p style="font-size:12px;color:#9aa1b1;margin-top:6px;line-height:1.5">Relays power Discover and peer-announce. Your identity is a local keypair — there’s no account.</p>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:16px;min-width:0">
+            <div style="display:flex;flex-direction:column;gap:7px">
+              <label style="font-size:11.5px;color:#9aa1b1;font-weight:500">Relays <span style="color:#666e7e;font-weight:400;margin-left:6px">one per line · wss:// or ws://&lt;onion&gt;</span></label>
+              <textarea rows="5" value="{{ relaysText }}" onChange="{{ setRelaysText }}" style="background:#161922;border:1px solid #262b36;border-radius:6px;padding:10px 12px;color:#e8eaf0;font-size:13px;outline:none;width:100%;resize:vertical;line-height:1.7;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace"></textarea>
+            </div>
+
+            <div style="display:flex;flex-direction:column;gap:7px">
+              <label style="font-size:11.5px;color:#9aa1b1;font-weight:500">Identity</label>
+              <div style="background:#161922;border:1px solid #1c212b;border-radius:8px;padding:14px;display:flex;flex-direction:column;gap:11px">
+                <div style="display:flex;align-items:center;gap:12px">
+                  <span style="font-size:11px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em;width:88px;flex:0 0 88px">public key</span>
+                  <button onClick="{{ copyNpub }}" title="Copy" style="display:inline-flex;align-items:center;gap:8px;padding:4px 9px;border-radius:6px;background:#161922;border:1px solid #1c212b;color:#9aa1b1;font-size:12px;transition:.12s" style-hover="background:#1c2029;color:#e8eaf0;border-color:#262b36">
+                    <span style="font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">npub1carl9x7k3qp4n…fwd2v3sba</span>
+                    <span style="display:flex;color:#666e7e;flex:0 0 auto"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="{{ npubIcon }}"></path></svg></span>
+                  </button>
+                </div>
+                <div style="display:flex;align-items:center;gap:12px">
+                  <span style="font-size:11px;color:#666e7e;text-transform:uppercase;letter-spacing:0.05em;width:88px;flex:0 0 88px">secret key</span>
+                  <span style="font-size:12px;color:#9aa1b1;letter-spacing:0.06em;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">nsec1 ••••••••••••••••••••••••••••••• <span style="font-family:'IBM Plex Sans',sans-serif;font-size:10.5px;color:#666e7e;letter-spacing:0;margin-left:6px">never shown · stored in OS keychain</span></span>
+                </div>
+                <div style="display:flex;gap:8px;margin-top:2px">
+                  <button style="display:inline-flex;align-items:center;gap:7px;padding:6px 11px;border-radius:6px;background:#161922;border:1px solid #262b36;color:#e8eaf0;font-size:12px;font-weight:500" style-hover="background:#1c2029;border-color:#333a47">Generate new</button>
+                  <button style="display:inline-flex;align-items:center;gap:7px;padding:6px 11px;border-radius:6px;background:#161922;border:1px solid #262b36;color:#e8eaf0;font-size:12px;font-weight:500" style-hover="background:#1c2029;border-color:#333a47">Import nsec…</button>
+                </div>
+              </div>
+            </div>
+
+            <label style="display:flex;align-items:center;gap:9px;font-size:12.5px;color:#9aa1b1;cursor:pointer;padding-top:4px">
+              <input type="checkbox" checked="{{ true }}" style="accent-color:#8b7cf6;width:15px;height:15px" /> <span>Publish a NIP-35 event when I add or seed a torrent</span>
+            </label>
+          </div>
+        </section>
+
+        <section data-sset="1" style="display:grid;grid-template-columns:200px 1fr;gap:30px;padding:26px 0">
+          <div>
+            <h2 style="font-family:Newsreader,Georgia,serif;font-size:18px;font-weight:500">General</h2>
+            <p style="font-size:12px;color:#9aa1b1;margin-top:6px;line-height:1.5">Paths, ports and concurrency.</p>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:16px;min-width:0">
+            <div style="display:flex;flex-direction:column;gap:7px">
+              <label style="font-size:11.5px;color:#9aa1b1;font-weight:500">Default download folder</label>
+              <div style="display:flex;align-items:center;gap:9px;background:#161922;border:1px solid #262b36;border-radius:6px;padding:0 12px">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto;color:#666e7e"><path d="M3 7h6l2 2h10v10H3z"></path></svg>
+                <input value="~/Downloads/carl" style="background:none;border:none;box-shadow:none;padding:10px 0;color:#e8eaf0;font-size:13px;outline:none;width:100%;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace" />
+                <button style="color:#a99ff8;font-size:12px;font-weight:500;white-space:nowrap" style-hover="text-decoration:underline">choose…</button>
+              </div>
+            </div>
+            <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:14px">
+              <div style="display:flex;flex-direction:column;gap:7px">
+                <label style="font-size:11.5px;color:#9aa1b1;font-weight:500">Listen port</label>
+                <input value="51413" style="background:#161922;border:1px solid #262b36;border-radius:6px;padding:10px 12px;color:#e8eaf0;font-size:13px;outline:none;width:100%;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace" />
+                <span style="font-size:11px;color:#666e7e;line-height:1.5">disabled while Tor / proxy is active</span>
+              </div>
+              <div style="display:flex;flex-direction:column;gap:7px">
+                <label style="font-size:11.5px;color:#9aa1b1;font-weight:500">Max active transfers</label>
+                <input value="8" style="background:#161922;border:1px solid #262b36;border-radius:6px;padding:10px 12px;color:#e8eaf0;font-size:13px;outline:none;width:100%;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace" />
+              </div>
+              <div style="display:flex;flex-direction:column;gap:7px">
+                <label style="font-size:11.5px;color:#9aa1b1;font-weight:500">Per-torrent peer limit</label>
+                <input value="60" style="background:#161922;border:1px solid #262b36;border-radius:6px;padding:10px 12px;color:#e8eaf0;font-size:13px;outline:none;width:100%;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace" />
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </div>
+    </sc-if>
+
+  </main>
+
+  <sc-if value="{{ showAdd }}">
+    <div onClick="{{ closeAdd }}" style="position:fixed;inset:0;background:rgba(6,7,10,0.66);backdrop-filter:blur(3px);display:flex;align-items:center;justify-content:center;z-index:200;animation:fadein .14s ease;padding:24px">
+      <div onClick="{{ stop }}" style="background:#111319;border:1px solid #262b36;border-radius:12px;width:560px;max-width:100%;max-height:90vh;overflow:auto;box-shadow:0 24px 60px rgba(0,0,0,.55);animation:rise .18s ease">
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:18px 20px 14px;border-bottom:1px solid #1c212b">
+          <h2 style="font-family:Newsreader,Georgia,serif;font-size:20px;font-weight:500">Add transfer</h2>
+          <button onClick="{{ closeAdd }}" style="display:flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:6px;color:#9aa1b1" style-hover="background:#1c2029;color:#e8eaf0"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="M6 6l12 12M18 6L6 18"></path></svg></button>
+        </div>
+
+        <div style="padding:18px 20px;display:flex;flex-direction:column;gap:16px">
+          <div style="display:flex;gap:2px;background:#161922;padding:3px;border-radius:6px;border:1px solid #1c212b">
+            <sc-for list="{{ addTabs }}" as="a" hint-placeholder-count="3">
+              <button onClick="{{ a.go }}" style="{{ a.style }}">{{ a.label }}</button>
+            </sc-for>
+          </div>
+
+          <sc-if value="{{ addIsMagnet }}">
+            <div style="display:flex;flex-direction:column;gap:7px">
+              <input value="{{ addVal }}" onChange="{{ setAddVal }}" placeholder="magnet:?xt=urn:btih:…" style="background:#161922;border:1px solid #262b36;border-radius:6px;padding:10px 12px;color:#e8eaf0;font-size:13px;outline:none;width:100%;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace" />
+              <span style="font-size:11px;color:#666e7e;line-height:1.5">Paste a magnet URI. The info-hash is parsed and verified locally.</span>
+            </div>
+          </sc-if>
+
+          <sc-if value="{{ addIsUrl }}">
+            <div style="display:flex;flex-direction:column;gap:7px">
+              <input value="{{ addVal }}" onChange="{{ setAddVal }}" placeholder="https://example.org/file.torrent" style="background:#161922;border:1px solid #262b36;border-radius:6px;padding:10px 12px;color:#e8eaf0;font-size:13px;outline:none;width:100%;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace" />
+              <span style="font-size:11px;color:#666e7e;line-height:1.5">carl fetches the .torrent over your selected route.</span>
+            </div>
+          </sc-if>
+
+          <sc-if value="{{ addIsFile }}">
+            <div onClick="{{ dropFile }}" style="{{ dropzoneStyle }}">
+              <span style="{{ dzIconStyle }}"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="M14 3v5h5M7 3h8l4 4v14H7z"></path></svg></span>
+              <div style="{{ dzTitleStyle }}">{{ dzTitle }}</div>
+              <div style="font-size:11.5px;color:#666e7e;max-width:42ch;line-height:1.5">{{ dzSub }}</div>
+            </div>
+          </sc-if>
+
+          <div style="display:flex;flex-direction:column;gap:16px;padding-top:4px">
+            <div style="display:flex;flex-direction:column;gap:7px">
+              <label style="font-size:11.5px;color:#9aa1b1;font-weight:500">Route</label>
+              <div style="display:flex;gap:2px;background:#161922;padding:3px;border-radius:6px;border:1px solid #1c212b">
+                <sc-for list="{{ addRoutes }}" as="r" hint-placeholder-count="3">
+                  <button onClick="{{ r.go }}" style="{{ r.style }}">
+                    <sc-if value="{{ r.isTor }}"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" style="display:block;flex:0 0 auto"><circle cx="12" cy="12" r="8.5"></circle><circle cx="12" cy="12" r="5"></circle><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"></circle></svg></sc-if>
+                    <sc-if value="{{ r.notTor }}"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="{{ r.icon }}"></path></svg></sc-if>
+                    {{ r.label }}
+                  </button>
+                </sc-for>
+              </div>
+              <span style="font-size:11px;color:#666e7e;line-height:1.5">{{ addRouteHint }}</span>
+            </div>
+
+            <label onClick="{{ toggleNostr }}" style="{{ nostrRowStyle }}">
+              <span style="{{ switchStyle }}"><span style="{{ knobStyle }}"></span></span>
+              <span style="display:flex;flex-direction:column;gap:2px">
+                <span style="font-size:12.5px;font-weight:500;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">--nostr · find peers via Nostr</span>
+                <span style="font-size:11.5px;color:#9aa1b1;line-height:1.45">Query relays for peer-announce events in addition to trackers/DHT.</span>
+              </span>
+            </label>
+          </div>
+        </div>
+
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:14px;padding:14px 20px;border-top:1px solid #1c212b;background:#161922">
+          <div style="display:flex;align-items:center;gap:8px">
+            <span style="{{ addRouteBadgeStyle }}">
+              <sc-if value="{{ addRouteIsTor }}"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" style="display:block;flex:0 0 auto"><circle cx="12" cy="12" r="8.5"></circle><circle cx="12" cy="12" r="5"></circle><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"></circle></svg></sc-if>
+              <sc-if value="{{ addRouteNotTor }}"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="{{ addRouteBadgeIcon }}"></path></svg></sc-if>
+              <span>{{ addRouteBadgeLabel }}</span>
+            </span>
+            <sc-if value="{{ addNostr }}"><span style="font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;font-size:10px;font-weight:500;padding:2px 7px;border-radius:5px;letter-spacing:0.02em;color:#a99ff8;background:rgba(139,124,246,0.14)">nostr</span></sc-if>
+          </div>
+          <div style="display:flex;gap:10px">
+            <button onClick="{{ closeAdd }}" style="display:inline-flex;align-items:center;gap:7px;padding:8px 14px;border-radius:6px;background:#161922;border:1px solid #262b36;color:#e8eaf0;font-size:13px;font-weight:500" style-hover="background:#1c2029;border-color:#333a47">Cancel</button>
+            <button onClick="{{ closeAdd }}" style="{{ addSubmitStyle }}">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="M12 5v14M5 12h14"></path></svg> Add transfer
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ showNewDrive }}">
+    <div onClick="{{ closeNewDrive }}" style="position:fixed;inset:0;background:rgba(6,7,10,0.66);backdrop-filter:blur(3px);display:flex;align-items:center;justify-content:center;z-index:200;animation:fadein .14s ease;padding:24px">
+      <div onClick="{{ stop }}" style="background:#111319;border:1px solid #262b36;border-radius:14px;width:560px;max-width:100%;max-height:90vh;overflow:auto;box-shadow:0 24px 60px rgba(0,0,0,.55);animation:rise .18s ease">
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:18px 20px 14px;border-bottom:1px solid #1c212b">
+          <h2 style="font-family:Newsreader,Georgia,serif;font-size:20px;font-weight:500">New drive</h2>
+          <button onClick="{{ closeNewDrive }}" style="display:flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:6px;color:#9aa1b1" style-hover="background:#1c2029;color:#e8eaf0"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="M6 6l12 12M18 6L6 18"></path></svg></button>
+        </div>
+
+        <div style="padding:18px 20px;display:flex;flex-direction:column;gap:16px">
+          <div style="display:flex;gap:2px;background:#161922;padding:3px;border-radius:6px;border:1px solid #1c212b">
+            <sc-for list="{{ ndRoles }}" as="r" hint-placeholder-count="2">
+              <button onClick="{{ r.go }}" style="{{ r.style }}">{{ r.label }}</button>
+            </sc-for>
+          </div>
+
+          <sc-if value="{{ ndIsPublish }}">
+            <div style="display:flex;flex-direction:column;gap:16px">
+              <div style="display:flex;flex-direction:column;gap:7px">
+                <label style="font-size:11.5px;color:#9aa1b1;font-weight:500">Folder to share <span style="color:#666e7e;font-weight:400;margin-left:6px">watched &amp; seeded</span></label>
+                <div style="display:flex;align-items:center;gap:9px;background:#161922;border:1px solid #262b36;border-radius:6px;padding:0 12px">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto;color:#666e7e"><path d="{{ folderIconPath }}"></path></svg>
+                  <input value="{{ ndDir }}" onChange="{{ setNdDir }}" placeholder="~/Music/mixtapes" style="background:none;border:none;padding:10px 0;color:#e8eaf0;font-size:13px;outline:none;width:100%;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace" />
+                  <button style="color:#a99ff8;font-size:12px;font-weight:500;white-space:nowrap" style-hover="text-decoration:underline">Browse…</button>
+                </div>
+                <span style="font-size:11px;color:#666e7e;line-height:1.5">carl hashes every file in this folder and keeps seeding it. Edits are re-published as a new signed index.</span>
+              </div>
+
+              <div style="display:flex;flex-direction:column;gap:7px">
+                <label style="font-size:11.5px;color:#9aa1b1;font-weight:500">Drive name</label>
+                <input value="{{ ndName }}" onChange="{{ setNdName }}" placeholder="my-drive" style="background:#161922;border:1px solid #262b36;border-radius:6px;padding:10px 12px;color:#e8eaf0;font-size:13px;outline:none;width:100%;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace" />
+                <span style="font-size:11px;color:#666e7e;line-height:1.5">Lowercase, no spaces — this becomes the share address.</span>
+              </div>
+            </div>
+          </sc-if>
+
+          <sc-if value="{{ ndIsSubscribe }}">
+            <div style="display:flex;flex-direction:column;gap:16px">
+              <div style="display:flex;flex-direction:column;gap:7px">
+                <label style="font-size:11.5px;color:#9aa1b1;font-weight:500">Author npub</label>
+                <input value="{{ ndAuthor }}" onChange="{{ setNdAuthor }}" placeholder="npub1…" style="{{ ndAuthorInputStyle }}" />
+                <sc-if value="{{ ndAuthorBad }}"><span style="font-size:11px;color:#d9726b;line-height:1.5">Not a valid npub — must be bech32 and decode to 32 bytes.</span></sc-if>
+                <span style="font-size:11px;color:#666e7e;line-height:1.5">The key that signs this drive’s index on your relays.</span>
+              </div>
+
+              <div style="display:flex;flex-direction:column;gap:7px">
+                <label style="font-size:11.5px;color:#9aa1b1;font-weight:500">Drive name</label>
+                <input value="{{ ndName }}" onChange="{{ setNdName }}" placeholder="my-drive" style="background:#161922;border:1px solid #262b36;border-radius:6px;padding:10px 12px;color:#e8eaf0;font-size:13px;outline:none;width:100%;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace" />
+              </div>
+
+              <div style="display:flex;flex-direction:column;gap:7px">
+                <label style="font-size:11.5px;color:#9aa1b1;font-weight:500">Mirror into <span style="color:#666e7e;font-weight:400;margin-left:6px">optional</span></label>
+                <div style="display:flex;align-items:center;gap:9px;background:#161922;border:1px solid #262b36;border-radius:6px;padding:0 12px">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto;color:#666e7e"><path d="{{ folderIconPath }}"></path></svg>
+                  <input value="{{ ndDir }}" onChange="{{ setNdDir }}" placeholder="{{ ndMirrorPlaceholder }}" style="background:none;border:none;padding:10px 0;color:#e8eaf0;font-size:13px;outline:none;width:100%;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace" />
+                  <button style="color:#a99ff8;font-size:12px;font-weight:500;white-space:nowrap" style-hover="text-decoration:underline">Browse…</button>
+                </div>
+              </div>
+
+              <div style="border:1px solid #1c212b;border-radius:8px;background:#161922;overflow:hidden">
+                <button onClick="{{ toggleAdvanced }}" style="display:flex;align-items:center;gap:9px;width:100%;padding:11px 13px;font-size:12px;color:#9aa1b1;text-align:left" style-hover="color:#e8eaf0">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="{{ advancedIcon }}"></path></svg>
+                  <span style="flex:1">Advanced · extra writers</span>
+                </button>
+                <sc-if value="{{ ndAdvanced }}">
+                  <div style="padding:0 13px 13px;display:flex;flex-direction:column;gap:8px">
+                    <sc-for list="{{ ndWriters }}" as="w" hint-placeholder-count="1">
+                      <div style="display:flex;align-items:center;gap:8px">
+                        <input value="{{ w.value }}" onChange="{{ w.set }}" placeholder="npub1…" style="background:#111319;border:1px solid #262b36;border-radius:6px;padding:9px 11px;color:#e8eaf0;font-size:12.5px;outline:none;flex:1;min-width:0;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace" />
+                        <sc-if value="{{ w.canRemove }}">
+                          <button onClick="{{ w.remove }}" title="Remove writer" style="display:flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:6px;color:#666e7e;flex:0 0 auto" style-hover="background:#1c2029;color:#d9726b"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="M6 6l12 12M18 6L6 18"></path></svg></button>
+                        </sc-if>
+                      </div>
+                    </sc-for>
+                    <button onClick="{{ addWriter }}" style="align-self:flex-start;display:inline-flex;align-items:center;gap:7px;padding:6px 11px;border-radius:6px;background:#111319;border:1px solid #262b36;color:#e8eaf0;font-size:12px;font-weight:500" style-hover="background:#1c2029;border-color:#333a47">
+                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="M12 5v14M5 12h14"></path></svg> Add writer
+                    </button>
+                    <span style="font-size:11px;color:#666e7e;line-height:1.5">All writers’ indexes are merged; newest edit per file wins (last-writer-wins).</span>
+                  </div>
+                </sc-if>
+              </div>
+            </div>
+          </sc-if>
+
+          <div style="display:flex;flex-direction:column;gap:7px">
+            <label style="font-size:11.5px;color:#9aa1b1;font-weight:500">Route</label>
+            <div style="display:flex;gap:2px;background:#161922;padding:3px;border-radius:6px;border:1px solid #1c212b">
+              <sc-for list="{{ ndRoutes }}" as="r" hint-placeholder-count="2">
+                <button onClick="{{ r.go }}" style="{{ r.style }}">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="{{ r.icon }}"></path></svg>
+                  {{ r.label }}
+                </button>
+              </sc-for>
+            </div>
+            <span style="font-size:11px;color:#666e7e;line-height:1.5">{{ ndRouteHint }}</span>
+          </div>
+
+          <sc-if value="{{ ndShowIp }}">
+            <div style="display:flex;flex-direction:column;gap:7px">
+              <label style="font-size:11.5px;color:#9aa1b1;font-weight:500">External IP</label>
+              <input value="{{ ndIp }}" onChange="{{ setNdIp }}" placeholder="203.0.113.42" style="background:#161922;border:1px solid #262b36;border-radius:6px;padding:10px 12px;color:#e8eaf0;font-size:13px;outline:none;width:100%;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace" />
+              <span style="font-size:11px;color:#666e7e;line-height:1.5">Public IPv4 so peers can reach you (loopback/private is rejected).</span>
+            </div>
+          </sc-if>
+
+          <sc-if value="{{ ndIsPublish }}">
+            <div style="display:flex;align-items:flex-start;gap:10px;padding:12px 14px;background:#161922;border:1px solid #1c212b;border-radius:8px;font-size:11.5px;color:#9aa1b1;line-height:1.55">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="display:block;color:#a99ff8;flex:0 0 auto;margin-top:1px"><path d="M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"></path></svg>
+              <span>Anyone who can read your relay can see this drive’s file list.</span>
+            </div>
+          </sc-if>
+        </div>
+
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:14px;padding:14px 20px;border-top:1px solid #1c212b;background:#161922">
+          <div style="display:flex;align-items:center;gap:8px">
+            <span style="{{ ndRouteBadgeStyle }}">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="{{ ndRouteBadgeIcon }}"></path></svg>
+              <span>{{ ndRouteBadgeLabel }}</span>
+            </span>
+            <span style="font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace;font-size:10px;font-weight:500;padding:2px 7px;border-radius:5px;letter-spacing:0.02em;color:#a99ff8;background:rgba(139,124,246,0.14)">nostr</span>
+          </div>
+          <div style="display:flex;gap:10px">
+            <button onClick="{{ closeNewDrive }}" style="display:inline-flex;align-items:center;gap:7px;padding:8px 14px;border-radius:6px;background:#161922;border:1px solid #262b36;color:#e8eaf0;font-size:13px;font-weight:500" style-hover="background:#1c2029;border-color:#333a47">Cancel</button>
+            <button onClick="{{ closeNewDrive }}" style="{{ ndSubmitStyle }}">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="M12 5v14M5 12h14"></path></svg> {{ ndSubmitLabel }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ seedFlow }}">
+    <div onClick="{{ closeSeed }}" style="position:fixed;inset:0;background:rgba(6,7,10,0.66);backdrop-filter:blur(3px);display:flex;align-items:center;justify-content:center;z-index:200;animation:fadein .14s ease;padding:24px">
+      <div onClick="{{ stop }}" style="background:#111319;border:1px solid #262b36;border-radius:12px;width:560px;max-width:100%;max-height:90vh;overflow:auto;box-shadow:0 24px 60px rgba(0,0,0,.55);animation:rise .18s ease">
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:18px 20px 14px;border-bottom:1px solid #1c212b">
+          <h2 style="font-family:Newsreader,Georgia,serif;font-size:20px;font-weight:500">Seed a file</h2>
+          <button onClick="{{ closeSeed }}" style="display:flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:6px;color:#9aa1b1" style-hover="background:#1c2029;color:#e8eaf0"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="M6 6l12 12M18 6L6 18"></path></svg></button>
+        </div>
+
+        <sc-if value="{{ seedIsPick }}">
+          <div style="padding:18px 20px;display:flex;flex-direction:column;gap:16px">
+            <div onClick="{{ pickSeedFile }}" style="border:1.5px dashed #262b36;border-radius:8px;padding:30px 20px;text-align:center;display:flex;flex-direction:column;align-items:center;gap:8px;cursor:pointer;transition:.14s;background:#161922" style-hover="border-color:rgba(139,124,246,0.4);background:rgba(139,124,246,0.14)">
+              <span style="color:#666e7e;margin-bottom:2px"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="M14 3v5h5M7 3h8l4 4v14H7z"></path></svg></span>
+              <div style="font-size:13.5px;color:#e8eaf0;font-weight:500">Drop a file or folder, or click to choose</div>
+              <div style="font-size:11.5px;color:#666e7e;max-width:42ch;line-height:1.5">carl hashes it locally and creates the torrent — nothing leaves your machine until you publish.</div>
+            </div>
+          </div>
+        </sc-if>
+
+        <sc-if value="{{ seedNotPick }}">
+          <div style="padding:18px 20px;display:flex;flex-direction:column;gap:16px">
+            <div style="display:flex;align-items:center;gap:10px;padding:11px 13px;background:#161922;border:1px solid #1c212b;border-radius:8px">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto;color:#666e7e"><path d="M14 3v5h5M7 3h8l4 4v14H7z"></path></svg>
+              <span style="font-size:12.5px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ seedFileName }}</span>
+              <span style="color:#9aa1b1;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ seedFileSize }}</span>
+              <button onClick="{{ seedBack }}" style="color:#a99ff8;font-size:12px;font-weight:500" style-hover="text-decoration:underline">change</button>
+            </div>
+
+            <div style="font-size:11.5px;color:#9aa1b1;font-weight:500">Visibility</div>
+            <div style="display:flex;flex-direction:column;gap:8px">
+              <sc-for list="{{ visOptions }}" as="v" hint-placeholder-count="3">
+                <button onClick="{{ v.go }}" style="{{ v.style }}">
+                  <div style="display:flex;align-items:center;justify-content:space-between">
+                    <span style="{{ v.routeStyle }}">
+                      <sc-if value="{{ v.isTor }}"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" style="display:block;flex:0 0 auto"><circle cx="12" cy="12" r="8.5"></circle><circle cx="12" cy="12" r="5"></circle><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"></circle></svg></sc-if>
+                      <sc-if value="{{ v.notTor }}"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="{{ v.icon }}"></path></svg></sc-if>
+                      <span>{{ v.routeLabel }}</span>
+                    </span>
+                    <sc-if value="{{ v.active }}"><span style="color:#a99ff8;display:flex"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="M5 12l4 4 10-10"></path></svg></span></sc-if>
+                  </div>
+                  <div style="font-size:13.5px;font-weight:600;margin-top:8px">{{ v.label }}</div>
+                  <div style="font-size:11.5px;color:#9aa1b1;margin-top:2px;line-height:1.45">{{ v.desc }}</div>
+                </button>
+              </sc-for>
+            </div>
+
+            <sc-if value="{{ seedShowOnion }}">
+              <div style="background:linear-gradient(160deg,rgba(70,192,138,0.08),rgba(70,192,138,0.02));border:1px solid rgba(70,192,138,0.28);border-radius:12px;padding:16px 18px">
+                <div style="display:flex;align-items:center;gap:13px;margin-bottom:13px">
+                  <span style="width:38px;height:38px;border-radius:10px;background:rgba(70,192,138,0.14);color:#46c08a;display:flex;align-items:center;justify-content:center;flex:0 0 auto">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" style="display:block;flex:0 0 auto"><circle cx="12" cy="12" r="8.5"></circle><circle cx="12" cy="12" r="5"></circle><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"></circle></svg>
+                  </span>
+                  <div>
+                    <div style="font-size:14px;font-weight:600;color:#e8eaf0">Seeding as a Tor hidden service</div>
+                    <div style="font-size:12px;color:#9aa1b1;margin-top:1px">Peers reach you over this .onion address. Share it via Discover or directly.</div>
+                  </div>
+                  <span style="margin-left:auto;display:flex;align-items:center;gap:6px;font-size:11.5px;color:#46c08a;font-weight:500">
+                    <span style="width:7px;height:7px;border-radius:50%;background:#46c08a;animation:relaypulse 2.4s ease-out infinite"></span> online
+                  </span>
+                </div>
+                <button onClick="{{ copyFlowOnion }}" title="Copy" style="display:inline-flex;align-items:center;gap:8px;border-radius:6px;background:#161922;border:1px solid #1c212b;color:#9aa1b1;width:100%;justify-content:space-between;padding:9px 12px" style-hover="background:#1c2029;border-color:#262b36">
+                  <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;color:#e8eaf0;font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace">{{ flowOnion }}</span>
+                  <span style="display:flex;color:#666e7e;flex:0 0 auto"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="display:block"><path d="{{ flowOnionIcon }}"></path></svg></span>
+                </button>
+                <div style="display:flex;align-items:center;gap:18px;margin-top:13px;flex-wrap:wrap">
+                  <span style="display:flex;align-items:center;gap:7px;font-size:11.5px;color:#9aa1b1">
+                    <span style="width:6px;height:6px;border-radius:50%;background:#a99ff8"></span> published to <strong>4 relays</strong> over Nostr
+                  </span>
+                  <span style="display:flex;align-items:center;gap:7px;font-size:11.5px;color:#46c08a">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"></path></svg> no IP leaked · tracker &amp; DHT announces disabled
+                  </span>
+                </div>
+              </div>
+            </sc-if>
+          </div>
+
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:14px;padding:14px 20px;border-top:1px solid #1c212b;background:#161922">
+            <label style="display:flex;align-items:center;gap:9px;font-size:12.5px;color:#9aa1b1;cursor:pointer">
+              <input type="checkbox" checked="{{ true }}" style="accent-color:#8b7cf6;width:15px;height:15px" /> <span>Announce over Nostr (NIP-35)</span>
+            </label>
+            <div style="display:flex;gap:10px">
+              <button onClick="{{ closeSeed }}" style="display:inline-flex;align-items:center;gap:7px;padding:8px 14px;border-radius:6px;background:#161922;border:1px solid #262b36;color:#e8eaf0;font-size:13px;font-weight:500" style-hover="background:#1c2029;border-color:#333a47">Cancel</button>
+              <sc-if value="{{ seedIsConfigure }}">
+                <button onClick="{{ seedStart }}" style="display:inline-flex;align-items:center;gap:7px;padding:8px 14px;border-radius:6px;background:#8b7cf6;border:1px solid transparent;color:#0c0d11;font-size:13px;font-weight:600" style-hover="background:#a99ff8">{{ seedStartLabel }}</button>
+              </sc-if>
+              <sc-if value="{{ seedIsLive }}">
+                <button onClick="{{ closeSeed }}" style="display:inline-flex;align-items:center;gap:7px;padding:8px 14px;border-radius:6px;background:#8b7cf6;border:1px solid transparent;color:#0c0d11;font-size:13px;font-weight:600" style-hover="background:#a99ff8">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex:0 0 auto"><path d="M5 12l4 4 10-10"></path></svg> Done
+                </button>
+              </sc-if>
+            </div>
+          </div>
+        </sc-if>
+      </div>
+    </div>
+  </sc-if>
+
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1440,&quot;height&quot;:900},&quot;driveState&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;list&quot;,&quot;empty&quot;,&quot;loading&quot;,&quot;error&quot;],&quot;default&quot;:&quot;list&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Drive&quot;,&quot;label&quot;:&quot;Drive screen state&quot;}}">
+const MONO = "'IBM Plex Mono',ui-monospace,Menlo,monospace";
+
+const ROUTE = {
+  direct: { label: "clearnet", color: "#d6a44e", bg: "rgba(214,164,78,0.1)", bd: "rgba(214,164,78,0.25)" },
+  proxy:  { label: "proxied",  color: "#5aa6db", bg: "rgba(90,166,219,0.1)", bd: "rgba(90,166,219,0.25)" },
+  tor:    { label: "tor",      color: "#46c08a", bg: "rgba(70,192,138,0.1)", bd: "rgba(70,192,138,0.28)" },
+};
+const STATUS = {
+  downloading: { label: "downloading", color: "#a99ff8", bg: "rgba(139,124,246,0.14)", bd: "rgba(139,124,246,0.4)", pulse: "pulse 1.6s ease-in-out infinite" },
+  seeding:     { label: "seeding",     color: "#46c08a", bg: "rgba(70,192,138,0.1)",  bd: "rgba(70,192,138,0.28)", pulse: "pulse 1.6s ease-in-out infinite" },
+  complete:    { label: "complete",    color: "#9aa1b1", bg: "#1c2029",                bd: "#262b36", pulse: "none" },
+  metadata:    { label: "metadata",    color: "#d6a44e", bg: "rgba(214,164,78,0.1)",  bd: "rgba(214,164,78,0.25)", pulse: "pulse 1s ease-in-out infinite" },
+  stalled:     { label: "stalled",     color: "#d9726b", bg: "rgba(217,114,107,0.08)", bd: "rgba(217,114,107,0.22)", pulse: "none" },
+};
+const SOURCE_CHIP = {
+  tracker: { label: "tracker", color: "#5aa6db", bg: "rgba(90,166,219,0.12)" },
+  dht:     { label: "DHT",     color: "#d6a44e", bg: "rgba(214,164,78,0.12)" },
+  nostr:   { label: "nostr",   color: "#a99ff8", bg: "rgba(139,124,246,0.14)" },
+};
+const ICON = {
+  transfers: "M12 3v11m0 0 4-4m-4 4-4-4M5 19h14",
+  discover: "M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14zM20 20l-3.5-3.5",
+  seeding: "M12 21V10m0 0 4 4m-4-4-4 4M5 5h14",
+  settings: "M5 7h14M5 12h14M5 17h14",
+  drive: "M4 12a8 8 0 0 1 13.6-5.7L20 8M20 4v4h-4M20 12a8 8 0 0 1-13.6 5.7L4 16M4 20v-4h4",
+  folder: "M3 7h6l2 2h10v10H3z",
+  pause: "M9 5v14M15 5v14",
+  play: "M7 4l12 8-12 8z",
+  trash: "M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13",
+  ext: "M14 4h6v6M20 4l-9 9M18 14v5H5V6h5",
+  copy: "M9 9h9v11H9zM6 15H4V4h11v2",
+  check: "M5 12l4 4 10-10",
+  download: "M12 3v11m0 0 4-4m-4 4-4-4M5 19h14",
+  globe: "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM3 12h18M12 3c2.5 2.5 2.5 15 0 18M12 3c-2.5 2.5-2.5 15 0 18",
+  shield: "M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z",
+};
+const GB = 1024 * 1024 * 1024, MB = 1024 * 1024, KB = 1024;
+
+const TRANSFERS = [
+  { id: "t1", name: "debian-12.5.0-amd64-netinst.iso", hash: "a1d9f3c2e7b48f10c9a6d2e5f8b3071c4e9a2d6f", status: "downloading", route: "direct", pct: 64, size: 658 * MB, down: 4.2 * MB, up: 256 * KB, eta: "1m 48s", peers: 38 },
+  { id: "t2", name: "archlinux-2026.06.01-x86_64.iso", hash: "7f2b9c4e1a8d603f5e2c7b09a4d6f813c0e5b27a", status: "seeding", route: "tor", pct: 100, size: 1.12 * GB, down: 0, up: 1.8 * MB, eta: "—", peers: 12 },
+  { id: "t3", name: "blender-4.2.0-source.tar.xz", hash: "c3e8a1f60d2b9745e1c8a3f7b04d62e9015c8b4d", status: "downloading", route: "proxy", pct: 23, size: 412 * MB, down: 1.1 * MB, up: 48 * KB, eta: "6m 12s", peers: 9 },
+  { id: "t4", name: "nixos-25.05-minimal-x86_64.iso", hash: "5b1c7e3a9f2d8460c7e1b5a8f3d29c604e7a1f8b", status: "complete", route: "direct", pct: 100, size: 892 * MB, down: 0, up: 0, eta: "—", peers: 0 },
+  { id: "t5", name: "tails-amd64-6.4.img", hash: "9e4d2a7c1f8b3056e9a2d4c7f1b80d35a6e9c243", status: "metadata", route: "tor", pct: 0, size: null, down: 0, up: 0, eta: "—", peers: 3 },
+  { id: "t6", name: "ubuntu-26.04-desktop-amd64.iso", hash: "2c8f1b6e4a9d7350f2c1e8b4a7d96035e1c8a4f7", status: "stalled", route: "proxy", pct: 47, size: 4.7 * GB, down: 0, up: 0, eta: "stalled", peers: 0 },
+  { id: "t7", name: "LibreOffice_24.8_macOS_aarch64.dmg", hash: "8a3f6c1e9b2d7045c8a1f3e6b9d40725e8a3c1f6", status: "seeding", route: "direct", pct: 100, size: 348 * MB, down: 0, up: 412 * KB, eta: "—", peers: 5 },
+];
+const PEERS = [
+  { addr: "188.40.62.17", port: 51413, client: "carl/0.9.2", down: 1.4 * MB, up: 84 * KB, pct: 100, flags: "DUE" },
+  { addr: "94.130.12.88", port: 6881, client: "Transmission 4.0.6", down: 880 * KB, up: 22 * KB, pct: 100, flags: "DU" },
+  { addr: "g7k3xqp4nfz2vw9d6r8slmc1ojtb5haeuyx0qprtkn9fwd2v3sba.onion", port: 0, client: "carl/0.9.2", down: 720 * KB, up: 0, pct: 88, flags: "DE", onion: true },
+  { addr: "tkn9fwd2v3sbag7k3xqp4nfz2vw9d6r8slmc1ojtb5haeuyx0qprt.onion", port: 0, client: "libtorrent 2.0.10", down: 512 * KB, up: 0, pct: 73, flags: "D", onion: true },
+  { addr: "37.221.193.4", port: 51820, client: "qBittorrent 4.6.5", down: 420 * KB, up: 0, pct: 64, flags: "Du" },
+  { addr: "159.69.201.55", port: 6889, client: "Deluge 2.1.1", down: 0, up: 0, pct: 100, flags: "UE" },
+];
+const FILES = [
+  { name: "debian-12.5.0-amd64-netinst.iso", size: 658 * MB, pct: 64, prio: "normal" },
+  { name: "SHA256SUMS", size: 142, pct: 100, prio: "high" },
+  { name: "SHA256SUMS.sign", size: 833, pct: 100, prio: "high" },
+];
+const SOURCES = [
+  { kind: "tracker", label: "udp://tracker.debian.org:6969", detail: "64 seeds · 38 leechers", interval: "next in 14m" },
+  { kind: "tracker", label: "udp://explodie.org:6969/announce", detail: "12 seeds · 4 leechers", interval: "next in 9m" },
+  { kind: "dht", label: "Distributed Hash Table", detail: "1,284 nodes · 22 peers", interval: "—" },
+  { kind: "nostr", label: "Nostr peer-announce (NIP-35)", detail: "announced to 4 relays · 7 peers", interval: "next in 2m" },
+];
+const DISCOVER = [
+  { id: "d1", title: "Debian 12.5 — Full DVD set (amd64)", hash: "a1d9f3c2e7b48f10c9a6d2e5f8b3071c4e9a2d6f", size: 3.7 * GB, files: 3, trackers: 4, desc: "Official Debian 12.5 “bookworm” full DVD images, GPG-verified. Includes installer + offline package set.", verified: true, relays: ["relay.damus.io", "nos.lol", "relay.snort.social"], author: "npub1deb…22qx", age: "2h ago" },
+  { id: "d2", title: "Sintel (2010) — Blender Open Movie · 4K", hash: "4e9a2d6fa1d9f3c2e7b48f10c9a6d2e5f8b3071c", size: 6.1 * GB, files: 12, trackers: 2, desc: "Durian project short film, CC-BY 3.0. 4K ProRes master + 1080p H.264 + source .blend files.", verified: true, relays: ["relay.damus.io", "nostr.wine"], author: "npub1blnd…9f7k", age: "6h ago" },
+  { id: "d3", title: "Big Buck Bunny — 60fps remaster", hash: "c0e5b27a7f2b9c4e1a8d603f5e2c7b09a4d6f813", size: 1.4 * GB, files: 4, trackers: 3, desc: "Peach open movie, CC-BY 3.0. 60fps 1080p remaster with stems and poster art.", verified: true, relays: ["nos.lol", "relay.snort.social", "ws://relay onion"], author: "npub1peach…41dz", age: "1d ago" },
+  { id: "d4", title: "Project Gutenberg — 2026 ebook archive", hash: "015c8b4dc3e8a1f60d2b9745e1c8a3f7b04d62e9", size: 78 * GB, files: 73421, trackers: 1, desc: "Complete public-domain ebook corpus, EPUB + plaintext. Updated 2026-05-30.", verified: false, relays: ["relay.damus.io"], author: "npub1gtnbg…7xqa", age: "3d ago" },
+  { id: "d5", title: "Wikipedia ZIM dump — en_all_nopic 2026-05", hash: "e7a1f8b5b1c7e3a9f2d8460c7e1b5a8f3d29c604", size: 102 * GB, files: 1, trackers: 2, desc: "Kiwix ZIM, English Wikipedia, no images. For offline / air-gapped reading.", verified: true, relays: ["nos.lol", "relay.nostr.band"], author: "npub1kiwix…m0r3", age: "4d ago" },
+];
+const RELAYS = [
+  { url: "wss://relay.damus.io", state: "connected", net: "clearnet" },
+  { url: "wss://nos.lol", state: "connected", net: "clearnet" },
+  { url: "wss://relay.snort.social", state: "connected", net: "clearnet" },
+  { url: "ws://nostrr5h7k3xqp4nfz2vw9d6r8slmc1ojt.onion", state: "connected", net: "tor" },
+  { url: "wss://relay.nostr.band", state: "unreachable", net: "clearnet" },
+  { url: "wss://nostr.wine", state: "connecting", net: "clearnet" },
+];
+const SEEDS = [
+  { id: "s1", name: "archlinux-2026.06.01-x86_64.iso", visibility: "tor", onion: "g7k3xqp4nfz2vw9d6r8slmc1ojtb5haeuyx0qprtkn9fwd2v3sba.onion", size: 1.12 * GB, upTotal: 3.82 * GB, up: 1.8 * MB, leechers: 12, ratio: 3.41, relays: 4 },
+  { id: "s2", name: "LibreOffice_24.8_macOS_aarch64.dmg", visibility: "direct", size: 348 * MB, upTotal: 604 * MB, up: 412 * KB, leechers: 5, ratio: 1.74, relays: 3 },
+  { id: "s3", name: "field-recordings-2025.flac.tar", visibility: "proxy", size: 2.3 * GB, upTotal: 1.1 * GB, up: 96 * KB, leechers: 2, ratio: 0.48, relays: 4 },
+];
+const VIS_META = {
+  direct: { label: "Public IP", route: "direct", desc: "Announced to trackers + DHT. Your IP is visible to peers." },
+  proxy: { label: "Proxy", route: "proxy", desc: "Outbound via SOCKS5. Trackers/DHT disabled; peers via Nostr." },
+  tor: { label: "Tor hidden service", route: "tor", desc: "Seed as a .onion. No IP, no trackers, no DHT — Nostr only." },
+};
+
+const DRIVE_ICON = "M4 12a8 8 0 0 1 13.6-5.7L20 8M20 4v4h-4M20 12a8 8 0 0 1-13.6 5.7L4 16M4 20v-4h4";
+const FOLDER_ICON = "M3 7h6l2 2h10v10H3z";
+// File-type icons: La Capitaine icon theme (keeferrourke/la-capitaine-icon-theme, CC-BY-SA 4.0)
+const MIME = "mimetypes/scalable/", PLACE = "places/scalable/";
+const EXT_ICON = {
+  flac: "application-audio.svg", mp3: "application-audio.svg", m4a: "application-audio.svg",
+  wav: "application-audio.svg", aiff: "application-audio.svg",
+  pdf: "application-pdf.svg",
+  png: "application-image-png.svg", jpg: "application-image-png.svg", jpeg: "application-image-png.svg",
+  gif: "application-image-png.svg",
+  tif: "application-image-tiff.svg", tiff: "application-image-tiff.svg",
+  pack: "application-archive.svg", tar: "application-archive.svg", zip: "application-archive.svg",
+  gz: "application-archive.svg", xz: "application-archive.svg", iso: "application-archive.svg",
+  json: "application-json.svg",
+  mp4: "application-video.svg", mov: "application-video.svg", mkv: "application-video.svg",
+  txt: "application-text.svg", md: "application-text.svg", log: "application-text.svg",
+};
+const KIND_FOLDER = {
+  audio: "folder-music.svg", image: "folder-pictures.svg", doc: "folder-documents.svg",
+};
+function extOf(p) { const i = p.lastIndexOf("."); return i === -1 ? "" : p.slice(i + 1).toLowerCase(); }
+function fileIcon(p) { return MIME + (EXT_ICON[extOf(p)] || "application-text.svg"); }
+function iconStyle(url, px) {
+  return { width: px + "px", height: px + "px", flex: "0 0 auto", display: "block",
+    background: "url('" + url + "') center/contain no-repeat" };
+}
+function extKind(e) {
+  if (["flac", "mp3", "m4a", "wav", "aiff"].indexOf(e) > -1) return "audio";
+  if (["png", "jpg", "jpeg", "gif", "tif", "tiff"].indexOf(e) > -1) return "image";
+  if (["pdf", "txt", "md", "log"].indexOf(e) > -1) return "doc";
+  return "other";
+}
+function folderIconFor(paths) {
+  const tally = {};
+  paths.forEach((p) => { const k = extKind(extOf(p)); tally[k] = (tally[k] || 0) + 1; });
+  let best = null, n = 0;
+  Object.keys(tally).forEach((k) => { if (k !== "other" && tally[k] > n) { n = tally[k]; best = k; } });
+  return PLACE + (KIND_FOLDER[best] || "folder.svg");
+}
+
+const DRIVE_ROUTE = { direct: "direct", i2p: "proxy" };
+const DRIVE_ROUTE_DESC = {
+  direct: "Peers see your IP. Fastest sync.",
+  i2p: "Synced over I2P · no clearnet IP exposed.",
+};
+const PHASE = {
+  seeding:     { label: "seeding",     m: STATUS.seeding },
+  downloading: { label: "downloading", m: STATUS.downloading },
+  starting:    { label: "starting",    m: STATUS.metadata },
+  paused:      { label: "paused",      m: STATUS.complete },
+  failed:      { label: "failed",      m: STATUS.stalled },
+};
+
+const DRIVES = [
+  {
+    id: "drv-7f3a2c", role: "publisher", name: "mixtapes", dir: "~/Music/mixtapes",
+    route: "direct", author: null, also: [], file_count: 12, trash: 0,
+    files: [
+      { path: "ambient-2026-04.flac", size: 312460288, phase: "seeding", info_hash: "9f2c8d41b7e6a053c1d4f8e2b9a30761d5c84f2a", isNew: true },
+      { path: "live-at-the-bunker.mp3", size: 98304512, phase: "seeding", info_hash: "3b7e91a4c6d208f5e1b4a7c9d2f60385e4a91b7c" },
+      { path: "notes-on-side-b.txt", size: 4096, phase: "seeding", info_hash: "c41d5f8e2b9a30761d5c84f2a9f2c8d41b7e6a05" },
+      { path: "dub-selects-vol3.flac", size: 268435456, phase: "seeding", info_hash: "7e6a053c1d4f8e2b9a30761d5c84f2a9f2c8d41b" },
+      { path: "tape-hiss-loops.wav", size: 41943040, phase: "seeding", info_hash: "d208f5e1b4a7c9d2f60385e4a91b7c3b7e91a4c6" },
+      { path: "cover-art-front.png", size: 2359296, phase: "seeding", info_hash: "0761d5c84f2a9f2c8d41b7e6a053c1d4f8e2b9a3" },
+      { path: "cover-art-back.png", size: 2097152, phase: "seeding", info_hash: "85e4a91b7c3b7e91a4c6d208f5e1b4a7c9d2f603" },
+      { path: "tracklist.md", size: 3072, phase: "seeding", info_hash: "4f2a9f2c8d41b7e6a053c1d4f8e2b9a30761d5c8" },
+      { path: "mastering-notes.pdf", size: 184320, phase: "seeding", info_hash: "a7c9d2f60385e4a91b7c3b7e91a4c6d208f5e1b4" },
+      { path: "rehearsal-0412.m4a", size: 57671680, phase: "seeding", info_hash: "1d4f8e2b9a30761d5c84f2a9f2c8d41b7e6a053c" },
+      { path: "field-rec-harbour.wav", size: 134217728, phase: "seeding", info_hash: "b7c3b7e91a4c6d208f5e1b4a7c9d2f60385e4a91" },
+      { path: "archive-index.json", size: 8192, phase: "seeding", info_hash: "9a30761d5c84f2a9f2c8d41b7e6a053c1d4f8e2b" },
+    ],
+  },
+  {
+    id: "drv-b21c90", role: "subscriber", name: "fieldnotes", dir: "~/carl/drive-8d3f1a2c4b9e/fieldnotes",
+    route: "i2p", author: "npub1fieldn0tes9x2k4m8q3v7w5z1c6b4n8m2l0k9j7h5g3f1ds8d3f1a2",
+    also: [], file_count: 3, trash: 0,
+    files: [
+      { path: "index.md", size: 18432, phase: "seeding", info_hash: "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d" },
+      { path: "svalbard-log-07.md", size: 61440, phase: "downloading", info_hash: "f5e4d3c2b1a09876f5e4d3c2b1a09876f5e4d3c2" },
+      { path: "map-tiles.pack", size: 486539264, phase: "starting", info_hash: "08f7e6d5c4b3a291807f6e5d4c3b2a1908f7e6d5" },
+    ],
+  },
+  {
+    id: "drv-4e0d17", role: "subscriber", name: "zine-archive", dir: "~/carl/drive-c4b9e8d3f1a2/zine-archive",
+    route: "direct", author: "npub1en33xq7k3p4nfz2vw9d6r8slmc1ojtb5haeuyx0qprtkn9fwd2cs4v",
+    also: [
+      "npub1collab0writer7h5g3f1d2s4a6q8w0e2r4t6y8u0i2o4p6m8n0b2v4c6",
+      "npub1r1s0graph3r5t7y9u1i3o5p7a9s1d3f5g7h9j1k3l5z7x9c1v3b5n7m9",
+    ],
+    file_count: 6, trash: 1,
+    files: [
+      { path: "issues/01-riot-grrrl.pdf", size: 24117248, phase: "seeding", info_hash: "5ef631cb8a2d4f0917e3b6c9d2a5f80413ce7b6a" },
+      { path: "issues/02-xerox-dreams.pdf", size: 31457280, phase: "seeding", info_hash: "2d4f0917e3b6c9d2a5f80413ce7b6a5ef631cb8a" },
+      { path: "issues/03-photocopy-punk.pdf", size: 28311552, phase: "downloading", info_hash: "917e3b6c9d2a5f80413ce7b6a5ef631cb8a2d4f0" },
+      { path: "scans/contact-sheet.tif", size: 187695104, phase: "paused", info_hash: "c9d2a5f80413ce7b6a5ef631cb8a2d4f0917e3b6" },
+      { path: "credits.md", size: 5120, phase: "seeding", info_hash: "0413ce7b6a5ef631cb8a2d4f0917e3b6c9d2a5f8" },
+      { path: "colophon.txt", size: 2048, phase: "failed", info_hash: "6a5ef631cb8a2d4f0917e3b6c9d2a5f80413ce7b" },
+    ],
+  },
+];
+
+function fmtBytes(b) {
+  if (b == null) return "—";
+  if (b === 0) return "0 B";
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  const i = Math.floor(Math.log(b) / Math.log(1024));
+  const n = b / Math.pow(1024, i);
+  return (n >= 100 || i === 0 ? Math.round(n) : n.toFixed(n >= 10 ? 1 : 2)) + " " + u[i];
+}
+function fmtSpeed(b) { return b ? fmtBytes(b) + "/s" : "—"; }
+function trunc(h, n) { n = n || 8; return h ? h.slice(0, n) + "…" + h.slice(-n) : ""; }
+
+class Component extends DCLogic {
+  state = {
+    screen: "transfers", filter: "all", expanded: "t1", dtab: "peers",
+    q: "", dRoute: "tor", added: {},
+    driveOpen: {}, drivePaused: {}, driveConfirm: null,
+    driveOpenId: null, driveCwd: "",
+    showNewDrive: false, ndRole: "publisher", ndDir: "", ndName: "",
+    ndRoute: "i2p", ndIp: "", ndAuthor: "", ndWriters: [""], ndAdvanced: false,
+    showAdd: false, addTab: "magnet", addVal: "", addRoute: "tor", addNostr: true, addDropped: null,
+    seedFlow: false, seedStep: "pick", seedFile: null, seedVis: "tor",
+    setRoute: "tor", copied: null,
+    relaysText: "wss://relay.damus.io\nwss://nos.lol\nwss://relay.snort.social\nws://nostrr5h7k3xqp4nfz2vw9d6r8slmc1ojt.onion\nwss://relay.nostr.band",
+  };
+
+  componentDidMount() {
+    try {
+      const s = localStorage.getItem("carl.screen");
+      if (s) this.setState({ screen: s });
+    } catch (e) {}
+  }
+
+  go = (screen) => {
+    this.setState({ screen });
+    try { localStorage.setItem("carl.screen", screen); } catch (e) {}
+  };
+
+  copy = (key, value) => {
+    try { navigator.clipboard.writeText(value); } catch (e) {}
+    this.setState({ copied: key });
+    clearTimeout(this._ct);
+    this._ct = setTimeout(() => this.setState({ copied: null }), 1300);
+  };
+
+  // ---- style builders ----
+  routeBadge(route, sm) {
+    const m = ROUTE[route] || ROUTE.direct;
+    return {
+      display: "inline-flex", alignItems: "center", gap: sm ? "4px" : "5px",
+      padding: sm ? "2px 7px" : "2.5px 8px", borderRadius: "20px",
+      fontSize: sm ? "10.5px" : "11.5px", fontWeight: 500, lineHeight: 1,
+      border: "1px solid " + m.bd, whiteSpace: "nowrap", color: m.color, background: m.bg,
+    };
+  }
+  navStyle(active) {
+    return {
+      display: "flex", alignItems: "center", gap: "11px", padding: "9px 11px", borderRadius: "6px",
+      color: active ? "#e8eaf0" : "#9aa1b1", fontSize: "13.5px", fontWeight: 450, textAlign: "left",
+      background: active ? "rgba(139,124,246,0.14)" : "transparent", transition: "background .12s, color .12s",
+    };
+  }
+  segStyle(active) {
+    return {
+      display: "flex", alignItems: "center", gap: "6px", padding: "5px 11px", borderRadius: "5px",
+      fontSize: "12.5px", fontWeight: 450, transition: ".12s",
+      color: active ? "#e8eaf0" : "#9aa1b1",
+      background: active ? "#1c2029" : "transparent",
+      boxShadow: active ? "0 1px 2px rgba(0,0,0,.3)" : "none",
+    };
+  }
+  rslStyle(active, route, lg) {
+    const c = active ? (route === "tor" ? "#46c08a" : route === "proxy" ? "#5aa6db" : "#d6a44e") : "#9aa1b1";
+    return {
+      display: "flex", alignItems: "center", gap: "6px",
+      padding: lg ? "7px 14px" : "5px 12px", borderRadius: "5px",
+      fontSize: lg ? "12.5px" : "12px", fontWeight: 450, transition: ".12s",
+      color: c, background: active ? "#1c2029" : "transparent",
+    };
+  }
+
+  renderVals() {
+    const st = this.state;
+    const connected = RELAYS.filter((r) => r.state === "connected").length;
+    const navCounts = {
+      transfers: TRANSFERS.filter((t) => t.status === "downloading" || t.status === "metadata").length,
+      seeding: SEEDS.length,
+      drive: DRIVES.length,
+    };
+
+    const nav = [["transfers", "Transfers"], ["discover", "Discover"], ["seeding", "Seeding"], ["drive", "Drive"], ["settings", "Settings"]].map(([id, label]) => {
+      const active = st.screen === id;
+      const count = navCounts[id];
+      return {
+        id, label, icon: ICON[id], go: () => this.go(id),
+        style: this.navStyle(active),
+        icStyle: { display: "flex", color: active ? "#a99ff8" : "#666e7e" },
+        hasCount: count != null && count > 0, count,
+        countStyle: {
+          fontFamily: MONO, fontSize: "11px", padding: "1px 7px", borderRadius: "9px",
+          minWidth: "20px", textAlign: "center",
+          background: active ? "#8b7cf6" : "#1c2029",
+          color: active ? "#0c0d11" : "#9aa1b1",
+          fontWeight: active ? 600 : 400,
+        },
+      };
+    });
+
+    // ---- transfers ----
+    const counts = {
+      all: TRANSFERS.length,
+      downloading: TRANSFERS.filter((t) => t.status === "downloading" || t.status === "metadata").length,
+      seeding: TRANSFERS.filter((t) => t.status === "seeding").length,
+      complete: TRANSFERS.filter((t) => t.status === "complete").length,
+    };
+    const segs = [["all", "All"], ["downloading", "Active"], ["seeding", "Seeding"], ["complete", "Done"]].map(([id, label]) => {
+      const active = st.filter === id;
+      return {
+        id, label, count: counts[id], go: () => this.setState({ filter: id }),
+        style: this.segStyle(active),
+        countStyle: { fontFamily: MONO, fontSize: "10.5px", color: active ? "#a99ff8" : "#666e7e" },
+      };
+    });
+
+    const rows = TRANSFERS.filter((t) => {
+      if (st.filter === "all") return true;
+      if (st.filter === "downloading") return t.status === "downloading" || t.status === "metadata" || t.status === "stalled";
+      return t.status === st.filter;
+    }).map((t) => {
+      const expanded = st.expanded === t.id;
+      const sm = STATUS[t.status];
+      const meta = t.status === "metadata";
+      const stalled = t.status === "stalled";
+      const fillColor = stalled ? "#666e7e" : meta ? "#d6a44e" : "#8b7cf6";
+      const stripe = stalled ? "rgba(0,0,0,.2)" : "rgba(255,255,255,.14)";
+      return {
+        id: t.id, name: t.name, peers: t.peers, eta: t.eta, expanded,
+        toggle: () => this.setState({ expanded: expanded ? null : t.id }),
+        sizeLabel: fmtBytes(t.size), downLabel: fmtSpeed(t.down), upLabel: fmtSpeed(t.up),
+        pctLabel: meta ? "fetching metadata…" : t.pct + "%",
+        isTor: t.route === "tor", isProxy: t.route === "proxy", isDirect: t.route === "direct",
+        routeLabel: ROUTE[t.route].label, routeStyle: this.routeBadge(t.route, true),
+        statusLabel: sm.label,
+        statusStyle: {
+          display: "inline-flex", alignItems: "center", gap: "6px", padding: "2px 9px 2px 7px",
+          borderRadius: "20px", fontSize: "11px", fontWeight: 500, lineHeight: 1,
+          border: "1px solid " + sm.bd, whiteSpace: "nowrap", color: sm.color, background: sm.bg,
+        },
+        statusDotStyle: { width: "6px", height: "6px", borderRadius: "50%", background: "currentColor", flex: "0 0 auto", animation: sm.pulse },
+        wrapStyle: {
+          background: expanded ? "#161922" : "#111319",
+          border: "1px solid " + (expanded ? "rgba(139,124,246,0.4)" : "#1c212b"),
+          borderRadius: "8px", overflow: "hidden", transition: "border-color .12s",
+        },
+        chevStyle: {
+          color: expanded ? "#a99ff8" : "#666e7e", display: "flex", flex: "0 0 16px",
+          transition: "transform .18s", transform: expanded ? "rotate(90deg)" : "none",
+        },
+        barStyle: {
+          flex: 1, height: "6px", borderRadius: "3px", background: "#1c2029", overflow: "hidden", position: "relative",
+          backgroundImage: "repeating-linear-gradient(90deg, transparent 0 7px, rgba(0,0,0,.25) 7px 8px)",
+        },
+        fillStyle: {
+          height: "100%", borderRadius: "3px", width: (meta ? 8 : t.pct) + "%",
+          background: fillColor,
+          backgroundImage: "repeating-linear-gradient(90deg, " + fillColor + " 0 7px, " + stripe + " 7px 8px)",
+          transition: "width .5s ease",
+          animation: meta ? "metaslide 1.4s ease-in-out infinite" : "none",
+        },
+      };
+    });
+
+    const dtabCounts = { peers: 38, files: FILES.length };
+    const dtabs = [["peers", "Peers"], ["pieces", "Pieces"], ["sources", "Sources"], ["files", "Files"]].map(([id, label]) => {
+      const active = st.dtab === id;
+      return {
+        id, label, go: () => this.setState({ dtab: id }),
+        hasCount: dtabCounts[id] != null, count: dtabCounts[id],
+        style: {
+          display: "flex", alignItems: "center", gap: "7px", padding: "8px 13px", fontSize: "12.5px",
+          fontWeight: 450, borderBottom: "2px solid " + (active ? "#8b7cf6" : "transparent"),
+          marginBottom: "-1px", transition: ".12s", color: active ? "#e8eaf0" : "#9aa1b1",
+        },
+      };
+    });
+
+    const pieceStates = (() => {
+      const n = 360, have = Math.floor(0.64 * n);
+      return Array.from({ length: n }, (_, i) => (i < have ? 1 : i < have + 6 ? (i % 2 === 0 ? 2 : 0) : 0));
+    })();
+    const pieces = pieceStates.map((s) => ({
+      style: {
+        width: "11px", height: "11px", borderRadius: "2px",
+        background: s === 1 ? "#8b7cf6" : s === 2 ? "#a99ff8" : "#1c2029",
+        animation: s === 2 ? "pcpulse 1.2s ease-in-out infinite" : "none",
+      },
+    }));
+
+    // ---- discover ----
+    const q = st.q.trim().toLowerCase();
+    const results = DISCOVER.filter((d) => !q || d.title.toLowerCase().includes(q) || d.desc.toLowerCase().includes(q)).map((d) => {
+      const added = !!st.added[d.id];
+      const magnet = "magnet:?xt=urn:btih:" + d.hash;
+      return {
+        id: d.id, title: d.title, desc: d.desc, author: d.author, age: d.age,
+        verified: d.verified, unverified: !d.verified,
+        size: fmtBytes(d.size), files: d.files.toLocaleString(), trackers: d.trackers,
+        hashLabel: "btih:" + trunc(d.hash, 7),
+        hashIcon: st.copied === d.id + "-h" ? ICON.check : ICON.copy,
+        copyHash: () => this.copy(d.id + "-h", magnet),
+        magnetLabel: st.copied === d.id + "-m" ? "copied" : "copy magnet",
+        magnetIcon: st.copied === d.id + "-m" ? ICON.check : ICON.copy,
+        copyMagnet: () => this.copy(d.id + "-m", magnet),
+        relays: d.relays.map((r) => {
+          const isOnion = r.includes("onion");
+          return { name: r.replace(/^wss?:\/\//, "").replace("ws://", ""), isOnion, isPlain: !isOnion };
+        }),
+        add: () => { if (!added) this.setState((s) => ({ added: Object.assign({}, s.added, { [d.id]: true }) })); },
+        btnLabel: added ? "Added" : "Download",
+        btnIcon: added ? ICON.check : ICON.download,
+        btnStyle: {
+          display: "inline-flex", alignItems: "center", gap: "7px", padding: "6px 11px", borderRadius: "6px",
+          background: added ? "#46c08a" : "#8b7cf6", border: "1px solid transparent",
+          color: "#0c0d11", fontSize: "12px", fontWeight: 600, transition: ".12s",
+        },
+      };
+    });
+
+    const relays = RELAYS.map((r) => {
+      const host = r.url.replace(/^wss?:\/\//, "");
+      return {
+        title: r.url + " · " + r.state,
+        host: r.net === "tor" ? host.slice(0, 6) + "…onion" : host,
+        dotStyle: {
+          width: "7px", height: "7px", borderRadius: "50%", flex: "0 0 auto",
+          background: r.state === "connected" ? "#46c08a" : r.state === "connecting" ? "#d6a44e" : "#d9726b",
+          animation: r.state === "connected" ? "relaypulse 2.4s ease-out infinite" : r.state === "connecting" ? "pulse 1s ease-in-out infinite" : "none",
+          boxShadow: r.net === "tor" ? "0 0 0 2px rgba(70,192,138,.25)" : "none",
+        },
+      };
+    });
+
+    const dRoutes = [["direct", "Direct"], ["proxy", "Proxy"], ["tor", "Tor"]].map(([id, label]) => ({
+      id, label, go: () => this.setState({ dRoute: id }), style: this.rslStyle(st.dRoute === id, id, false),
+    }));
+
+    // ---- seeding ----
+    const torSeed = SEEDS.find((s) => s.visibility === "tor");
+    const seeds = SEEDS.map((s) => ({
+      name: s.name,
+      isTor: s.visibility === "tor", isProxy: s.visibility === "proxy", isDirect: s.visibility === "direct",
+      routeLabel: ROUTE[s.visibility].label, routeStyle: this.routeBadge(s.visibility, true),
+      hasOnion: !!s.onion, noOnion: !s.onion,
+      onionShort: s.onion ? trunc(s.onion, 12) : "",
+      visLabel: VIS_META[s.visibility].label,
+      size: fmtBytes(s.size), upTotal: fmtBytes(s.upTotal), rate: fmtSpeed(s.up),
+      leechers: s.leechers, ratio: s.ratio.toFixed(2),
+      ratioStyle: { fontSize: "12.5px", fontFamily: MONO, color: s.ratio >= 1 ? "#46c08a" : "#e8eaf0" },
+    }));
+
+    const visOptions = Object.keys(VIS_META).map((id) => {
+      const m = VIS_META[id], active = st.seedVis === id;
+      return {
+        id, label: m.label, desc: m.desc, active,
+        go: () => this.setState({ seedVis: id }),
+        isTor: m.route === "tor", notTor: m.route !== "tor",
+        icon: m.route === "proxy" ? ICON.shield : ICON.globe,
+        routeLabel: ROUTE[m.route].label, routeStyle: this.routeBadge(m.route, true),
+        style: {
+          textAlign: "left", padding: "12px 14px", borderRadius: "8px", transition: ".12s",
+          background: active ? "rgba(139,124,246,0.14)" : "#161922",
+          border: "1px solid " + (active ? "rgba(139,124,246,0.4)" : "#1c212b"),
+        },
+      };
+    });
+
+    // ---- settings ----
+    const leakSafe = st.setRoute !== "direct";
+    const setRoutes = [
+      ["direct", "Direct", "Connect straight to peers. Fastest, no privacy.", ICON.globe],
+      ["proxy", "SOCKS5 proxy", "Tunnel all traffic through a SOCKS5 proxy.", ICON.shield],
+      ["tor", "Tor", "Route through the Tor network. Seed as a hidden service.", null],
+    ].map(([id, label, desc, icon]) => {
+      const active = st.setRoute === id;
+      const isTor = id === "tor";
+      const dot = active ? (isTor ? "#46c08a" : "#8b7cf6") : "#262b36";
+      return {
+        id, label, desc, icon, active, isTor, notTor: !isTor,
+        go: () => this.setState({ setRoute: id }),
+        style: {
+          display: "flex", alignItems: "center", gap: "13px", padding: "12px 14px", borderRadius: "8px",
+          textAlign: "left", transition: ".12s",
+          background: active ? "rgba(139,124,246,0.14)" : "#161922",
+          border: "1px solid " + (active ? "rgba(139,124,246,0.4)" : "#1c212b"),
+        },
+        radioStyle: {
+          width: "17px", height: "17px", borderRadius: "50%", border: "2px solid " + dot,
+          flex: "0 0 auto", transition: ".12s", position: "relative", display: "block",
+        },
+        radioInner: { position: "absolute", inset: "3px", borderRadius: "50%", background: dot, display: "block" },
+        icStyle: { color: active ? (isTor ? "#46c08a" : "#a99ff8") : "#666e7e", display: "flex" },
+      };
+    });
+
+    // ---- drive ----
+    const driveState = this.props.driveState || "list";
+    const totalBytes = DRIVES.reduce((a, d) => a + d.files.reduce((x, f) => x + f.size, 0), 0);
+
+    const driveCards = DRIVES.map((d) => {
+      const open = !!st.driveOpen[d.id];
+      const paused = !!st.drivePaused[d.id];
+      const shown = open ? d.files : d.files.slice(0, 3);
+      const hidden = d.files.length - shown.length;
+      const rt = DRIVE_ROUTE[d.route];
+      const pub = d.role === "publisher";
+      return {
+        id: d.id, name: d.name, dir: d.dir,
+        open: () => this.setState({ driveOpenId: d.id, driveCwd: "" }),
+        isPublisher: pub, isSubscriber: !pub,
+        roleLabel: pub ? "publisher" : "subscriber",
+        rolePillStyle: {
+          display: "inline-flex", alignItems: "center", gap: "6px", padding: "2px 9px", borderRadius: "20px",
+          fontSize: "11px", fontWeight: 500, lineHeight: 1, whiteSpace: "nowrap",
+          color: pub ? "#a99ff8" : "#9aa1b1",
+          background: pub ? "rgba(139,124,246,0.14)" : "transparent",
+          border: "1px solid " + (pub ? "rgba(139,124,246,0.4)" : "#262b36"),
+        },
+        routeStyle: this.routeBadge(rt, true), routeLabel: ROUTE[rt].label,
+        isTor: false, isProxy: rt === "proxy", isDirect: rt === "direct",
+        hasAuthor: !pub && !!d.author,
+        authorShort: d.author ? d.author.slice(0, 10) + "…" + d.author.slice(-4) : "",
+        authorFull: d.author || "",
+        authorIcon: st.copied === d.id + "-a" ? ICON.check : ICON.copy,
+        copyAuthor: () => this.copy(d.id + "-a", d.author),
+        hasAlso: d.also.length > 0,
+        alsoLabel: "+" + d.also.length + " writer" + (d.also.length === 1 ? "" : "s"),
+        alsoTitle: d.also.join("\n"),
+        fileCount: d.file_count, sizeLabel: fmtBytes(d.files.reduce((a, f) => a + f.size, 0)),
+        statLine: d.file_count + " files · " + fmtBytes(d.files.reduce((a, f) => a + f.size, 0)),
+        hasTrash: d.trash > 0,
+        trashLabel: d.trash + " file" + (d.trash === 1 ? "" : "s") + " moved to .trash",
+        paused, pauseLabel: paused ? "Resume" : "Pause",
+        pauseIcon: paused ? ICON.play : ICON.pause,
+        togglePause: () => this.setState((s) => ({ drivePaused: Object.assign({}, s.drivePaused, { [d.id]: !paused }) })),
+        confirming: st.driveConfirm === d.id, notConfirming: st.driveConfirm !== d.id,
+        askRemove: () => this.setState({ driveConfirm: d.id }),
+        cancelRemove: () => this.setState({ driveConfirm: null }),
+        doRemove: () => this.setState({ driveConfirm: null }),
+        cardStyle: {
+          background: "#111319", border: "1px solid " + (paused ? "#1c212b" : "#1c212b"),
+          borderRadius: "12px", padding: "17px 18px", transition: "border-color .12s",
+          opacity: paused ? 0.62 : 1,
+        },
+        files: shown.map((f) => {
+          const p = PHASE[f.phase] || PHASE.starting;
+          return {
+            path: f.path, size: fmtBytes(f.size), phaseLabel: p.label, iconStyle: iconStyle(fileIcon(f.path), 17),
+            hash: f.info_hash.slice(0, 8) + "…", hashFull: f.info_hash,
+            phaseStyle: {
+              display: "inline-flex", alignItems: "center", gap: "6px", padding: "2px 9px 2px 7px",
+              borderRadius: "20px", fontSize: "10.5px", fontWeight: 500, lineHeight: 1, whiteSpace: "nowrap",
+              color: p.m.color, background: p.m.bg, border: "1px solid " + p.m.bd,
+              transition: "color .3s, background .3s, border-color .3s",
+            },
+            dotStyle: { width: "5px", height: "5px", borderRadius: "50%", background: "currentColor", flex: "0 0 auto", animation: p.m.pulse },
+            rowStyle: { animation: f.isNew ? "rowflash 2.6s ease-out 1" : "none" },
+          };
+        }),
+        canToggle: d.files.length > 3,
+        toggleLabel: open ? "show less" : "show all " + d.files.length + " files",
+        toggleFiles: () => this.setState((s) => ({ driveOpen: Object.assign({}, s.driveOpen, { [d.id]: !open }) })),
+        hiddenNote: hidden > 0 ? hidden + " more" : "",
+      };
+    });
+
+    // ---- drive detail (single-directory view) ----
+    const openDrive = DRIVES.find((d) => d.id === st.driveOpenId) || null;
+    let dd = null;
+    if (openDrive) {
+      const cwd = st.driveCwd;
+      const prefix = cwd ? cwd + "/" : "";
+      const folderMap = new Map();
+      const fileList = [];
+      openDrive.files.forEach((f) => {
+        if (!f.path.startsWith(prefix)) return;
+        const rest = f.path.slice(prefix.length);
+        const slash = rest.indexOf("/");
+        if (slash === -1) { fileList.push({ f: f, name: rest }); return; }
+        const nm = rest.slice(0, slash);
+        const e = folderMap.get(nm) || { name: nm, count: 0, size: 0, paths: [] };
+        e.count += 1; e.size += f.size; e.paths.push(f.path);
+        folderMap.set(nm, e);
+      });
+      const parts = cwd ? cwd.split("/") : [];
+      const rt = DRIVE_ROUTE[openDrive.route];
+      const pub = openDrive.role === "publisher";
+      const paused = !!st.drivePaused[openDrive.id];
+      dd = {
+        name: openDrive.name, dir: openDrive.dir + (cwd ? "/" + cwd : ""),
+        rootIconStyle: iconStyle(folderIconFor(openDrive.files.map((f) => f.path)), 16),
+        isPublisher: pub, roleLabel: pub ? "publisher" : "subscriber",
+        rolePillStyle: {
+          display: "inline-flex", alignItems: "center", gap: "6px", padding: "2px 9px", borderRadius: "20px",
+          fontSize: "11px", fontWeight: 500, lineHeight: 1, whiteSpace: "nowrap",
+          color: pub ? "#a99ff8" : "#9aa1b1",
+          background: pub ? "rgba(139,124,246,0.14)" : "transparent",
+          border: "1px solid " + (pub ? "rgba(139,124,246,0.4)" : "#262b36"),
+        },
+        routeStyle: this.routeBadge(rt, true), routeLabel: ROUTE[rt].label,
+        isProxy: rt === "proxy", isDirect: rt === "direct",
+        pauseLabel: paused ? "Resume" : "Pause", pauseIcon: paused ? ICON.play : ICON.pause,
+        togglePause: () => this.setState((s) => ({ drivePaused: Object.assign({}, s.drivePaused, { [openDrive.id]: !paused }) })),
+        atRoot: parts.length === 0, notAtRoot: parts.length > 0,
+        crumbs: parts.map((p, i) => ({
+          label: p, isLast: i === parts.length - 1,
+          go: () => this.setState({ driveCwd: parts.slice(0, i + 1).join("/") }),
+          style: { fontSize: "12.5px", color: i === parts.length - 1 ? "#e8eaf0" : "#9aa1b1", fontFamily: MONO },
+        })),
+        goRoot: () => this.setState({ driveCwd: "" }),
+        goUp: () => this.setState({ driveCwd: parts.slice(0, -1).join("/") }),
+        folders: Array.from(folderMap.values()).sort((a, b) => a.name.localeCompare(b.name)).map((e) => ({
+          name: e.name, size: fmtBytes(e.size), iconStyle: iconStyle(folderIconFor(e.paths), 19),
+          countLabel: e.count + " item" + (e.count === 1 ? "" : "s"),
+          open: () => this.setState({ driveCwd: (cwd ? cwd + "/" : "") + e.name }),
+        })),
+        files: fileList.sort((a, b) => a.name.localeCompare(b.name)).map((it) => {
+          const f = it.f, p = PHASE[f.phase] || PHASE.starting;
+          return {
+            name: it.name, size: fmtBytes(f.size), phaseLabel: p.label, iconStyle: iconStyle(fileIcon(f.path), 19),
+            hash: f.info_hash.slice(0, 8) + "…", hashFull: f.info_hash,
+            phaseStyle: {
+              display: "inline-flex", alignItems: "center", gap: "6px", padding: "2px 9px 2px 7px",
+              borderRadius: "20px", fontSize: "10.5px", fontWeight: 500, lineHeight: 1, whiteSpace: "nowrap",
+              color: p.m.color, background: p.m.bg, border: "1px solid " + p.m.bd,
+              transition: "color .3s, background .3s, border-color .3s",
+            },
+            dotStyle: { width: "5px", height: "5px", borderRadius: "50%", background: "currentColor", flex: "0 0 auto", animation: p.m.pulse },
+          };
+        }),
+        isEmpty: folderMap.size === 0 && fileList.length === 0,
+        summary: (folderMap.size ? folderMap.size + " folder" + (folderMap.size === 1 ? "" : "s") + " · " : "")
+          + fileList.length + " file" + (fileList.length === 1 ? "" : "s"),
+      };
+    }
+
+    const ndPub = st.ndRole === "publisher";
+    const npubOk = /^npub1[023456789acdefghjklmnpqrstuvwxyz]{20,}$/.test(st.ndAuthor.trim());
+    const ndValid = ndPub
+      ? !!(st.ndDir.trim() && st.ndName.trim() && (st.ndRoute !== "direct" || st.ndIp.trim()))
+      : !!(npubOk && st.ndName.trim());
+
+    const drive = {
+      driveIsList: driveState === "list", driveIsEmpty: driveState === "empty",
+      driveIsLoading: driveState === "loading", driveIsError: driveState === "error",
+      driveShowList: driveState === "list" || driveState === "error",
+      driveCards, skeletons: [1, 2, 3],
+      driveListMode: !openDrive, driveDetailOpen: !!openDrive, dd,
+      closeDrive: () => this.setState({ driveOpenId: null, driveCwd: "" }),
+      driveSummary: DRIVES.length + " drive" + (DRIVES.length === 1 ? "" : "s") + " · " + fmtBytes(totalBytes) + " synced",
+      driveIconPath: DRIVE_ICON, folderIconPath: FOLDER_ICON,
+      pauseIconPath: ICON.pause, trashIconPath: ICON.trash, extIconPath: ICON.ext,
+      openNewDrive: () => this.setState({ showNewDrive: true }),
+      closeNewDrive: () => this.setState({ showNewDrive: false }),
+      showNewDrive: st.showNewDrive,
+      ndIsPublish: ndPub, ndIsSubscribe: !ndPub,
+      ndRoles: [["publisher", "Publish a folder"], ["subscriber", "Subscribe"]].map(([id, label]) => ({
+        id, label, go: () => this.setState({ ndRole: id }),
+        style: {
+          flex: 1, padding: "7px", borderRadius: "5px", fontSize: "12.5px", fontWeight: 450, transition: ".12s",
+          color: st.ndRole === id ? "#e8eaf0" : "#9aa1b1",
+          background: st.ndRole === id ? "#1c2029" : "transparent",
+        },
+      })),
+      ndDir: st.ndDir, setNdDir: (e) => this.setState({ ndDir: e.target.value }),
+      ndName: st.ndName, setNdName: (e) => this.setState({ ndName: e.target.value }),
+      ndIp: st.ndIp, setNdIp: (e) => this.setState({ ndIp: e.target.value }),
+      ndAuthor: st.ndAuthor, setNdAuthor: (e) => this.setState({ ndAuthor: e.target.value }),
+      ndAuthorBad: st.ndAuthor.trim().length > 0 && !npubOk,
+      ndAuthorInputStyle: {
+        background: "#161922", borderRadius: "6px", padding: "10px 12px", color: "#e8eaf0",
+        fontSize: "13px", outline: "none", width: "100%", fontFamily: MONO,
+        border: "1px solid " + (st.ndAuthor.trim().length > 0 && !npubOk ? "rgba(217,114,107,0.5)" : "#262b36"),
+      },
+      ndShowIp: st.ndRoute === "direct",
+      ndRouteHint: DRIVE_ROUTE_DESC[st.ndRoute],
+      ndMirrorPlaceholder: "~/carl/drive-" + (npubOk ? st.ndAuthor.trim().slice(5, 17) : "<npub12>") + "-" + (st.ndName.trim() || "<name>"),
+      ndRoutes: [["direct", "Direct"], ["i2p", "I2P"]].map(([id, label]) => ({
+        id, label, go: () => this.setState({ ndRoute: id }),
+        style: this.rslStyle(st.ndRoute === id, DRIVE_ROUTE[id], true),
+        isProxy: id === "i2p", icon: id === "i2p" ? ICON.shield : ICON.globe,
+      })),
+      ndAdvanced: st.ndAdvanced,
+      toggleAdvanced: () => this.setState({ ndAdvanced: !st.ndAdvanced }),
+      advancedIcon: st.ndAdvanced ? "M6 15l6-6 6 6" : "M6 9l6 6 6-6",
+      ndWriters: st.ndWriters.map((w, i) => ({
+        value: w, index: i, canRemove: st.ndWriters.length > 1,
+        set: (e) => {
+          const v = e.target.value;
+          this.setState((s) => { const n = s.ndWriters.slice(); n[i] = v; return { ndWriters: n }; });
+        },
+        remove: () => this.setState((s) => ({ ndWriters: s.ndWriters.filter((_, j) => j !== i) })),
+      })),
+      addWriter: () => this.setState((s) => ({ ndWriters: s.ndWriters.concat([""]) })),
+      ndRouteBadgeStyle: this.routeBadge(DRIVE_ROUTE[st.ndRoute], true),
+      ndRouteBadgeLabel: ROUTE[DRIVE_ROUTE[st.ndRoute]].label,
+      ndRouteBadgeIcon: st.ndRoute === "i2p" ? ICON.shield : ICON.globe,
+      ndSubmitLabel: ndPub ? "Start publishing" : "Subscribe",
+      ndSubmitStyle: {
+        display: "inline-flex", alignItems: "center", gap: "7px", padding: "8px 14px", borderRadius: "6px",
+        background: "#8b7cf6", border: "1px solid transparent", color: "#0c0d11", fontSize: "13px", fontWeight: 600,
+        opacity: ndValid ? 1 : 0.4, cursor: ndValid ? "pointer" : "not-allowed",
+      },
+    };
+
+    // ---- add modal ----
+    const addTabs = [["magnet", "Magnet link"], ["file", ".torrent file"], ["url", "HTTP URL"]].map(([id, label]) => {
+      const active = st.addTab === id;
+      return {
+        id, label, go: () => this.setState({ addTab: id }),
+        style: {
+          flex: 1, padding: "7px", borderRadius: "5px", fontSize: "12.5px", fontWeight: 450, transition: ".12s",
+          color: active ? "#e8eaf0" : "#9aa1b1", background: active ? "#1c2029" : "transparent",
+        },
+      };
+    });
+    const addRoutes = [["direct", "Direct"], ["proxy", "Proxy"], ["tor", "Tor"]].map(([id, label]) => ({
+      id, label, go: () => this.setState({ addRoute: id }), style: this.rslStyle(st.addRoute === id, id, true),
+      isTor: id === "tor", notTor: id !== "tor", icon: id === "proxy" ? ICON.shield : ICON.globe,
+    }));
+    const canAdd = (st.addTab === "magnet" && st.addVal.trim()) || (st.addTab === "url" && st.addVal.trim()) || (st.addTab === "file" && st.addDropped);
+
+    const flowOnion = "kx7m2qp9nfz4vw8d6r3slmc0ojtb5haeuyx1qprtkn7fwd5v2sba.onion";
+
+    return {
+      nav, relayRatio: connected + "/" + RELAYS.length,
+      isTransfers: st.screen === "transfers", isDiscover: st.screen === "discover",
+      isSeeding: st.screen === "seeding", isDrive: st.screen === "drive",
+      isSettings: st.screen === "settings",
+      ...drive,
+      stop: (e) => e.stopPropagation(),
+
+      segs, rows,
+      totalDown: fmtSpeed(TRANSFERS.reduce((a, t) => a + t.down, 0)),
+      totalUp: fmtSpeed(TRANSFERS.reduce((a, t) => a + t.up, 0)),
+      dtabs,
+      isPeersTab: st.dtab === "peers", isPiecesTab: st.dtab === "pieces",
+      isSourcesTab: st.dtab === "sources", isFilesTab: st.dtab === "files",
+      peers: PEERS.map((p) => ({
+        addr: (p.onion ? trunc(p.addr, 10) : p.addr) + (p.port ? ":" + p.port : ""),
+        client: p.client, pct: p.pct, down: fmtSpeed(p.down), up: fmtSpeed(p.up), flags: p.flags, onion: !!p.onion,
+        rowStyle: p.onion ? { background: "rgba(70,192,138,0.04)" } : {},
+      })),
+      pieces, pieceLabel: pieceStates.filter((s) => s === 1).length + " / " + pieceStates.length + " pieces · 256 KB each",
+      sources: SOURCES.map((s) => {
+        const c = SOURCE_CHIP[s.kind];
+        return {
+          label: s.label, detail: s.detail, interval: s.interval, chipLabel: c.label,
+          chipStyle: { fontFamily: MONO, fontSize: "10px", fontWeight: 500, padding: "2px 7px", borderRadius: "5px", letterSpacing: "0.02em", color: c.color, background: c.bg },
+        };
+      }),
+      files: FILES.map((f) => ({
+        name: f.name, size: fmtBytes(f.size), pct: f.pct, prio: f.prio,
+        prioStyle: {
+          fontSize: "10.5px", padding: "1.5px 8px", borderRadius: "5px", textTransform: "capitalize",
+          color: f.prio === "high" ? "#a99ff8" : "#9aa1b1",
+          background: f.prio === "high" ? "rgba(139,124,246,0.14)" : "#1c2029",
+        },
+      })),
+
+      q: st.q, hasQ: !!st.q,
+      setQ: (e) => this.setState({ q: e.target.value }),
+      clearQ: () => this.setState({ q: "" }),
+      dRoutes, relays, results,
+      resultCount: results.length, noResults: results.length === 0,
+      emptyMsg: "No NIP-35 torrent events on your relays match “" + st.q + "”. Try a broader term or add more relays in Settings.",
+
+      seeds,
+      seedUpTotal: fmtSpeed(SEEDS.reduce((a, s) => a + s.up, 0)),
+      seedCountLabel: SEEDS.length + " files",
+      seedOnion: torSeed.onion,
+      seedOnionIcon: st.copied === "seed-onion" ? ICON.check : ICON.copy,
+      copySeedOnion: () => this.copy("seed-onion", torSeed.onion),
+      openSeed: () => this.setState({ seedFlow: true, seedStep: "pick", seedFile: null, seedVis: "tor" }),
+      closeSeed: () => this.setState({ seedFlow: false }),
+      seedFlow: st.seedFlow,
+      seedIsPick: st.seedStep === "pick", seedNotPick: st.seedStep !== "pick",
+      seedIsConfigure: st.seedStep === "configure", seedIsLive: st.seedStep === "live",
+      seedShowOnion: st.seedStep === "live" && st.seedVis === "tor",
+      seedStartLabel: st.seedVis === "tor" ? "Start hidden service" : "Start seeding",
+      seedStart: () => this.setState({ seedStep: "live" }),
+      seedBack: () => this.setState({ seedStep: "pick" }),
+      pickSeedFile: () => this.setState({ seedFile: { name: "ubuntu-keynote-2026.mp4", size: 1.84 * GB }, seedStep: "configure" }),
+      seedFileName: st.seedFile ? st.seedFile.name : "",
+      seedFileSize: st.seedFile ? fmtBytes(st.seedFile.size) : "",
+      visOptions, flowOnion,
+      flowOnionIcon: st.copied === "flow-onion" ? ICON.check : ICON.copy,
+      copyFlowOnion: () => this.copy("flow-onion", flowOnion),
+
+      setRoutes, showSocks: st.setRoute !== "direct",
+      leakTitle: leakSafe ? "Leak check passed" : "Direct connection — IP exposed",
+      leakDetail: st.setRoute === "tor" ? "exit via 127.0.0.1:9050 · circuit OK · DNS over Tor"
+        : st.setRoute === "proxy" ? "all traffic via socks5h://127.0.0.1:9050 · DNS proxied"
+        : "188.40.62.17 visible to trackers, DHT & peers",
+      leakStyle: {
+        display: "flex", alignItems: "center", gap: "12px", padding: "12px 14px", borderRadius: "8px",
+        background: leakSafe ? "rgba(70,192,138,0.07)" : "rgba(214,164,78,0.07)",
+        border: "1px solid " + (leakSafe ? "rgba(70,192,138,0.28)" : "rgba(214,164,78,0.28)"),
+      },
+      leakDotStyle: {
+        width: "9px", height: "9px", borderRadius: "50%", flex: "0 0 auto",
+        background: leakSafe ? "#46c08a" : "#d6a44e",
+        boxShadow: leakSafe ? "0 0 0 4px rgba(70,192,138,.18)" : "0 0 0 4px rgba(214,164,78,.18)",
+      },
+      leakTitleStyle: { fontSize: "12.5px", fontWeight: 600, color: leakSafe ? "#46c08a" : "#d6a44e" },
+      relaysText: st.relaysText,
+      setRelaysText: (e) => this.setState({ relaysText: e.target.value }),
+      npubIcon: st.copied === "npub" ? ICON.check : ICON.copy,
+      copyNpub: () => this.copy("npub", "npub1carl9x7k3qp4nfz2vw9d6r8slmc1ojtb5haeuyx0qprtkn9fwd2v3sba"),
+
+      showAdd: st.showAdd,
+      openAdd: () => this.setState({ showAdd: true }),
+      closeAdd: () => this.setState({ showAdd: false }),
+      addTabs, addRoutes, addVal: st.addVal, addNostr: st.addNostr,
+      setAddVal: (e) => this.setState({ addVal: e.target.value }),
+      addIsMagnet: st.addTab === "magnet", addIsUrl: st.addTab === "url", addIsFile: st.addTab === "file",
+      dropFile: () => this.setState({ addDropped: "debian-12.5.0-amd64-netinst.iso.torrent" }),
+      dzTitle: st.addDropped || "Drop a .torrent file here",
+      dzSub: st.addDropped ? "Parsed · 3 files · 658 MB" : "or click to browse",
+      dzTitleStyle: {
+        fontSize: "13.5px", color: "#e8eaf0", fontWeight: 500,
+        fontFamily: st.addDropped ? MONO : "inherit",
+      },
+      dropzoneStyle: {
+        border: "1.5px dashed #262b36", borderRadius: "8px", padding: "30px 20px", textAlign: "center",
+        display: "flex", flexDirection: "column", alignItems: "center", gap: "8px", cursor: "pointer",
+        transition: ".14s", background: "#161922",
+      },
+      dzIconStyle: { color: "#666e7e", marginBottom: "2px" },
+      addRouteHint: st.addRoute === "direct" ? "Peers see your IP."
+        : st.addRoute === "proxy" ? "Tunneled via SOCKS5 · trackers & DHT off."
+        : "Anonymous · trackers & DHT off · Nostr only.",
+      addRouteBadgeStyle: this.routeBadge(st.addRoute, true),
+      addRouteBadgeLabel: ROUTE[st.addRoute].label,
+      addRouteBadgeIcon: st.addRoute === "proxy" ? ICON.shield : ICON.globe,
+      addRouteIsTor: st.addRoute === "tor", addRouteNotTor: st.addRoute !== "tor",
+      toggleNostr: () => this.setState({ addNostr: !st.addNostr }),
+      nostrRowStyle: {
+        display: "flex", alignItems: "flex-start", gap: "12px", padding: "12px 14px", borderRadius: "8px",
+        cursor: "pointer", transition: ".12s",
+        background: st.addNostr ? "rgba(139,124,246,0.14)" : "#161922",
+        border: "1px solid " + (st.addNostr ? "rgba(139,124,246,0.4)" : "#1c212b"),
+      },
+      switchStyle: {
+        width: "36px", height: "21px", borderRadius: "11px", flex: "0 0 auto", position: "relative",
+        transition: ".16s", marginTop: "1px", display: "block",
+        background: st.addNostr ? "#8b7cf6" : "#1c2029",
+        border: "1px solid " + (st.addNostr ? "transparent" : "#262b36"),
+      },
+      knobStyle: {
+        position: "absolute", top: "2px", left: st.addNostr ? "18px" : "2px", width: "15px", height: "15px",
+        borderRadius: "50%", background: "#fff", transition: ".16s", display: "block",
+      },
+      addSubmitStyle: {
+        display: "inline-flex", alignItems: "center", gap: "7px", padding: "8px 14px", borderRadius: "6px",
+        background: "#8b7cf6", border: "1px solid transparent", color: "#0c0d11", fontSize: "13px", fontWeight: 600,
+        opacity: canAdd ? 1 : 0.4, cursor: canAdd ? "pointer" : "not-allowed",
+      },
+    };
+  }
+}
+</script>
+</body>
+</html>

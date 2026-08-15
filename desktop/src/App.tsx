@@ -3,6 +3,7 @@ import { Sidebar, type Screen } from "./Sidebar";
 import { TransfersScreen } from "./screens/Transfers";
 import { DiscoverScreen } from "./screens/Discover";
 import { SeedingScreen } from "./screens/Seeding";
+import { DriveScreen } from "./screens/Drive";
 import { FollowingScreen } from "./screens/Following";
 import { SettingsScreen } from "./screens/Settings";
 import { AddModal } from "./modals/AddModal";
@@ -164,6 +165,7 @@ export function App() {
         {screen === "discover" && <DiscoverScreen />}
         {screen === "following" && <FollowingScreen />}
         {screen === "seeding" && <SeedingScreen />}
+        {screen === "drive" && <DriveScreen />}
         {screen === "settings" && <SettingsScreen />}
       </main>
 

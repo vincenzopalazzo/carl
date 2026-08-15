@@ -34,6 +34,7 @@ const tor_control = @import("tor_control.zig");
 const state_mod = @import("state.zig");
 const workdir = @import("workdir.zig");
 const follow_mod = @import("follow.zig");
+const drive_mod = @import("drive.zig");
 const nostr_config = @import("nostr_config.zig");
 const nostr_mod = @import("nostr.zig");
 const secp = @import("secp.zig");
@@ -61,6 +62,12 @@ pub const Error = error{
     /// A follow request was invalid: a malformed pubkey, an unsupported route
     /// (follows run on `direct` or `i2p`), or the publisher is already followed.
     InvalidFollow,
+    /// A drive request was invalid: a bad role, an empty dir/name, a
+    /// subscriber without a valid author npub/hex (or an invalid `also`
+    /// writer), an unsupported route (drives run on `direct` or `i2p`), a
+    /// publisher with no local Nostr identity, or the same drive (role,
+    /// author, name, dir) is already running.
+    InvalidDrive,
 } || Allocator.Error;
 
 /// Daemon-level configuration mirrored to the Settings screen. String fields
@@ -195,6 +202,33 @@ const FollowHandle = struct {
     }
 };
 
+/// One shared drive: the drive worker plus the metadata the daemon needs to
+/// list and persist it.
+const DriveHandle = struct {
+    allocator: Allocator,
+    id: []u8,
+    role: drive_mod.Role,
+    dir: []u8,
+    name: []u8,
+    /// Subscriber: the followed author's pubkey; null for a publisher.
+    author: ?[32]u8,
+    /// Extra writer pubkeys (multi-writer subscriptions); owned slice.
+    also: []const [32]u8,
+    route: api.Route,
+    drive: *drive_mod.Drive,
+
+    /// Stop the drive (joins its loop thread — can block on in-flight relay
+    /// queries) and free everything. Call without holding the manager mutex.
+    fn destroy(self: *DriveHandle) void {
+        self.drive.destroy();
+        self.allocator.free(self.id);
+        self.allocator.free(self.dir);
+        self.allocator.free(self.name);
+        self.allocator.free(self.also);
+        self.allocator.destroy(self);
+    }
+};
+
 pub const Manager = struct {
     allocator: Allocator,
     mutex: std.Thread.Mutex = .{},
@@ -204,6 +238,10 @@ pub const Manager = struct {
     /// `transfers`; handles are destroyed outside the lock (joins threads).
     follows: std.ArrayList(*FollowHandle) = .empty,
     next_follow_id: usize = 1,
+    /// Shared drives (drive workers). Guarded by `mutex` like `follows`;
+    /// handles are destroyed outside the lock (joins the drive loop thread).
+    drives: std.ArrayList(*DriveHandle) = .empty,
+    next_drive_id: usize = 1,
     cfg: Config,
     /// While replaying persisted state on startup, suppress per-add persistence
     /// (we write once at the end of `restore`).
@@ -251,6 +289,8 @@ pub const Manager = struct {
         // No lock: deinit happens after the server loop has stopped.
         for (self.follows.items) |f| f.destroy();
         self.follows.deinit(self.allocator);
+        for (self.drives.items) |d| d.destroy();
+        self.drives.deinit(self.allocator);
         for (self.transfers.items) |mt| mt.destroy();
         self.transfers.deinit(self.allocator);
         for (self.retained_specs.items) |s| self.allocator.free(s.source);
@@ -811,6 +851,170 @@ pub const Manager = struct {
     }
 
     // -----------------------------------------------------------------------
+    // Drives (shared folders over Nostr)
+    // -----------------------------------------------------------------------
+
+    /// Add a shared drive: `role_str` is "publisher" (watch `dir` and publish
+    /// every file as its own torrent) or "subscriber" (mirror the author's
+    /// published drive index into `dir`). `author_str` (npub or 64-char hex)
+    /// is required for a subscriber and ignored for a publisher; `also_strs`
+    /// are extra writer pubkeys for a multi-writer subscription. Drives run on
+    /// `direct` or `i2p`. Returns the new drive id (owned by the caller).
+    pub fn addDrive(
+        self: *Manager,
+        role_str: []const u8,
+        dir_arg: []const u8,
+        name: []const u8,
+        author_str: ?[]const u8,
+        also_strs: []const []const u8,
+        route: api.Route,
+    ) Error![]u8 {
+        const role = std.meta.stringToEnum(drive_mod.Role, role_str) orelse return error.InvalidDrive;
+        if (dir_arg.len == 0 or name.len == 0) return error.InvalidDrive;
+        if (route != .direct and route != .i2p) return error.InvalidDrive;
+
+        var author: ?[32]u8 = null;
+        if (role == .subscriber) {
+            const s = author_str orelse return error.InvalidDrive;
+            author = follow_mod.parsePubkeyArg(s) catch return error.InvalidDrive;
+        }
+        var also_list: std.ArrayList([32]u8) = .empty;
+        defer also_list.deinit(self.allocator);
+        for (also_strs) |s| {
+            const pk = follow_mod.parsePubkeyArg(s) catch return error.InvalidDrive;
+            also_list.append(self.allocator, pk) catch return error.OutOfMemory;
+        }
+
+        self.mutex.lock();
+        for (self.drives.items) |d| {
+            if (d.role == role and std.meta.eql(d.author, author) and
+                std.mem.eql(u8, d.name, name) and std.mem.eql(u8, d.dir, dir_arg))
+            {
+                self.mutex.unlock();
+                return error.InvalidDrive; // already added
+            }
+        }
+        const id_num = self.next_drive_id;
+        self.next_drive_id += 1;
+        self.mutex.unlock();
+
+        // Once the handle owns these, its `destroy` frees them; the errdefers
+        // below are disarmed so a later failure can't double-free.
+        var handle_owned = false;
+        const id = std.fmt.allocPrint(self.allocator, "d{d}", .{id_num}) catch return error.OutOfMemory;
+        errdefer if (!handle_owned) self.allocator.free(id);
+        const dir = self.allocator.dupe(u8, dir_arg) catch return error.OutOfMemory;
+        errdefer if (!handle_owned) self.allocator.free(dir);
+        const name_owned = self.allocator.dupe(u8, name) catch return error.OutOfMemory;
+        errdefer if (!handle_owned) self.allocator.free(name_owned);
+        const also = also_list.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
+        errdefer if (!handle_owned) self.allocator.free(also);
+
+        const drv = drive_mod.Drive.create(self.allocator, .{
+            .role = role,
+            .dir = dir_arg,
+            .drive = name,
+            .author = author,
+            .also = also,
+            .route = route,
+        }) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // NoKey (a publisher with no local Nostr identity), InvalidOptions
+            // and UnsupportedRoute are all caller-fixable request problems.
+            else => return error.InvalidDrive,
+        };
+        errdefer if (!handle_owned) drv.destroy();
+        drv.start() catch return error.SessionInitFailed;
+
+        const handle = self.allocator.create(DriveHandle) catch return error.OutOfMemory;
+        handle.* = .{
+            .allocator = self.allocator,
+            .id = id,
+            .role = role,
+            .dir = dir,
+            .name = name_owned,
+            .author = author,
+            .also = also,
+            .route = route,
+            .drive = drv,
+        };
+        handle_owned = true;
+
+        self.mutex.lock();
+        self.drives.append(self.allocator, handle) catch {
+            self.mutex.unlock();
+            handle.destroy(); // frees id/dir/name/also + stops the drive
+            return error.OutOfMemory;
+        };
+        self.mutex.unlock();
+
+        self.persist();
+        return self.allocator.dupe(u8, id);
+    }
+
+    /// Stop and remove the drive with `id`. Returns true if found. Joins the
+    /// drive loop thread, so this can block on an in-flight relay query.
+    pub fn removeDrive(self: *Manager, id: []const u8) Error!bool {
+        self.mutex.lock();
+        var found: ?*DriveHandle = null;
+        var idx: usize = 0;
+        for (self.drives.items, 0..) |d, i| {
+            if (std.mem.eql(u8, d.id, id)) {
+                found = d;
+                idx = i;
+                break;
+            }
+        }
+        if (found) |_| _ = self.drives.orderedRemove(idx);
+        self.mutex.unlock();
+
+        if (found) |d| {
+            d.destroy(); // joins threads outside the lock
+            self.persist();
+            return true;
+        }
+        return false;
+    }
+
+    /// Snapshot all drives (with their file tables) into `arena`.
+    pub fn drivesSnapshot(self: *Manager, arena: Allocator) Allocator.Error![]api.Drive {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const out = try arena.alloc(api.Drive, self.drives.items.len);
+        for (self.drives.items, 0..) |d, i| {
+            const infos = try d.drive.filesSnapshot(arena);
+            const files = try arena.alloc(api.DriveFile, infos.len);
+            for (infos, 0..) |info, k| {
+                files[k] = .{
+                    .path = info.path,
+                    .size = info.size,
+                    .phase = info.phase.jsonName(),
+                    .info_hash = try arena.dupe(u8, &info.info_hash_hex),
+                };
+            }
+            const author: ?[]const u8 = if (d.author) |pk|
+                nip19.encode32(arena, .npub, pk) catch null
+            else
+                null;
+            const also = try arena.alloc([]const u8, d.also.len);
+            for (d.also, 0..) |pk, k| also[k] = nip19.encode32(arena, .npub, pk) catch "";
+            out[i] = .{
+                .id = try arena.dupe(u8, d.id),
+                .role = @tagName(d.role),
+                .name = try arena.dupe(u8, d.name),
+                .dir = try arena.dupe(u8, d.dir),
+                .route = d.route,
+                .author = author,
+                .also = also,
+                .files = files,
+                .file_count = files.len,
+            };
+        }
+        return out;
+    }
+
+    // -----------------------------------------------------------------------
     // Snapshots
     // -----------------------------------------------------------------------
 
@@ -963,9 +1167,40 @@ pub const Manager = struct {
             const pk = aa.dupe(u8, &f.pk_hex) catch break;
             follow_specs.append(aa, .{ .pubkey = pk, .route = f.route }) catch break;
         }
+        var drive_specs: std.ArrayList(state_mod.DriveSpec) = .empty;
+        for (self.drives.items) |d| {
+            const id = aa.dupe(u8, d.id) catch break;
+            const ddir = aa.dupe(u8, d.dir) catch break;
+            const dname = aa.dupe(u8, d.name) catch break;
+            var author_hex: []const u8 = "";
+            if (d.author) |pk| {
+                var hex: [64]u8 = undefined;
+                secp.toHex(&pk, &hex);
+                author_hex = aa.dupe(u8, &hex) catch break;
+            }
+            var also_buf: std.ArrayList(u8) = .empty;
+            for (d.also, 0..) |pk, k| {
+                if (k > 0) also_buf.append(aa, ',') catch break;
+                var hex: [64]u8 = undefined;
+                secp.toHex(&pk, &hex);
+                also_buf.appendSlice(aa, &hex) catch break;
+            }
+            drive_specs.append(aa, .{
+                .id = id,
+                .role = switch (d.role) {
+                    .publisher => .publisher,
+                    .subscriber => .subscriber,
+                },
+                .dir = ddir,
+                .name = dname,
+                .author = author_hex,
+                .also = also_buf.items,
+                .route = d.route,
+            }) catch break;
+        }
         self.mutex.unlock();
 
-        state_mod.save(self.allocator, route, dir, specs.items, follow_specs.items) catch |e| {
+        state_mod.save(self.allocator, route, dir, specs.items, follow_specs.items, drive_specs.items) catch |e| {
             log.warn("failed to persist daemon state: {}", .{e});
         };
     }
@@ -1059,6 +1294,26 @@ pub const Manager = struct {
                 log.warn("restore: could not re-follow '{s}': {}", .{ f.pubkey, e });
             }
         }
+        // Re-spawn persisted drives. Like follows, a failed re-add (bad key,
+        // missing identity, OOM) is logged and dropped; the drive loop itself
+        // retries its relays/peers forever once spawned.
+        var drives_n: usize = 0;
+        for (st.drives) |ds| {
+            const author_opt: ?[]const u8 = if (ds.author.len > 0) ds.author else null;
+            var also_strs: std.ArrayList([]const u8) = .empty;
+            defer also_strs.deinit(self.allocator);
+            var it = std.mem.splitScalar(u8, ds.also, ',');
+            while (it.next()) |part| {
+                if (part.len == 0) continue;
+                also_strs.append(self.allocator, part) catch break;
+            }
+            if (self.addDrive(@tagName(ds.role), ds.dir, ds.name, author_opt, also_strs.items, ds.route)) |id| {
+                self.allocator.free(id);
+                drives_n += 1;
+            } else |e| {
+                log.warn("restore: could not re-add drive '{s}' at '{s}': {}", .{ ds.name, ds.dir, e });
+            }
+        }
         self.restoring.store(false, .release);
         // Persisting here is safe even after failures: every failed spec was just
         // retained, and `persist` re-includes `retained_specs` alongside the live
@@ -1066,6 +1321,7 @@ pub const Manager = struct {
         self.persist();
         if (restored > 0) log.info("restored {d} transfer(s) from saved state", .{restored});
         if (followed > 0) log.info("restored {d} follow(s) from saved state", .{followed});
+        if (drives_n > 0) log.info("restored {d} drive(s) from saved state", .{drives_n});
         if (retained > 0) log.info("kept {d} saved transfer(s) that could not be re-added", .{retained});
     }
 

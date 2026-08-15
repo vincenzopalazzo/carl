@@ -227,6 +227,37 @@ pub const Identity = struct {
     npub: []const u8,
 };
 
+/// One file inside a shared drive.
+pub const DriveFile = struct {
+    /// Filename (drives are flat: path == filename == torrent name).
+    path: []const u8,
+    size: u64,
+    /// "starting" | "downloading" | "seeding" | "failed"
+    phase: []const u8,
+    /// info-hash, lowercase hex (40 chars).
+    info_hash: []const u8,
+};
+
+/// A shared drive: a flat folder published as one torrent per file (publisher
+/// role) or mirrored from a publisher's Nostr drive index (subscriber role).
+/// One row in the Drives screen.
+pub const Drive = struct {
+    id: []const u8,
+    /// "publisher" | "subscriber"
+    role: []const u8,
+    /// Drive name (the `<name>` in the `carl-drive:<name>` d-tag).
+    name: []const u8,
+    /// Watched folder (publisher) / sync folder (subscriber).
+    dir: []const u8,
+    route: Route,
+    /// bech32 npub of the subscriber's followed author; null for a publisher.
+    author: ?[]const u8,
+    /// Extra writer npubs (multi-writer subscriptions).
+    also: []const []const u8,
+    files: []const DriveFile,
+    file_count: usize,
+};
+
 /// User-facing settings. Mirrors the Settings screen.
 pub const Settings = struct {
     route: Route,
@@ -555,6 +586,39 @@ pub fn writeIdentity(j: *Json, id: Identity) Allocator.Error!void {
     try j.endObject();
 }
 
+pub fn writeDriveFile(j: *Json, f: DriveFile) Allocator.Error!void {
+    try j.beginObject();
+    try j.keyString("path", f.path);
+    try j.keyNumber("size", f.size);
+    try j.keyString("phase", f.phase);
+    try j.keyString("info_hash", f.info_hash);
+    try j.endObject();
+}
+
+/// Serialize one drive's file table as a JSON array.
+pub fn writeDriveFiles(j: *Json, files: []const DriveFile) Allocator.Error!void {
+    try j.beginArray();
+    for (files) |f| try writeDriveFile(j, f);
+    try j.endArray();
+}
+
+pub fn writeDrive(j: *Json, d: Drive) Allocator.Error!void {
+    try j.beginObject();
+    try j.keyString("id", d.id);
+    try j.keyString("role", d.role);
+    try j.keyString("name", d.name);
+    try j.keyString("dir", d.dir);
+    try j.keyString("route", d.route.jsonName());
+    try j.key("author");
+    if (d.author) |au| try j.string(au) else try j.nullValue();
+    try j.key("also");
+    try writeStringArray(j, d.also);
+    try j.key("files");
+    try writeDriveFiles(j, d.files);
+    try j.keyNumber("file_count", d.file_count);
+    try j.endObject();
+}
+
 pub fn writeSettings(j: *Json, s: Settings) Allocator.Error!void {
     try j.beginObject();
     try j.keyString("route", s.route.jsonName());
@@ -619,6 +683,67 @@ test "Json: string escaping" {
     var p = try parse(allocator, j.buf.items);
     defer p.deinit();
     try testing.expectEqualStrings("a\"b\\c\nd\te", p.value.object.get("k").?.string);
+}
+
+test "writeDrive: round-trips through std.json" {
+    const allocator = testing.allocator;
+    const files = [_]DriveFile{
+        .{ .path = "report.pdf", .size = 1024, .phase = "seeding", .info_hash = "ab" ** 20 },
+        .{ .path = "notes.txt", .size = 42, .phase = "downloading", .info_hash = "cd" ** 20 },
+    };
+    const also = [_][]const u8{ "npub1aaa", "npub1bbb" };
+    var j = Json.init(allocator);
+    defer j.deinit();
+    try writeDrive(&j, .{
+        .id = "d1",
+        .role = "subscriber",
+        .name = "docs",
+        .dir = "/data/docs",
+        .route = .i2p,
+        .author = "npub1author",
+        .also = &also,
+        .files = &files,
+        .file_count = 2,
+    });
+
+    var p = try parse(allocator, j.buf.items);
+    defer p.deinit();
+    const o = p.value.object;
+    try testing.expectEqualStrings("d1", o.get("id").?.string);
+    try testing.expectEqualStrings("subscriber", o.get("role").?.string);
+    try testing.expectEqualStrings("docs", o.get("name").?.string);
+    try testing.expectEqualStrings("/data/docs", o.get("dir").?.string);
+    try testing.expectEqualStrings("i2p", o.get("route").?.string);
+    try testing.expectEqualStrings("npub1author", o.get("author").?.string);
+    try testing.expectEqual(@as(usize, 2), o.get("also").?.array.items.len);
+    try testing.expectEqualStrings("npub1bbb", o.get("also").?.array.items[1].string);
+    try testing.expectEqual(@as(i64, 2), o.get("file_count").?.integer);
+    const f0 = o.get("files").?.array.items[0].object;
+    try testing.expectEqualStrings("report.pdf", f0.get("path").?.string);
+    try testing.expectEqual(@as(i64, 1024), f0.get("size").?.integer);
+    try testing.expectEqualStrings("seeding", f0.get("phase").?.string);
+    try testing.expectEqualStrings("ab" ** 20, f0.get("info_hash").?.string);
+
+    // A publisher serializes author as null and an empty also list.
+    var j2 = Json.init(allocator);
+    defer j2.deinit();
+    try writeDrive(&j2, .{
+        .id = "d2",
+        .role = "publisher",
+        .name = "x",
+        .dir = "/y",
+        .route = .direct,
+        .author = null,
+        .also = &.{},
+        .files = &.{},
+        .file_count = 0,
+    });
+    var p2 = try parse(allocator, j2.buf.items);
+    defer p2.deinit();
+    const o2 = p2.value.object;
+    try testing.expect(o2.get("author").? == .null);
+    try testing.expectEqual(@as(usize, 0), o2.get("also").?.array.items.len);
+    try testing.expectEqual(@as(usize, 0), o2.get("files").?.array.items.len);
 }
 
 test "writeTransfer: round-trips through std.json" {

@@ -129,6 +129,8 @@ pub fn main() !void {
             std.process.exit(1);
         }
         try cmdFollow(allocator, args[2], args[3..]);
+    } else if (std.mem.eql(u8, command, "drive")) {
+        try cmdDrive(allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "nostr-keygen")) {
         try cmdNostrKeygen(allocator, stdout);
     } else if (std.mem.eql(u8, command, "whoami")) {
@@ -179,6 +181,19 @@ fn printUsage() void {
         \\           --route i2p: download AND reseed over I2P (stable .b32.i2p
         \\           per torrent); --external-ip enables dialable direct announces.
         \\           --dir defaults to <work dir>/follow-<pubkey prefix>.
+        \\  drive create <dir> --name <drive> [--route direct|i2p] [--external-ip ip] [--interval secs]
+        \\  drive subscribe <npub|pubkey-hex> <drive-name> [--also <npub>]... [--dir d]
+        \\         [--route direct|i2p] [--interval secs]
+        \\           shared drives over nostr: `create` watches a flat folder and
+        \\           publishes every file in it as a torrent plus a kind-30035
+        \\           (NIP-33) drive index; `subscribe` mirrors a publisher's drive
+        \\           into --dir (default <work dir>/drive-<pubkey prefix>-<name>),
+        \\           converging on every index update (removals are quarantined
+        \\           to .carl-drive/.trash, never unlinked). --also adds extra
+        \\           writer pubkeys (multi-writer, last-writer-wins per path).
+        \\           --external-ip (create): routable IPv4 for direct-route
+        \\           peer-announces (like `carl follow`); without it a direct
+        \\           publisher seeds but is not dialable.
         \\  nostr-keygen                                     generate a fresh nostr key
         \\  whoami                                           print the configured identity's npub
         \\  daemon [--port p] [--bt-port p] [--route direct|proxy|tor|i2p] [--socks url]
@@ -964,6 +979,134 @@ fn cmdFollow(allocator: std.mem.Allocator, pubkey_arg: []const u8, extra: []cons
         .external_ip = external_ip,
         .poll_interval_s = parseUnsignedFlag(extra, "--interval", 60),
     });
+}
+
+// -------------------------------------------------------------------------
+// `carl drive` — shared folders over Nostr (kind-30035 drive index)
+// -------------------------------------------------------------------------
+
+fn parseDriveRoute(extra: []const [:0]u8) carl.api.Route {
+    const route_str = parseFlag(extra, "--route") orelse "direct";
+    const route = carl.api.Route.parse(route_str) orelse {
+        log.err("invalid --route '{s}' (expected direct|i2p)", .{route_str});
+        std.process.exit(1);
+    };
+    if (route != .direct and route != .i2p) {
+        log.err("carl drive supports --route direct|i2p (tor/proxy drives are a follow-up)", .{});
+        std.process.exit(1);
+    }
+    return route;
+}
+
+fn cmdDrive(allocator: std.mem.Allocator, rest: []const [:0]u8) !void {
+    if (rest.len < 1) {
+        log.err("usage: carl drive <create|subscribe> ...", .{});
+        std.process.exit(1);
+    }
+    const sub = rest[0];
+    if (std.mem.eql(u8, sub, "create")) {
+        if (rest.len < 2) {
+            log.err("usage: carl drive create <dir> --name <drive> [--route direct|i2p] [--external-ip ip] [--interval secs]", .{});
+            std.process.exit(1);
+        }
+        const dir = rest[1];
+        const extra = rest[2..];
+        const name = parseFlag(extra, "--name") orelse {
+            log.err("carl drive create requires --name <drive>", .{});
+            std.process.exit(1);
+        };
+        // Same plumbing as `carl follow`: a direct-route publisher needs a
+        // routable IPv4 to publish dialable kind-30078 announces.
+        var external_ip: ?[4]u8 = null;
+        if (parseFlag(extra, "--external-ip")) |s| {
+            external_ip = parseIpv4(s) orelse {
+                log.err("invalid --external-ip: {s}", .{s});
+                std.process.exit(1);
+            };
+            if (!carl.peer_announce.isRoutable(external_ip.?)) {
+                log.err("--external-ip {s} is not routable; refusing to publish peer-announces", .{s});
+                std.process.exit(1);
+            }
+        }
+        // The publisher watches a real folder; a typo must fail loudly.
+        var d = std.fs.cwd().openDir(dir, .{}) catch {
+            log.err("cannot open drive dir '{s}'", .{dir});
+            std.process.exit(1);
+        };
+        d.close();
+        carl.drive.run(allocator, .{
+            .role = .publisher,
+            .dir = dir,
+            .drive = name,
+            .route = parseDriveRoute(extra),
+            .external_ip = external_ip,
+            .poll_interval_s = parseUnsignedFlag(extra, "--interval", 5),
+        }) catch |err| {
+            log.err("drive failed: {}", .{err});
+            std.process.exit(1);
+        };
+    } else if (std.mem.eql(u8, sub, "subscribe")) {
+        if (rest.len < 3) {
+            log.err("usage: carl drive subscribe <npub|pubkey-hex> <drive-name> [--also <npub>]... [--dir d] [--route direct|i2p] [--interval secs]", .{});
+            std.process.exit(1);
+        }
+        const author = carl.follow.parsePubkeyArg(rest[1]) catch {
+            log.err("invalid pubkey '{s}' (expected npub1... or 64-char hex)", .{rest[1]});
+            std.process.exit(1);
+        };
+        const name = rest[2];
+        const extra = rest[3..];
+
+        // Collect repeated --also flags (parseFlag only returns the first).
+        var also: std.ArrayList([32]u8) = .empty;
+        defer also.deinit(allocator);
+        {
+            var i: usize = 0;
+            while (i < extra.len) : (i += 1) {
+                if (std.mem.eql(u8, extra[i], "--also")) {
+                    if (i + 1 >= extra.len) {
+                        log.err("--also requires a pubkey argument", .{});
+                        std.process.exit(1);
+                    }
+                    const pk = carl.follow.parsePubkeyArg(extra[i + 1]) catch {
+                        log.err("invalid --also pubkey '{s}'", .{extra[i + 1]});
+                        std.process.exit(1);
+                    };
+                    try also.append(allocator, pk);
+                    i += 1; // consume the value
+                }
+            }
+        }
+
+        // Default sync dir: <workdir>/drive-<pubkey prefix>-<name>, so
+        // different drives never mix data and the workdir stays reseedable.
+        var dir_owned: ?[]u8 = null;
+        defer if (dir_owned) |dd| allocator.free(dd);
+        const dir = parseFlag(extra, "--dir") orelse blk: {
+            var pk_hex: [64]u8 = undefined;
+            carl.secp.toHex(&author, &pk_hex);
+            const base = try carl.workdir.ensure(allocator);
+            defer allocator.free(base);
+            dir_owned = try std.fmt.allocPrint(allocator, "{s}/drive-{s}-{s}", .{ base, pk_hex[0..12], name });
+            break :blk @as([]const u8, dir_owned.?);
+        };
+
+        carl.drive.run(allocator, .{
+            .role = .subscriber,
+            .dir = dir,
+            .drive = name,
+            .author = author,
+            .also = also.items,
+            .route = parseDriveRoute(extra),
+            .relay_interval_s = parseUnsignedFlag(extra, "--interval", 15),
+        }) catch |err| {
+            log.err("drive failed: {}", .{err});
+            std.process.exit(1);
+        };
+    } else {
+        log.err("unknown drive subcommand: {s} (expected create|subscribe)", .{sub});
+        std.process.exit(1);
+    }
 }
 
 // -------------------------------------------------------------------------

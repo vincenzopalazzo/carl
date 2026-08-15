@@ -189,6 +189,46 @@ Unfollow: stops the mirror worker (joins its threads — may take a few seconds
 if a relay query is mid-flight). Mirrored data stays on disk. `204` on
 success, `404` if unknown.
 
+### `GET /api/drives` → `{ "drives": [Drive] }`
+
+The configured drives (publisher and subscriber roles alike) with their file
+tables and live per-file phase (see `docs/drive.md`). Note the object
+wrapper — unlike `GET /api/follows`, which returns a bare array. The bare
+`drives` array is also included in `GET /api/state` and the WebSocket push
+under `drives`.
+
+### `POST /api/drives`
+
+Body:
+
+```jsonc
+{
+  "role":   "publisher|subscriber",
+  "dir":    "<watched folder (publisher) | sync folder (subscriber)>",
+  "name":   "<drive name — the <name> in the carl-drive:<name> d-tag>",
+  "author": "<npub1…|64-char hex>",   // required for subscriber; ignored for publisher
+  "also":   ["<npub1…|hex>", ...],    // subscriber only: extra writers (LWW per path)
+  "route":  "direct|i2p"              // default: the configured route when it's
+                                      // one of those, else direct
+}
+```
+
+Starts the drive: a publisher watches `dir` and publishes the kind-30035
+drive index; a subscriber mirrors the writer(s)' drive into `dir` (see
+`docs/drive.md`). Returns `{ "id": "d<N>" }`; `400` with `{ "error": … }` on
+a malformed pubkey, an unsupported route, a missing `author` for the
+subscriber role, a publisher with no local Nostr identity, or a duplicate
+drive (same role+author+name+dir). Drives persist to `carl.db` and are
+restored on restart (publisher from `.carl-drive/state.json`, subscriber from
+`.carl-drive/applied.json`, both resuming from checkpointed torrents).
+
+### `DELETE /api/drives/<id>`
+
+Stops the drive (joins its threads — may take up to a relay timeout if a poll
+is mid-flight) and removes it from the configuration. Synced data and
+`.carl-drive/` state stay on disk; a subscriber's quarantined files remain in
+`.carl-drive/.trash/`. `204` on success, `404` if unknown.
+
 ### `POST /api/search`
 
 Body `{ "query": "<text>" }` (or `?q=<text>`). Searches configured Nostr relays
@@ -246,6 +286,26 @@ daemon does not read client frames; closing the socket ends the push.
 `Seed`: `{ id, name, visibility, onion|null, size, upTotal, up, leechers, ratio, relays }`.
 `Follow`: `{ id, npub, route, dir, seeding, downloading, failed, torrents:[FollowTorrent] }`.
 `FollowTorrent`: `{ name, hash, state: "starting|downloading|seeding|failed", pct, peers, down, up }`.
+`Drive`:
+
+```jsonc
+{
+  "id": "d1",
+  "role": "publisher|subscriber",
+  "name": "<drive name>",
+  "dir": "<watched/sync folder>",
+  "route": "direct|i2p",
+  "author": "<npub1…>"|null,      // subscriber's primary writer; null for a publisher
+  "also": ["<npub1…>", ...],      // subscriber's extra writers
+  "files": [DriveFile],
+  "file_count": <n>               // == files.length, for cheap badges
+}
+```
+
+`DriveFile`: `{ path, size, phase: "starting|downloading|seeding|failed", info_hash }`
+(`path` is the bare filename — drives are flat; `info_hash` is 40-char
+lowercase hex) — a publisher's files report `seeding` once their torrent is
+up; a subscriber's track the embedded mirror's live phase.
 `Identity`: `{ npub: "<bech32|''>" }` — the nsec is **never** serialized.
 `Settings`: `{ route, socks, relays:[url], downloadDir, listenPort, maxActive, peerLimit, publishNip35 }`.
 
@@ -269,3 +329,7 @@ These are part of the contract but return empty / derived values until later PRs
 - **Per-relay event counts** — relay reachability is now probed live (see
   `GET /api/relays`), but `events` is still reported as `0`; surfacing real
   per-relay event throughput is a follow-up.
+- **Drives** — the drives endpoints (above) are the newest part of the
+  contract; if a build from an in-between commit 404s on `/api/drives`, you
+  caught the tree mid-landing. The CLI (`carl drive`, see `docs/drive.md`)
+  is the stable interface.

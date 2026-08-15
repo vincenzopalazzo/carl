@@ -32,6 +32,8 @@ pub const daemon = @import("daemon.zig");
 pub const state = @import("state.zig");
 pub const workdir = @import("workdir.zig");
 pub const follow = @import("follow.zig");
+pub const drive_index = @import("drive_index.zig");
+pub const drive = @import("drive.zig");
 
 test {
     _ = bencode;
@@ -67,5 +69,7 @@ test {
     _ = state;
     _ = workdir;
     _ = follow;
+    _ = drive_index;
+    _ = drive;
     _ = @import("integration_test.zig");
 }
