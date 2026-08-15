@@ -192,6 +192,23 @@ pub const PeerConnection = struct {
     /// congested peers routinely need 5-10 s to complete a TCP handshake.
     pub const connect_timeout_secs: u32 = 15;
 
+    /// Connect timeout for anonymized-network dials (.onion via SOCKS,
+    /// .b32.i2p via SAM). Building a Tor circuit — and for a freshly published
+    /// hidden service, waiting for its descriptor to propagate to the HSDirs —
+    /// routinely takes 20-60 s. The plain-TCP timeout killed these dials
+    /// mid-handshake, which surfaced as intermittent total failure to reach
+    /// onion peers whose descriptors were simply a few seconds slow.
+    pub const anon_connect_timeout_secs: u32 = 90;
+
+    /// The timeout that applies to this peer's pending connect. `connect_host`
+    /// is set only by `initOnion`/`initI2p`, i.e. exactly the dials that go by
+    /// hostname through Tor or SAM, so it doubles as the "this is an
+    /// anonymized transport" test. A clearnet peer dialed through a plain
+    /// SOCKS proxy goes through `init` and keeps the 15s timeout.
+    pub fn currentConnectTimeout(self: *const PeerConnection) u32 {
+        return if (self.connect_host != null) anon_connect_timeout_secs else connect_timeout_secs;
+    }
+
     /// Disable Nagle on a peer socket (best-effort). Wire requests are tiny
     /// and latency-sensitive; letting the kernel coalesce them behind delayed
     /// ACKs stalls the request pipeline. Also applied to proxy/SAM bridge
@@ -727,4 +744,19 @@ test "peer handshake serialization" {
 
     try peer.sendHandshake([_]u8{0xAA} ** 20, [_]u8{0xBB} ** 20);
     try std.testing.expectEqual(@as(usize, 68), peer.send_buf.items.len);
+}
+
+test "connect timeout is per-transport" {
+    const a = std.testing.allocator;
+
+    var clearnet = PeerConnection.init(a, std.net.Address.initIp4(.{ 1, 2, 3, 4 }, 6881));
+    defer clearnet.deinit();
+    try std.testing.expectEqual(PeerConnection.connect_timeout_secs, clearnet.currentConnectTimeout());
+
+    // A hostname dial (Tor/SAM) must survive circuit build plus descriptor
+    // propagation, which routinely outlasts the clearnet TCP timeout.
+    var onion = try PeerConnection.initOnion(a, "examplepeer.onion", 6881);
+    defer onion.deinit();
+    try std.testing.expectEqual(PeerConnection.anon_connect_timeout_secs, onion.currentConnectTimeout());
+    try std.testing.expect(onion.currentConnectTimeout() > clearnet.currentConnectTimeout());
 }
