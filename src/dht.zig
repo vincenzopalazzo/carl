@@ -58,6 +58,12 @@ fn bucketIndex(dist: [id_len]u8) u8 {
 }
 
 /// DHT client for peer discovery.
+/// Poll a cancel token, treating "no token" as "not cancelled".
+fn cancelled(tok: ?*std.atomic.Value(bool)) bool {
+    const t = tok orelse return false;
+    return t.load(.monotonic);
+}
+
 pub const Dht = struct {
     allocator: Allocator,
     our_id: [id_len]u8,
@@ -70,7 +76,15 @@ pub const Dht = struct {
     pub fn init(allocator: Allocator, port: u16) Dht {
         var our_id: [id_len]u8 = undefined;
         std.crypto.random.bytes(&our_id);
+        return initWithId(allocator, port, our_id);
+    }
 
+    /// Like `init` but with a caller-supplied node ID. BEP 5 nodes are
+    /// expected to keep a stable ID: every fresh ID starts us over in the
+    /// keyspace and litters other nodes' routing tables with entries that
+    /// never answer again, so a client that runs repeated lookups must reuse
+    /// one ID rather than rolling a new one per lookup.
+    pub fn initWithId(allocator: Allocator, port: u16, our_id: [id_len]u8) Dht {
         var buckets: [160]std.ArrayList(Node) = undefined;
         for (&buckets) |*b| {
             b.* = .empty;
@@ -138,10 +152,15 @@ pub const Dht = struct {
 
     /// Query the DHT for peers with a given info_hash.
     /// Returns a list of peers found.
+    /// Iterative BEP 5 get_peers walk. `cancel`, when supplied, is polled
+    /// between network steps so a caller tearing down can stop a lookup that
+    /// would otherwise run for its full timeout budget (3 iterations x 8
+    /// receives x the 2s socket timeout, plus bootstrap DNS).
     pub fn getPeers(
         self: *Dht,
         allocator: Allocator,
         info_hash: [id_len]u8,
+        cancel: ?*std.atomic.Value(bool),
     ) ![]tracker_mod.Peer {
         var peers: std.ArrayList(tracker_mod.Peer) = .empty;
         errdefer peers.deinit(allocator);
@@ -157,6 +176,7 @@ pub const Dht = struct {
 
         // Also query bootstrap nodes directly
         for (bootstrap_nodes) |bn| {
+            if (cancelled(cancel)) return peers.toOwnedSlice(allocator) catch error.OutOfMemory;
             const addr_list = std.net.getAddressList(self.allocator, bn.host, bn.port) catch continue;
             defer addr_list.deinit();
             for (addr_list.addrs) |addr| {
@@ -173,9 +193,11 @@ pub const Dht = struct {
 
         var iterations: usize = 0;
         while (iterations < 3) : (iterations += 1) {
+            if (cancelled(cancel)) break;
             // Drain responses for this iteration
             var rounds: usize = 0;
             while (rounds < 8) : (rounds += 1) {
+                if (cancelled(cancel)) break;
                 var src_addr: std.posix.sockaddr = undefined;
                 var addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
                 const n = std.posix.recvfrom(sock, &recv_buf, 0, &src_addr, &addr_len) catch break;
