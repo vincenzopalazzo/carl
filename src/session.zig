@@ -30,6 +30,9 @@ const max_peers: usize = 50;
 const max_concurrent_pieces: usize = 4;
 const unchoke_slots: usize = 4;
 const unchoke_interval_secs: i64 = 10;
+/// Cooldown after a DHT walk fails, so a peerless session does not respawn a
+/// full cold bootstrap on every maintenance tick.
+const dht_retry_backoff_secs: i64 = 60;
 const optimistic_interval_secs: i64 = 30;
 /// How often to re-run Nostr peer discovery while a transfer has zero peers.
 /// One-shot discovery at startup isn't enough — a download whose only seed
@@ -80,8 +83,14 @@ const DhtState = struct {
     mutex: std.Thread.Mutex = .{},
     query_active: bool = false,
     failed: bool = false,
+    /// Earliest time a new lookup may start; set after a failed lookup so a
+    /// zero-peer session does not respawn a cold bootstrap every tick.
+    retry_after: i64 = 0,
     peers: []tracker_mod.Peer = &.{},
     nodes: u32 = 0,
+    /// Set by the session at teardown so an in-flight walk stops at its next
+    /// network step instead of running out its full timeout budget.
+    cancel: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
 
     fn ref(self: *DhtState) void {
@@ -250,6 +259,13 @@ pub const Session = struct {
     // back through the refcounted DhtState, so a session can shut down at
     // any moment without joining (or leaking into) the lookup.
     dht_state: ?*DhtState = null,
+    /// Handle for the in-flight lookup. The worker allocates through the
+    /// session allocator, so it MUST be joined before that allocator dies —
+    /// refcounting DhtState protects the state, not the allocator behind it.
+    dht_thread: ?std.Thread = null,
+    /// One DHT node ID for the whole session (see Dht.initWithId).
+    dht_node_id: [20]u8 = undefined,
+    dht_node_id_set: bool = false,
 
     // Outbound proxy (SOCKS5/SOCKS5h/HTTP CONNECT). When set, peers and HTTP
     // trackers are tunneled; DHT, UDP trackers, web seeds, and the inbound
@@ -428,6 +444,7 @@ pub const Session = struct {
         self.peers.deinit(self.allocator);
         if (self.cached_peers.len > 0) self.allocator.free(self.cached_peers);
 
+        self.stopDhtWorker();
         if (self.dht_state) |st| st.unref(self.allocator);
         if (self.metadata_download) |*md| md.deinit();
         if (self.listener) |*l| l.deinit();
@@ -2090,10 +2107,12 @@ pub const Session = struct {
             }
         }
 
-        // Fall back to DHT (BEP 5) — only for discovery, not terminal events
+        // Fall back to DHT (BEP 5) — only for discovery, not terminal events.
+        // Discovery is asynchronous now: this only starts the walk, and
+        // maintenance() connects whatever it finds a few ticks later. There is
+        // deliberately no peers check here — it could only ever be false.
         if (wants_peers and self.peers.items.len == 0) {
             self.tryDhtPeerDiscovery() catch {};
-            if (self.peers.items.len > 0) return;
         }
 
         return error.TrackerFailed;
@@ -2376,37 +2395,71 @@ pub const Session = struct {
         if (self.anonymized()) return;
 
         if (self.dht_state == null) {
-            const st = self.allocator.create(DhtState) catch return;
+            const st = self.allocator.create(DhtState) catch {
+                log.warn("DHT disabled: out of memory allocating lookup state", .{});
+                return;
+            };
             st.* = .{};
             self.dht_state = st;
         }
         const st = self.dht_state.?;
 
         // Don't retry if DHT previously failed to start (e.g. port busy);
-        // only one lookup in flight at a time.
+        // only one lookup in flight at a time; back off after a failed walk.
+        const now = std.time.timestamp();
         {
             st.mutex.lock();
             defer st.mutex.unlock();
             if (st.failed) return;
             if (st.query_active) return;
+            if (now < st.retry_after) return;
             st.query_active = true;
         }
 
-        // The worker holds its own reference to the shared state, so it can
-        // finish (and free it) after the session is gone.
+        // The previous worker has finished (query_active was clear) but may
+        // not have returned from its last free yet — reap it so its allocator
+        // use is ordered before anything that could tear the allocator down.
+        self.joinDhtWorker();
+
+        if (!self.dht_node_id_set) {
+            std.crypto.random.bytes(&self.dht_node_id);
+            self.dht_node_id_set = true;
+        }
+
+        // The worker holds its own reference to the shared state so the state
+        // outlives an early session teardown; the thread itself is joined.
         st.ref();
         log.info("DHT lookup starting (background)...", .{});
         const thread = std.Thread.spawn(.{}, dhtQueryWorker, .{
-            self.allocator, st, self.listen_port + 1, self.info_hash,
+            self.allocator, st, self.listen_port + 1, self.info_hash, self.dht_node_id,
         }) catch |err| {
-            log.warn("DHT thread spawn failed: {}", .{err});
+            log.warn("DHT thread spawn failed: {t}", .{err});
             st.mutex.lock();
             st.query_active = false;
             st.mutex.unlock();
             st.unref(self.allocator);
             return;
         };
-        thread.detach();
+        self.dht_thread = thread;
+    }
+
+    /// Reap a finished lookup thread. Called before starting the next one and
+    /// from `stopDhtWorker`; joining an already-exited thread is cheap.
+    fn joinDhtWorker(self: *Session) void {
+        const t = self.dht_thread orelse return;
+        self.dht_thread = null;
+        t.join();
+    }
+
+    /// Stop DHT work and make sure no worker is still running. The worker
+    /// allocates and frees through the session allocator, and callers destroy
+    /// that allocator right after the session, so leaving a detached lookup
+    /// running past this point is a use-after-free of the allocator itself.
+    /// The cancel flag keeps the wait to about one socket timeout instead of
+    /// the walk's full budget.
+    fn stopDhtWorker(self: *Session) void {
+        if (self.dht_state) |st| st.cancel.store(true, .monotonic);
+        self.joinDhtWorker();
     }
 
     /// DHT lookup worker: owns its Dht for the duration of the query so the
@@ -2414,7 +2467,7 @@ pub const Session = struct {
     /// session safely by holding a reference to the shared state and never
     /// touching the Session itself. Posts found peers + routing-table size
     /// for maintenance() to consume.
-    fn dhtQueryWorker(allocator: Allocator, st: *DhtState, port: u16, info_hash: [20]u8) void {
+    fn dhtQueryWorker(allocator: Allocator, st: *DhtState, port: u16, info_hash: [20]u8, node_id: [20]u8) void {
         defer st.unref(allocator);
         defer {
             st.mutex.lock();
@@ -2422,7 +2475,7 @@ pub const Session = struct {
             st.mutex.unlock();
         }
 
-        var d = dht_mod.Dht.init(allocator, port);
+        var d = dht_mod.Dht.initWithId(allocator, port, node_id);
         defer d.deinit();
         d.start() catch {
             log.warn("DHT failed to start", .{});
@@ -2432,7 +2485,13 @@ pub const Session = struct {
             return;
         };
 
-        const peers = d.getPeers(allocator, info_hash) catch return;
+        const peers = d.getPeers(allocator, info_hash, &st.cancel) catch {
+            // Don't cold-bootstrap again on the very next maintenance tick.
+            st.mutex.lock();
+            st.retry_after = std.time.timestamp() + dht_retry_backoff_secs;
+            st.mutex.unlock();
+            return;
+        };
 
         var node_count: u32 = 0;
         for (&d.buckets) |*b| node_count += @intCast(b.items.len);
