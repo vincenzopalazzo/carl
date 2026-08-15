@@ -1935,7 +1935,7 @@ pub const Session = struct {
                 // A clearnet peer stuck in the non-blocking connect phase past
                 // the connect timeout is a dead host — reclaim its poll slot so
                 // it doesn't squat against the max_peers cap.
-                if ((p.state == .connecting or p.state == .socks_connecting) and now - p.connect_started_at > peer_mod.PeerConnection.connect_timeout_secs) {
+                if ((p.state == .connecting or p.state == .socks_connecting) and now - p.connect_started_at > p.currentConnectTimeout()) {
                     p.disconnect();
                     i += 1;
                     continue;
