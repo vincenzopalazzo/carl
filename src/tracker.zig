@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const bencode = @import("bencode.zig");
 const proxy_mod = @import("proxy.zig");
+const udp_tracker = @import("udp_tracker.zig");
 
 const log = std.log.scoped(.tracker);
 
@@ -190,9 +191,56 @@ pub fn parseAnnounceResponse(
     };
 }
 
-/// Perform an HTTP tracker announce. Returns the parsed response. When `proxy`
-/// is set, the announce is tunneled through it (fail-closed: no direct request).
+/// Perform a tracker announce over whichever transport `announce_url` names.
+/// Returns the parsed response. When `proxy` is set, the announce is tunneled
+/// through it (fail-closed: no direct request).
+///
+/// This is the single dispatch point for every announce in carl — the session
+/// loop, `carl announce`, and the seeding paths all come through here, so the
+/// udp:// and proxy rules below cannot drift between callers.
 pub fn announce(
+    allocator: Allocator,
+    announce_url: []const u8,
+    req: AnnounceRequest,
+    proxy: ?proxy_mod.Proxy,
+) TrackerError!AnnounceResponse {
+    if (!std.mem.startsWith(u8, announce_url, "udp://")) {
+        return announceHttp(allocator, announce_url, req, proxy);
+    }
+
+    // BEP 15: udp:// goes to the UDP tracker client. UDP cannot be tunneled
+    // through SOCKS/HTTP proxies, so with a proxy set we must not dial it
+    // directly — that would leak the real IP. Rewrite
+    // udp://host:port → http://host:port/announce (most public trackers serve
+    // both protocols on the same port) and tunnel that instead.
+    if (proxy != null) {
+        var buf: [512]u8 = undefined;
+        const http_url = udpAsHttpUrl(&buf, announce_url) orelse return error.HttpError;
+        log.info("proxied: rewriting {s} -> {s}", .{ announce_url, http_url });
+        return announceHttp(allocator, http_url, req, proxy);
+    }
+
+    return udp_tracker.announce(allocator, announce_url, req) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        // TrackerError has no UDP-specific variant; log the real cause so a
+        // bare "HttpError" on a udp:// URL is still diagnosable.
+        else => {
+            log.warn("UDP tracker {s} failed: {t}", .{ announce_url, err });
+            return error.HttpError;
+        },
+    };
+}
+
+/// udp://host:port[/anything] → http://host:port/announce
+fn udpAsHttpUrl(buf: []u8, udp_url: []const u8) ?[]const u8 {
+    const rest = udp_url["udp://".len..];
+    const slash_pos = std.mem.indexOfScalar(u8, rest, '/');
+    const host_port = rest[0 .. slash_pos orelse rest.len];
+    const url = std.fmt.bufPrint(buf, "http://{s}/announce", .{host_port}) catch return null;
+    return url;
+}
+
+fn announceHttp(
     allocator: Allocator,
     announce_url: []const u8,
     req: AnnounceRequest,
@@ -486,4 +534,16 @@ test "parse IPv4" {
     try std.testing.expect(parseIpv4("invalid") == null);
     try std.testing.expect(parseIpv4("1.2.3") == null);
     try std.testing.expect(parseIpv4("1.2.3.4.5") == null);
+}
+
+test "udp as http url rewrite" {
+    var buf: [512]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "http://tracker.example.com:1337/announce",
+        udpAsHttpUrl(&buf, "udp://tracker.example.com:1337/announce").?,
+    );
+    try std.testing.expectEqualStrings(
+        "http://tracker.example.com:1337/announce",
+        udpAsHttpUrl(&buf, "udp://tracker.example.com:1337").?,
+    );
 }
