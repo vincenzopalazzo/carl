@@ -191,33 +191,44 @@ pub fn parseAnnounceResponse(
     };
 }
 
-/// Perform an HTTP tracker announce. Returns the parsed response. When `proxy`
-/// is set, the announce is tunneled through it (fail-closed: no direct request).
+/// Perform a tracker announce over whichever transport `announce_url` names.
+/// Returns the parsed response. When `proxy` is set, the announce is tunneled
+/// through it (fail-closed: no direct request).
+///
+/// This is the single dispatch point for every announce in carl — the session
+/// loop, `carl announce`, and the seeding paths all come through here, so the
+/// udp:// and proxy rules below cannot drift between callers.
 pub fn announce(
     allocator: Allocator,
     announce_url: []const u8,
     req: AnnounceRequest,
     proxy: ?proxy_mod.Proxy,
 ) TrackerError!AnnounceResponse {
-    // BEP 15: udp:// announce URLs go to the UDP tracker client. UDP cannot be
-    // tunneled through SOCKS/HTTP proxies, so with a proxy set we rewrite
-    // udp://host:port → http://host:port/announce (most public trackers serve
-    // both protocols on the same port) and tunnel that — the same fail-closed
-    // strategy Session.tryAnnounceUrl applies to session announces. This used
-    // to be session-only: `carl announce` (CLI) sent udp:// URLs down the HTTP
-    // path and failed with error.HttpError.
-    if (std.mem.startsWith(u8, announce_url, "udp://")) {
-        if (proxy != null) {
-            var buf: [512]u8 = undefined;
-            const http_url = udpAsHttpUrl(&buf, announce_url) orelse return error.HttpError;
-            return announceHttp(allocator, http_url, req, proxy);
-        }
-        return udp_tracker.announce(allocator, announce_url, req) catch |err| switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            else => error.HttpError,
-        };
+    if (!std.mem.startsWith(u8, announce_url, "udp://")) {
+        return announceHttp(allocator, announce_url, req, proxy);
     }
-    return announceHttp(allocator, announce_url, req, proxy);
+
+    // BEP 15: udp:// goes to the UDP tracker client. UDP cannot be tunneled
+    // through SOCKS/HTTP proxies, so with a proxy set we must not dial it
+    // directly — that would leak the real IP. Rewrite
+    // udp://host:port → http://host:port/announce (most public trackers serve
+    // both protocols on the same port) and tunnel that instead.
+    if (proxy != null) {
+        var buf: [512]u8 = undefined;
+        const http_url = udpAsHttpUrl(&buf, announce_url) orelse return error.HttpError;
+        log.info("proxied: rewriting {s} -> {s}", .{ announce_url, http_url });
+        return announceHttp(allocator, http_url, req, proxy);
+    }
+
+    return udp_tracker.announce(allocator, announce_url, req) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        // TrackerError has no UDP-specific variant; log the real cause so a
+        // bare "HttpError" on a udp:// URL is still diagnosable.
+        else => {
+            log.warn("UDP tracker {s} failed: {t}", .{ announce_url, err });
+            return error.HttpError;
+        },
+    };
 }
 
 /// udp://host:port[/anything] → http://host:port/announce

@@ -6,7 +6,6 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const metainfo = @import("metainfo.zig");
 const tracker_mod = @import("tracker.zig");
-const udp_tracker = @import("udp_tracker.zig");
 const wire = @import("wire.zig");
 const piece_mod = @import("piece.zig");
 const storage_mod = @import("storage.zig");
@@ -2079,48 +2078,15 @@ pub const Session = struct {
         // trackers, and announcing over them directly would leak the real IP.
         // (I2P-native trackers are a follow-up.) Skip all clearnet trackers.
         if (self.anonymized() and self.proxy == null) return null;
-        if (std.mem.startsWith(u8, url, "udp://")) {
-            if (self.proxy != null) {
-                // UDP can't be tunneled through SOCKS/Tor.  Most public
-                // trackers serve both UDP and HTTP on the same host, so
-                // rewrite udp://host:port → http://host:port/announce and
-                // try through the proxy.
-                return self.tryUdpAsHttp(url, req);
-            }
-            return udp_tracker.announce(self.allocator, url, req) catch |err| {
-                log.warn("UDP tracker {s} failed: {}", .{ url, err });
-                return null;
-            };
-        } else if (url.len > 0) {
-            return tracker_mod.announce(self.allocator, url, req, self.proxy) catch |err| {
-                log.warn("HTTP tracker {s} failed: {}", .{ url, err });
-                return null;
-            };
-        } else {
-            return null;
-        }
-    }
+        if (url.len == 0) return null;
 
-    /// Rewrite a udp:// tracker URL to http:// and try an HTTP announce
-    /// through the proxy.  Many public trackers (opentrackr, openbittorrent,
-    /// torrent.eu.org, …) serve both protocols on the same host:port.
-    fn tryUdpAsHttp(self: *Session, udp_url: []const u8, req: tracker_mod.AnnounceRequest) ?tracker_mod.AnnounceResponse {
-        // udp://host:port[/anything] → http://host:port/announce
-        const host_start = "udp://".len;
-        const rest = udp_url[host_start..];
-        // Find end of host:port (first '/' or end of string)
-        const slash_pos = std.mem.indexOfScalar(u8, rest, '/');
-        const host_port = rest[0..(slash_pos orelse rest.len)];
-
-        var buf: [256]u8 = undefined;
-        const http_url = std.fmt.bufPrint(&buf, "http://{s}/announce", .{host_port}) catch return null;
-
-        const resp = tracker_mod.announce(self.allocator, http_url, req, self.proxy) catch |err| {
-            log.debug("HTTP rewrite of UDP tracker {s} failed: {}", .{ udp_url, err });
+        // tracker_mod.announce owns the transport choice (udp:// vs http://)
+        // and the fail-closed proxy rewrite, so the session and `carl announce`
+        // cannot drift apart on which trackers are safe to dial.
+        return tracker_mod.announce(self.allocator, url, req, self.proxy) catch |err| {
+            log.warn("tracker {s} failed: {t}", .{ url, err });
             return null;
         };
-        log.info("proxied: rewriting {s} → {s}", .{ udp_url, http_url });
-        return resp;
     }
 
     fn handleAnnounceResponse(self: *Session, resp: tracker_mod.AnnounceResponse) void {
