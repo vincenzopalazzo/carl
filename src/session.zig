@@ -13,6 +13,7 @@ const peer_mod = @import("peer.zig");
 const extension = @import("extension.zig");
 const bencode = @import("bencode.zig");
 const dht_mod = @import("dht.zig");
+const nostr_config = @import("nostr_config.zig");
 const proxy_mod = @import("proxy.zig");
 const i2p_sam = @import("i2p_sam.zig");
 
@@ -2431,10 +2432,22 @@ pub const Session = struct {
         // outlives an early session teardown; the thread itself is joined.
         st.ref();
         log.info("DHT lookup starting (background)...", .{});
+        // Warm the table from the persisted node cache (learned nodes from
+        // previous sessions), falling back to the well-known routers.
+        // Heap-allocated, not a stack buffer: the worker outlives this frame,
+        // so a slice into a local would dangle by the time it opens the file.
+        // Ownership transfers to the worker, which frees it.
+        const dht_cache_path: []const u8 = blk: {
+            const cfg_dir = nostr_config.configDir(self.allocator) catch break :blk "";
+            defer self.allocator.free(cfg_dir);
+            std.fs.cwd().makePath(cfg_dir) catch {};
+            break :blk std.fmt.allocPrint(self.allocator, "{s}/dht_nodes.dat", .{cfg_dir}) catch "";
+        };
         const thread = std.Thread.spawn(.{}, dhtQueryWorker, .{
-            self.allocator, st, self.listen_port + 1, self.info_hash, self.dht_node_id,
+            self.allocator, st, self.listen_port + 1, self.info_hash, self.dht_node_id, dht_cache_path,
         }) catch |err| {
             log.warn("DHT thread spawn failed: {t}", .{err});
+            if (dht_cache_path.len > 0) self.allocator.free(dht_cache_path);
             st.mutex.lock();
             st.query_active = false;
             st.mutex.unlock();
@@ -2468,7 +2481,16 @@ pub const Session = struct {
     /// session safely by holding a reference to the shared state and never
     /// touching the Session itself. Posts found peers + routing-table size
     /// for maintenance() to consume.
-    fn dhtQueryWorker(allocator: Allocator, st: *DhtState, port: u16, info_hash: [20]u8, node_id: [20]u8) void {
+    fn dhtQueryWorker(
+        allocator: Allocator,
+        st: *DhtState,
+        port: u16,
+        info_hash: [20]u8,
+        node_id: [20]u8,
+        /// Heap-allocated and owned by this worker; see startDhtLookup.
+        cache_path: []const u8,
+    ) void {
+        defer if (cache_path.len > 0) allocator.free(cache_path);
         defer st.unref(allocator);
         defer {
             st.mutex.lock();
@@ -2478,6 +2500,10 @@ pub const Session = struct {
 
         var d = dht_mod.Dht.initWithId(allocator, port, node_id);
         defer d.deinit();
+        if (cache_path.len > 0) {
+            const warmed = dht_mod.loadNodeCache(&d, cache_path);
+            if (warmed > 0) log.info("DHT: warmed table with {d} cached nodes", .{warmed});
+        }
         d.start() catch {
             log.warn("DHT failed to start", .{});
             st.mutex.lock();
@@ -2485,6 +2511,18 @@ pub const Session = struct {
             st.mutex.unlock();
             return;
         };
+
+        // Both of these run even when the walk ends in an error, because both
+        // consume state the walk has already built by then: getPeers collects
+        // announce tokens and grows the routing table before it can fail, and
+        // discarding either on a late error costs us a cycle of
+        // discoverability and a needless cold start next session.
+        //
+        // BEP 5 announce_peer: make this session (seeder or leecher)
+        // discoverable via DHT for info_hash. `port` is the DHT socket port
+        // (listen_port + 1); the BitTorrent listener is one below it.
+        defer if (port > 1) d.announceSelf(info_hash, port - 1);
+        defer if (cache_path.len > 0) dht_mod.saveNodeCache(&d, cache_path);
 
         const peers = d.getPeers(allocator, info_hash, &st.cancel) catch {
             // Don't cold-bootstrap again on the very next maintenance tick.

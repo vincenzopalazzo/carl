@@ -24,11 +24,20 @@ pub const Node = struct {
     address: std.net.Address,
 };
 
-/// Well-known bootstrap nodes.
+/// Well-known bootstrap nodes. Kept deliberately broad: routers die or
+/// degrade (observed in the wild: router.bittorrent.com and router.utorrent.com
+/// timing out for whole residential networks while transmissionbt answers with
+/// a single dead-end node). A client starting with an empty table needs
+/// several live, generous routers to have a chance.
 const bootstrap_nodes = [_]struct { host: []const u8, port: u16 }{
     .{ .host = "router.bittorrent.com", .port = 6881 },
     .{ .host = "dht.transmissionbt.com", .port = 6881 },
     .{ .host = "router.utorrent.com", .port = 6881 },
+    .{ .host = "dht.libtorrent.org", .port = 25401 },
+    .{ .host = "dht.bluetigers.club", .port = 6881 },
+    .{ .host = "dht.anacrolix.link", .port = 6881 },
+    .{ .host = "router.silotis.us", .port = 6881 },
+    .{ .host = "dht.aelitis.com", .port = 6881 },
 };
 
 /// XOR distance between two node IDs.
@@ -57,6 +66,16 @@ fn bucketIndex(dist: [id_len]u8) u8 {
     return 159; // Same ID
 }
 
+pub const AnnounceToken = struct {
+    addr: std.posix.sockaddr,
+    len: std.posix.socklen_t,
+    token: [32]u8,
+    token_len: u8,
+    /// Responder's node ID, kept so the bounded cache can hold the nodes
+    /// closest to the target rather than the first to answer.
+    id: [id_len]u8,
+};
+
 /// DHT client for peer discovery.
 /// Poll a cancel token, treating "no token" as "not cancelled".
 fn cancelled(tok: ?*std.atomic.Value(bool)) bool {
@@ -69,6 +88,14 @@ pub const Dht = struct {
     our_id: [id_len]u8,
     sock: ?std.posix.fd_t,
     port: u16,
+
+    /// (addr, token) pairs learned from get_peers responses, used by
+    /// announceSelf (BEP 5 announce_peer). Tokens are single-use-ish per
+    /// node; we keep the most recent few and clear them after announcing.
+    announce_tokens: [8]AnnounceToken = undefined,
+    announce_token_count: usize = 0,
+
+    /// Max nodes written to the cache file.
 
     // Routing table: 160 buckets, each up to k nodes
     buckets: [160]std.ArrayList(Node),
@@ -165,6 +192,9 @@ pub const Dht = struct {
         var peers: std.ArrayList(tracker_mod.Peer) = .empty;
         errdefer peers.deinit(allocator);
 
+        // Tokens are only valid for the target they were issued against.
+        self.announce_token_count = 0;
+
         // Find closest nodes to the info_hash
         var closest = self.findClosest(info_hash, k);
 
@@ -192,7 +222,7 @@ pub const Dht = struct {
         const sock = self.sock orelse return peers.toOwnedSlice(allocator) catch return error.OutOfMemory;
 
         var iterations: usize = 0;
-        while (iterations < 3) : (iterations += 1) {
+        while (iterations < 8) : (iterations += 1) {
             if (cancelled(cancel)) break;
             // Drain responses for this iteration
             var rounds: usize = 0;
@@ -209,6 +239,20 @@ pub const Dht = struct {
 
                 // Check for "values" (peers)
                 if (resp.dictGet("r")) |r_dict| {
+                    // Capture the announce token (BEP 5): announce_peer must
+                    // echo a token the node previously handed us in a
+                    // get_peers response.
+                    if (r_dict.dictGet("token")) |tok_val| {
+                        if (tok_val.asString()) |ts| {
+                            const rid: [id_len]u8 = blk: {
+                                const idv = r_dict.dictGet("id") orelse break :blk info_hash;
+                                const ids = idv.asString() orelse break :blk info_hash;
+                                if (ids.len != id_len) break :blk info_hash;
+                                break :blk ids[0..id_len].*;
+                            };
+                            self.rememberToken(info_hash, rid, src_addr, addr_len, ts);
+                        }
+                    }
                     if (r_dict.dictGet("values")) |values| {
                         if (values.asList()) |peer_list| {
                             for (peer_list) |peer_val| {
@@ -235,7 +279,12 @@ pub const Dht = struct {
             }
 
             // If we found peers, we're done
-            if (peers.items.len > 0) break;
+            // Stop early once we have peers, but never before a second
+            // iteration: the first one only reaches the bootstrap routers,
+            // and routers do not store announces. Breaking at iteration 0
+            // leaves announceSelf with nothing but router tokens, so the
+            // session never actually becomes discoverable.
+            if (peers.items.len > 0 and iterations >= 1) break;
 
             // Otherwise, query the closer nodes we just learned about
             var next_closest = self.findClosest(info_hash, k);
@@ -251,6 +300,89 @@ pub const Dht = struct {
         }
 
         return peers.toOwnedSlice(allocator) catch return error.OutOfMemory;
+    }
+
+    /// BEP 5 announce_peer: tell the nodes that issued us tokens that this
+    /// client holds (or is interested in) `info_hash` and is reachable for the
+    /// BitTorrent protocol on `bt_port`. Without this, a carl session is
+    /// invisible to other DHT clients: they can get_peers all day and never
+    /// find us. Fire-and-forget; responses are ignored (the next lookup's
+    /// drain consumes them harmlessly).
+    /// Record a get_peers announce token, keeping the slots for the nodes
+    /// closest to `target`. The cache is small and get_peers hears from far
+    /// more nodes than it can hold, so first-come would fill it with the
+    /// bootstrap routers — which answer fastest and do not store announces.
+    fn rememberToken(
+        self: *Dht,
+        target: [id_len]u8,
+        node_id: [id_len]u8,
+        addr: std.posix.sockaddr,
+        addr_len: std.posix.socklen_t,
+        token: []const u8,
+    ) void {
+        if (token.len == 0 or token.len > 32) return;
+
+        // Same node answering twice replaces its own slot; a stale token for
+        // an address must not occupy a second one.
+        for (self.announce_tokens[0..self.announce_token_count]) |*t| {
+            if (std.mem.eql(u8, std.mem.asBytes(&t.addr), std.mem.asBytes(&addr))) {
+                @memcpy(t.token[0..token.len], token);
+                t.token_len = @intCast(token.len);
+                t.id = node_id;
+                return;
+            }
+        }
+
+        var slot: *AnnounceToken = undefined;
+        if (self.announce_token_count < self.announce_tokens.len) {
+            slot = &self.announce_tokens[self.announce_token_count];
+            self.announce_token_count += 1;
+        } else {
+            // Full: evict the farthest slot, and only if this node is closer.
+            var worst: usize = 0;
+            var worst_d = distance(self.announce_tokens[0].id, target);
+            for (self.announce_tokens[1..], 1..) |t, i| {
+                const d = distance(t.id, target);
+                if (std.mem.order(u8, &d, &worst_d) == .gt) {
+                    worst = i;
+                    worst_d = d;
+                }
+            }
+            const mine = distance(node_id, target);
+            if (std.mem.order(u8, &mine, &worst_d) != .lt) return;
+            slot = &self.announce_tokens[worst];
+        }
+
+        slot.addr = addr;
+        slot.len = addr_len;
+        @memcpy(slot.token[0..token.len], token);
+        slot.token_len = @intCast(token.len);
+        slot.id = node_id;
+    }
+
+    pub fn announceSelf(self: *Dht, info_hash: [id_len]u8, bt_port: u16) void {
+        const sock = self.sock orelse return;
+        if (bt_port == 0) return;
+
+        for (self.announce_tokens[0..self.announce_token_count]) |*tok| {
+            var a_entries: [5]bencode.Value.DictEntry = undefined;
+            a_entries[0] = .{ .key = "id", .value = .{ .string = &self.our_id } };
+            a_entries[1] = .{ .key = "implied_port", .value = .{ .integer = 0 } };
+            a_entries[2] = .{ .key = "info_hash", .value = .{ .string = &info_hash } };
+            a_entries[3] = .{ .key = "port", .value = .{ .integer = @intCast(bt_port) } };
+            a_entries[4] = .{ .key = "token", .value = .{ .string = tok.token[0..tok.token_len] } };
+
+            var top_entries: [4]bencode.Value.DictEntry = undefined;
+            top_entries[0] = .{ .key = "a", .value = .{ .dict = &a_entries } };
+            top_entries[1] = .{ .key = "q", .value = .{ .string = "announce_peer" } };
+            top_entries[2] = .{ .key = "t", .value = .{ .string = "ap" } };
+            top_entries[3] = .{ .key = "y", .value = .{ .string = "q" } };
+
+            const msg = bencode.encode(self.allocator, .{ .dict = &top_entries }) catch continue;
+            defer self.allocator.free(msg);
+            _ = std.posix.sendto(sock, msg, 0, &tok.addr, tok.len) catch continue;
+        }
+        self.announce_token_count = 0;
     }
 
     fn processResponses(self: *Dht, max_rounds: usize) !void {
@@ -437,4 +569,226 @@ test "add compact nodes" {
         total += b.items.len;
     }
     try std.testing.expectEqual(@as(usize, 1), total);
+}
+
+// --- Routing-table persistence ------------------------------------------------
+//
+// A fresh client with an empty table is at the mercy of the well-known
+// routers; several of them are chronically dead or answer with a single
+// dead-end node (observed in the wild). Persisting learned nodes across
+// sessions gives every later lookup a warm table, exactly like libtorrent's
+// dht_state. Format: u32 LE count, then per node 20B id + 4B IPv4 + 2B BE port.
+//
+// All file I/O here goes through raw syscalls (std.posix.system) instead of
+// std.fs: the cache is a pure optimization and must never be able to abort
+// the process. std.fs wrappers contain `unreachable` branches for errno paths
+// they consider impossible (EFAULT/BADF) and an inline length assert in
+// toPosixPath — under the detached DHT worker a corrupted slice hit exactly
+// that assert once and killed a seeder mid-lookup. Raw syscalls let us treat
+// every failure as "no cache this time".
+
+/// Max nodes written to the cache file.
+pub const node_cache_max: usize = 64;
+
+/// NUL-terminate `path` into `buf`; null when it does not fit.
+fn pathZ(buf: []u8, path: []const u8) ?[*:0]const u8 {
+    if (path.len + 1 > buf.len) return null;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    return @ptrCast(buf.ptr);
+}
+
+/// Write up to `node_cache_max` routing-table nodes to `path`. Best-effort:
+/// every failure is silently ignored.
+pub fn saveNodeCache(self: *const Dht, path: []const u8) void {
+    const c = std.posix.system;
+
+    var buf: [4 + node_cache_max * 26]u8 = undefined;
+    var n: usize = 0;
+    outer: for (&self.buckets) |*b| {
+        for (b.items) |node| {
+            if (n >= node_cache_max) break :outer;
+            if (node.address.any.family != std.posix.AF.INET) continue;
+            @memcpy(buf[4 + n * 26 ..][0..20], &node.id);
+            const ip4: [4]u8 = @bitCast(node.address.in.sa.addr);
+            buf[4 + n * 26 + 20] = ip4[0];
+            buf[4 + n * 26 + 21] = ip4[1];
+            buf[4 + n * 26 + 22] = ip4[2];
+            buf[4 + n * 26 + 23] = ip4[3];
+            const port = node.address.getPort();
+            buf[4 + n * 26 + 24] = @intCast(port >> 8);
+            buf[4 + n * 26 + 25] = @intCast(port & 0xff);
+            n += 1;
+        }
+    }
+    if (n == 0) return;
+    std.mem.writeInt(u32, buf[0..4], @intCast(n), .little);
+
+    const total = 4 + n * 26;
+
+    // Write to "<path>.tmp" and rename over the destination. Opening the real
+    // path with TRUNC would destroy a good cache the moment anything after the
+    // open fails, leaving the next session to cold-start — the opposite of
+    // what the cache is for.
+    var tpbuf: [512]u8 = undefined;
+    var tmp_path_buf: [512]u8 = undefined;
+    const tmp_path = std.fmt.bufPrint(&tmp_path_buf, "{s}.tmp", .{path}) catch return;
+    const tp = pathZ(&tpbuf, tmp_path) orelse return;
+
+    var pbuf: [512]u8 = undefined;
+    const p = pathZ(&pbuf, path) orelse return;
+
+    const oflags: c.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true };
+    const fd = c.openat(std.posix.AT.FDCWD, tp, oflags, @as(c.mode_t, 0o644));
+    if (fd < 0) return;
+    var ok = false;
+    defer {
+        _ = c.close(fd);
+        if (!ok) _ = c.unlinkat(std.posix.AT.FDCWD, tp, 0);
+    }
+
+    var off: usize = 0;
+    while (off < total) {
+        // `total - off`, NOT `buf[off..].len`: buf is `undefined` past the
+        // payload, so writing its full length would append the uninitialized
+        // tail of a stack buffer to a file on disk.
+        const rc = c.write(fd, buf[off..].ptr, total - off);
+        if (rc <= 0) return; // error or nothing written; best-effort
+        off += @intCast(rc);
+    }
+    if (c.renameat(std.posix.AT.FDCWD, tp, std.posix.AT.FDCWD, p) != 0) return;
+    ok = true;
+}
+
+/// Load a previously saved node cache into the routing table. Returns how
+/// many nodes were inserted. Missing/corrupt file is not an error.
+pub fn loadNodeCache(self: *Dht, path: []const u8) usize {
+    const c = std.posix.system;
+
+    var pbuf: [512]u8 = undefined;
+    const p = pathZ(&pbuf, path) orelse return 0;
+    const oflags: c.O = .{ .ACCMODE = .RDONLY };
+    const fd = c.openat(std.posix.AT.FDCWD, p, oflags, @as(c.mode_t, 0));
+    if (fd < 0) return 0;
+    defer _ = c.close(fd);
+
+    var hdr: [4]u8 = undefined;
+    if (!readFull(c, fd, &hdr)) return 0;
+    const count = std.mem.readInt(u32, &hdr, .little);
+    if (count == 0 or count > 4096) return 0;
+
+    var inserted: usize = 0;
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        var entry: [26]u8 = undefined;
+        if (!readFull(c, fd, &entry)) break;
+        const port = (@as(u16, entry[24]) << 8) | @as(u16, entry[25]);
+        if (port == 0) continue;
+        var id: [id_len]u8 = undefined;
+        @memcpy(&id, entry[0..20]);
+        const addr = std.net.Address.initIp4(.{ entry[20], entry[21], entry[22], entry[23] }, port);
+        self.addNode(.{ .id = id, .address = addr });
+        inserted += 1;
+    }
+    return inserted;
+}
+
+fn readFull(c: anytype, fd: c_int, buf: []u8) bool {
+    var off: usize = 0;
+    while (off < buf.len) {
+        const rc = c.read(fd, buf[off..].ptr, buf[off..].len);
+        if (rc <= 0) return false;
+        off += @intCast(rc);
+    }
+    return true;
+}
+
+test "saveNodeCache writes only the payload, not the stack tail" {
+    const a = std.testing.allocator;
+    var d = Dht.init(a, 16999);
+    defer d.deinit();
+
+    // Two IPv4 nodes -> header(4) + 2*26 = 56 bytes on disk. Writing
+    // buf[off..].len instead of total-off produced the full 1668-byte buffer,
+    // i.e. 1612 bytes of uninitialized stack memory appended to the file.
+    const id1: [id_len]u8 = [_]u8{1} ** id_len;
+    const id2: [id_len]u8 = [_]u8{2} ** id_len;
+    d.buckets[0].append(a, .{
+        .id = id1,
+        .address = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 6881),
+    }) catch unreachable;
+    d.buckets[0].append(a, .{
+        .id = id2,
+        .address = std.net.Address.initIp4(.{ 10, 0, 0, 2 }, 6882),
+    }) catch unreachable;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+    const path = try std.fmt.allocPrint(a, "{s}/nodes.dat", .{dir});
+    defer a.free(path);
+
+    saveNodeCache(&d, path);
+
+    const f = try std.fs.openFileAbsolute(path, .{});
+    defer f.close();
+    const size = (try f.stat()).size;
+    try std.testing.expectEqual(@as(u64, 4 + 2 * 26), size);
+
+    // And it round-trips back into an empty table.
+    var d2 = Dht.init(a, 16998);
+    defer d2.deinit();
+    try std.testing.expectEqual(@as(usize, 2), loadNodeCache(&d2, path));
+}
+
+test "announce tokens keep the nodes closest to the target" {
+    const a = std.testing.allocator;
+    var d = Dht.init(a, 16997);
+    defer d.deinit();
+
+    const target: [id_len]u8 = [_]u8{0} ** id_len;
+    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6881);
+
+    // Fill every slot with far nodes (high first byte), then offer a near one.
+    var i: u8 = 0;
+    while (i < d.announce_tokens.len) : (i += 1) {
+        var id: [id_len]u8 = [_]u8{0xf0} ** id_len;
+        id[id_len - 1] = i; // distinct ids
+        var sa = std.net.Address.initIp4(.{ 10, 0, 0, i + 1 }, 6881);
+        d.rememberToken(target, id, sa.any, sa.getOsSockLen(), "tok");
+    }
+    try std.testing.expectEqual(d.announce_tokens.len, d.announce_token_count);
+
+    const near: [id_len]u8 = [_]u8{0x00} ** id_len;
+    d.rememberToken(target, near, addr.any, addr.getOsSockLen(), "near");
+
+    var found_near = false;
+    for (d.announce_tokens[0..d.announce_token_count]) |t| {
+        if (std.mem.eql(u8, &t.id, &near)) found_near = true;
+    }
+    try std.testing.expect(found_near);
+    // Still bounded, and the far node it replaced is gone.
+    try std.testing.expectEqual(d.announce_tokens.len, d.announce_token_count);
+
+    // A farther node offered against a full cache is rejected outright.
+    const farther: [id_len]u8 = [_]u8{0xff} ** id_len;
+    var sa2 = std.net.Address.initIp4(.{ 10, 1, 1, 1 }, 6881);
+    d.rememberToken(target, farther, sa2.any, sa2.getOsSockLen(), "far");
+    for (d.announce_tokens[0..d.announce_token_count]) |t| {
+        try std.testing.expect(!std.mem.eql(u8, &t.id, &farther));
+    }
+}
+
+test "the same responder does not consume two token slots" {
+    const a = std.testing.allocator;
+    var d = Dht.init(a, 16996);
+    defer d.deinit();
+    const target: [id_len]u8 = [_]u8{0} ** id_len;
+    const id: [id_len]u8 = [_]u8{7} ** id_len;
+    var sa = std.net.Address.initIp4(.{ 10, 2, 2, 2 }, 6881);
+    d.rememberToken(target, id, sa.any, sa.getOsSockLen(), "t1");
+    d.rememberToken(target, id, sa.any, sa.getOsSockLen(), "t2");
+    try std.testing.expectEqual(@as(usize, 1), d.announce_token_count);
+    try std.testing.expectEqualStrings("t2", d.announce_tokens[0].token[0..d.announce_tokens[0].token_len]);
 }
