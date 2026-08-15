@@ -71,6 +71,9 @@ pub const AnnounceToken = struct {
     len: std.posix.socklen_t,
     token: [32]u8,
     token_len: u8,
+    /// Responder's node ID, kept so the bounded cache can hold the nodes
+    /// closest to the target rather than the first to answer.
+    id: [id_len]u8,
 };
 
 /// DHT client for peer discovery.
@@ -189,6 +192,9 @@ pub const Dht = struct {
         var peers: std.ArrayList(tracker_mod.Peer) = .empty;
         errdefer peers.deinit(allocator);
 
+        // Tokens are only valid for the target they were issued against.
+        self.announce_token_count = 0;
+
         // Find closest nodes to the info_hash
         var closest = self.findClosest(info_hash, k);
 
@@ -238,14 +244,13 @@ pub const Dht = struct {
                     // get_peers response.
                     if (r_dict.dictGet("token")) |tok_val| {
                         if (tok_val.asString()) |ts| {
-                            if (ts.len > 0 and ts.len <= 32 and self.announce_token_count < self.announce_tokens.len) {
-                                const slot = &self.announce_tokens[self.announce_token_count];
-                                slot.addr = src_addr;
-                                slot.len = addr_len;
-                                @memcpy(slot.token[0..ts.len], ts);
-                                slot.token_len = @intCast(ts.len);
-                                self.announce_token_count += 1;
-                            }
+                            const rid: [id_len]u8 = blk: {
+                                const idv = r_dict.dictGet("id") orelse break :blk info_hash;
+                                const ids = idv.asString() orelse break :blk info_hash;
+                                if (ids.len != id_len) break :blk info_hash;
+                                break :blk ids[0..id_len].*;
+                            };
+                            self.rememberToken(info_hash, rid, src_addr, addr_len, ts);
                         }
                     }
                     if (r_dict.dictGet("values")) |values| {
@@ -274,7 +279,12 @@ pub const Dht = struct {
             }
 
             // If we found peers, we're done
-            if (peers.items.len > 0) break;
+            // Stop early once we have peers, but never before a second
+            // iteration: the first one only reaches the bootstrap routers,
+            // and routers do not store announces. Breaking at iteration 0
+            // leaves announceSelf with nothing but router tokens, so the
+            // session never actually becomes discoverable.
+            if (peers.items.len > 0 and iterations >= 1) break;
 
             // Otherwise, query the closer nodes we just learned about
             var next_closest = self.findClosest(info_hash, k);
@@ -298,6 +308,58 @@ pub const Dht = struct {
     /// invisible to other DHT clients: they can get_peers all day and never
     /// find us. Fire-and-forget; responses are ignored (the next lookup's
     /// drain consumes them harmlessly).
+    /// Record a get_peers announce token, keeping the slots for the nodes
+    /// closest to `target`. The cache is small and get_peers hears from far
+    /// more nodes than it can hold, so first-come would fill it with the
+    /// bootstrap routers — which answer fastest and do not store announces.
+    fn rememberToken(
+        self: *Dht,
+        target: [id_len]u8,
+        node_id: [id_len]u8,
+        addr: std.posix.sockaddr,
+        addr_len: std.posix.socklen_t,
+        token: []const u8,
+    ) void {
+        if (token.len == 0 or token.len > 32) return;
+
+        // Same node answering twice replaces its own slot; a stale token for
+        // an address must not occupy a second one.
+        for (self.announce_tokens[0..self.announce_token_count]) |*t| {
+            if (std.mem.eql(u8, std.mem.asBytes(&t.addr), std.mem.asBytes(&addr))) {
+                @memcpy(t.token[0..token.len], token);
+                t.token_len = @intCast(token.len);
+                t.id = node_id;
+                return;
+            }
+        }
+
+        var slot: *AnnounceToken = undefined;
+        if (self.announce_token_count < self.announce_tokens.len) {
+            slot = &self.announce_tokens[self.announce_token_count];
+            self.announce_token_count += 1;
+        } else {
+            // Full: evict the farthest slot, and only if this node is closer.
+            var worst: usize = 0;
+            var worst_d = distance(self.announce_tokens[0].id, target);
+            for (self.announce_tokens[1..], 1..) |t, i| {
+                const d = distance(t.id, target);
+                if (std.mem.order(u8, &d, &worst_d) == .gt) {
+                    worst = i;
+                    worst_d = d;
+                }
+            }
+            const mine = distance(node_id, target);
+            if (std.mem.order(u8, &mine, &worst_d) != .lt) return;
+            slot = &self.announce_tokens[worst];
+        }
+
+        slot.addr = addr;
+        slot.len = addr_len;
+        @memcpy(slot.token[0..token.len], token);
+        slot.token_len = @intCast(token.len);
+        slot.id = node_id;
+    }
+
     pub fn announceSelf(self: *Dht, info_hash: [id_len]u8, bt_port: u16) void {
         const sock = self.sock orelse return;
         if (bt_port == 0) return;
@@ -678,4 +740,55 @@ test "saveNodeCache writes only the payload, not the stack tail" {
     var d2 = Dht.init(a, 16998);
     defer d2.deinit();
     try std.testing.expectEqual(@as(usize, 2), loadNodeCache(&d2, path));
+}
+
+test "announce tokens keep the nodes closest to the target" {
+    const a = std.testing.allocator;
+    var d = Dht.init(a, 16997);
+    defer d.deinit();
+
+    const target: [id_len]u8 = [_]u8{0} ** id_len;
+    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6881);
+
+    // Fill every slot with far nodes (high first byte), then offer a near one.
+    var i: u8 = 0;
+    while (i < d.announce_tokens.len) : (i += 1) {
+        var id: [id_len]u8 = [_]u8{0xf0} ** id_len;
+        id[id_len - 1] = i; // distinct ids
+        var sa = std.net.Address.initIp4(.{ 10, 0, 0, i + 1 }, 6881);
+        d.rememberToken(target, id, sa.any, sa.getOsSockLen(), "tok");
+    }
+    try std.testing.expectEqual(d.announce_tokens.len, d.announce_token_count);
+
+    const near: [id_len]u8 = [_]u8{0x00} ** id_len;
+    d.rememberToken(target, near, addr.any, addr.getOsSockLen(), "near");
+
+    var found_near = false;
+    for (d.announce_tokens[0..d.announce_token_count]) |t| {
+        if (std.mem.eql(u8, &t.id, &near)) found_near = true;
+    }
+    try std.testing.expect(found_near);
+    // Still bounded, and the far node it replaced is gone.
+    try std.testing.expectEqual(d.announce_tokens.len, d.announce_token_count);
+
+    // A farther node offered against a full cache is rejected outright.
+    const farther: [id_len]u8 = [_]u8{0xff} ** id_len;
+    var sa2 = std.net.Address.initIp4(.{ 10, 1, 1, 1 }, 6881);
+    d.rememberToken(target, farther, sa2.any, sa2.getOsSockLen(), "far");
+    for (d.announce_tokens[0..d.announce_token_count]) |t| {
+        try std.testing.expect(!std.mem.eql(u8, &t.id, &farther));
+    }
+}
+
+test "the same responder does not consume two token slots" {
+    const a = std.testing.allocator;
+    var d = Dht.init(a, 16996);
+    defer d.deinit();
+    const target: [id_len]u8 = [_]u8{0} ** id_len;
+    const id: [id_len]u8 = [_]u8{7} ** id_len;
+    var sa = std.net.Address.initIp4(.{ 10, 2, 2, 2 }, 6881);
+    d.rememberToken(target, id, sa.any, sa.getOsSockLen(), "t1");
+    d.rememberToken(target, id, sa.any, sa.getOsSockLen(), "t2");
+    try std.testing.expectEqual(@as(usize, 1), d.announce_token_count);
+    try std.testing.expectEqualStrings("t2", d.announce_tokens[0].token[0..d.announce_tokens[0].token_len]);
 }
