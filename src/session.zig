@@ -14,6 +14,7 @@ const peer_mod = @import("peer.zig");
 const extension = @import("extension.zig");
 const bencode = @import("bencode.zig");
 const dht_mod = @import("dht.zig");
+const nostr_config = @import("nostr_config.zig");
 const proxy_mod = @import("proxy.zig");
 const i2p_sam = @import("i2p_sam.zig");
 
@@ -2433,8 +2434,17 @@ pub const Session = struct {
         // finish (and free it) after the session is gone.
         st.ref();
         log.info("DHT lookup starting (background)...", .{});
+        // Warm the table from the persisted node cache (learned nodes from
+        // previous sessions), falling back to the well-known routers.
+        var cache_path_buf: [512]u8 = undefined;
+        const dht_cache_path: []const u8 = blk: {
+            const cfg_dir = nostr_config.configDir(self.allocator) catch break :blk "";
+            defer self.allocator.free(cfg_dir);
+            std.fs.cwd().makePath(cfg_dir) catch {};
+            break :blk std.fmt.bufPrint(&cache_path_buf, "{s}/dht_nodes.dat", .{cfg_dir}) catch "";
+        };
         const thread = std.Thread.spawn(.{}, dhtQueryWorker, .{
-            self.allocator, st, self.listen_port + 1, self.info_hash,
+            self.allocator, st, self.listen_port + 1, self.info_hash, dht_cache_path,
         }) catch |err| {
             log.warn("DHT thread spawn failed: {}", .{err});
             st.mutex.lock();
@@ -2451,7 +2461,7 @@ pub const Session = struct {
     /// session safely by holding a reference to the shared state and never
     /// touching the Session itself. Posts found peers + routing-table size
     /// for maintenance() to consume.
-    fn dhtQueryWorker(allocator: Allocator, st: *DhtState, port: u16, info_hash: [20]u8) void {
+    fn dhtQueryWorker(allocator: Allocator, st: *DhtState, port: u16, info_hash: [20]u8, cache_path: []const u8) void {
         defer st.unref(allocator);
         defer {
             st.mutex.lock();
@@ -2461,6 +2471,10 @@ pub const Session = struct {
 
         var d = dht_mod.Dht.init(allocator, port);
         defer d.deinit();
+        if (cache_path.len > 0) {
+            const warmed = dht_mod.loadNodeCache(&d, cache_path);
+            if (warmed > 0) log.info("DHT: warmed table with {d} cached nodes", .{warmed});
+        }
         d.start() catch {
             log.warn("DHT failed to start", .{});
             st.mutex.lock();
@@ -2470,6 +2484,7 @@ pub const Session = struct {
         };
 
         const peers = d.getPeers(allocator, info_hash) catch return;
+        if (cache_path.len > 0) dht_mod.saveNodeCache(&d, cache_path);
 
         var node_count: u32 = 0;
         for (&d.buckets) |*b| node_count += @intCast(b.items.len);

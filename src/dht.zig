@@ -24,11 +24,20 @@ pub const Node = struct {
     address: std.net.Address,
 };
 
-/// Well-known bootstrap nodes.
+/// Well-known bootstrap nodes. Kept deliberately broad: routers die or
+/// degrade (observed in the wild: router.bittorrent.com and router.utorrent.com
+/// timing out for whole residential networks while transmissionbt answers with
+/// a single dead-end node). A client starting with an empty table needs
+/// several live, generous routers to have a chance.
 const bootstrap_nodes = [_]struct { host: []const u8, port: u16 }{
     .{ .host = "router.bittorrent.com", .port = 6881 },
     .{ .host = "dht.transmissionbt.com", .port = 6881 },
     .{ .host = "router.utorrent.com", .port = 6881 },
+    .{ .host = "dht.libtorrent.org", .port = 25401 },
+    .{ .host = "dht.bluetigers.club", .port = 6881 },
+    .{ .host = "dht.anacrolix.link", .port = 6881 },
+    .{ .host = "router.silotis.us", .port = 6881 },
+    .{ .host = "dht.aelitis.com", .port = 6881 },
 };
 
 /// XOR distance between two node IDs.
@@ -172,7 +181,7 @@ pub const Dht = struct {
         const sock = self.sock orelse return peers.toOwnedSlice(allocator) catch return error.OutOfMemory;
 
         var iterations: usize = 0;
-        while (iterations < 3) : (iterations += 1) {
+        while (iterations < 8) : (iterations += 1) {
             // Drain responses for this iteration
             var rounds: usize = 0;
             while (rounds < 8) : (rounds += 1) {
@@ -415,4 +424,116 @@ test "add compact nodes" {
         total += b.items.len;
     }
     try std.testing.expectEqual(@as(usize, 1), total);
+}
+
+// --- Routing-table persistence ------------------------------------------------
+//
+// A fresh client with an empty table is at the mercy of the well-known
+// routers; several of them are chronically dead or answer with a single
+// dead-end node (observed in the wild). Persisting learned nodes across
+// sessions gives every later lookup a warm table, exactly like libtorrent's
+// dht_state. Format: u32 LE count, then per node 20B id + 4B IPv4 + 2B BE port.
+//
+// All file I/O here goes through raw syscalls (std.posix.system) instead of
+// std.fs: the cache is a pure optimization and must never be able to abort
+// the process. std.fs wrappers contain `unreachable` branches for errno paths
+// they consider impossible (EFAULT/BADF) and an inline length assert in
+// toPosixPath — under the detached DHT worker a corrupted slice hit exactly
+// that assert once and killed a seeder mid-lookup. Raw syscalls let us treat
+// every failure as "no cache this time".
+
+/// Max nodes written to the cache file.
+pub const node_cache_max: usize = 64;
+
+/// NUL-terminate `path` into `buf`; null when it does not fit.
+fn pathZ(buf: []u8, path: []const u8) ?[*:0]const u8 {
+    if (path.len + 1 > buf.len) return null;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    return @ptrCast(buf.ptr);
+}
+
+/// Write up to `node_cache_max` routing-table nodes to `path`. Best-effort:
+/// every failure is silently ignored.
+pub fn saveNodeCache(self: *const Dht, path: []const u8) void {
+    const c = std.posix.system;
+
+    var buf: [4 + node_cache_max * 26]u8 = undefined;
+    var n: usize = 0;
+    outer: for (&self.buckets) |*b| {
+        for (b.items) |node| {
+            if (n >= node_cache_max) break :outer;
+            if (node.address.any.family != std.posix.AF.INET) continue;
+            @memcpy(buf[4 + n * 26 ..][0..20], &node.id);
+            const ip4: [4]u8 = @bitCast(node.address.in.sa.addr);
+            buf[4 + n * 26 + 20] = ip4[0];
+            buf[4 + n * 26 + 21] = ip4[1];
+            buf[4 + n * 26 + 22] = ip4[2];
+            buf[4 + n * 26 + 23] = ip4[3];
+            const port = node.address.getPort();
+            buf[4 + n * 26 + 24] = @intCast(port >> 8);
+            buf[4 + n * 26 + 25] = @intCast(port & 0xff);
+            n += 1;
+        }
+    }
+    if (n == 0) return;
+    std.mem.writeInt(u32, buf[0..4], @intCast(n), .little);
+
+    var pbuf: [512]u8 = undefined;
+    const p = pathZ(&pbuf, path) orelse return;
+    const oflags: c.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true };
+    const fd = c.openat(-100, p, oflags, @as(c.mode_t, 0o644));
+    if (fd < 0) return;
+    defer _ = c.close(fd);
+
+    var off: usize = 0;
+    const total = 4 + n * 26;
+    while (off < total) {
+        const rc = c.write(fd, buf[off..].ptr, buf[off..].len);
+        if (rc <= 0) return; // error or nothing written; best-effort
+        off += @intCast(rc);
+    }
+}
+
+/// Load a previously saved node cache into the routing table. Returns how
+/// many nodes were inserted. Missing/corrupt file is not an error.
+pub fn loadNodeCache(self: *Dht, path: []const u8) usize {
+    const c = std.posix.system;
+
+    var pbuf: [512]u8 = undefined;
+    const p = pathZ(&pbuf, path) orelse return 0;
+    const oflags: c.O = .{ .ACCMODE = .RDONLY };
+    const fd = c.openat(-100, p, oflags, @as(c.mode_t, 0));
+    if (fd < 0) return 0;
+    defer _ = c.close(fd);
+
+    var hdr: [4]u8 = undefined;
+    if (!readFull(c, fd, &hdr)) return 0;
+    const count = std.mem.readInt(u32, &hdr, .little);
+    if (count == 0 or count > 4096) return 0;
+
+    var inserted: usize = 0;
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        var entry: [26]u8 = undefined;
+        if (!readFull(c, fd, &entry)) break;
+        const port = (@as(u16, entry[24]) << 8) | @as(u16, entry[25]);
+        if (port == 0) continue;
+        var id: [id_len]u8 = undefined;
+        @memcpy(&id, entry[0..20]);
+        const addr = std.net.Address.initIp4(.{ entry[20], entry[21], entry[22], entry[23] }, port);
+        self.addNode(.{ .id = id, .address = addr });
+        inserted += 1;
+    }
+    return inserted;
+}
+
+fn readFull(c: anytype, fd: c_int, buf: []u8) bool {
+    var off: usize = 0;
+    while (off < buf.len) {
+        const rc = c.read(fd, buf[off..].ptr, buf[off..].len);
+        if (rc <= 0) return false;
+        off += @intCast(rc);
+    }
+    return true;
 }
