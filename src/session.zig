@@ -2484,6 +2484,10 @@ pub const Session = struct {
         };
 
         const peers = d.getPeers(allocator, info_hash) catch return;
+        // BEP 5 announce_peer: make this session (seeder or leecher)
+        // discoverable via DHT for info_hash. `port` is the DHT socket port
+        // (listen_port + 1); the BitTorrent listener is one below it.
+        if (port > 1) d.announceSelf(info_hash, port - 1);
         if (cache_path.len > 0) dht_mod.saveNodeCache(&d, cache_path);
 
         var node_count: u32 = 0;
