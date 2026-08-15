@@ -66,6 +66,13 @@ fn bucketIndex(dist: [id_len]u8) u8 {
     return 159; // Same ID
 }
 
+pub const AnnounceToken = struct {
+    addr: std.posix.sockaddr,
+    len: std.posix.socklen_t,
+    token: [32]u8,
+    token_len: u8,
+};
+
 /// DHT client for peer discovery.
 /// Poll a cancel token, treating "no token" as "not cancelled".
 fn cancelled(tok: ?*std.atomic.Value(bool)) bool {
@@ -78,6 +85,14 @@ pub const Dht = struct {
     our_id: [id_len]u8,
     sock: ?std.posix.fd_t,
     port: u16,
+
+    /// (addr, token) pairs learned from get_peers responses, used by
+    /// announceSelf (BEP 5 announce_peer). Tokens are single-use-ish per
+    /// node; we keep the most recent few and clear them after announcing.
+    announce_tokens: [8]AnnounceToken = undefined,
+    announce_token_count: usize = 0,
+
+    /// Max nodes written to the cache file.
 
     // Routing table: 160 buckets, each up to k nodes
     buckets: [160]std.ArrayList(Node),
@@ -218,6 +233,21 @@ pub const Dht = struct {
 
                 // Check for "values" (peers)
                 if (resp.dictGet("r")) |r_dict| {
+                    // Capture the announce token (BEP 5): announce_peer must
+                    // echo a token the node previously handed us in a
+                    // get_peers response.
+                    if (r_dict.dictGet("token")) |tok_val| {
+                        if (tok_val.asString()) |ts| {
+                            if (ts.len > 0 and ts.len <= 32 and self.announce_token_count < self.announce_tokens.len) {
+                                const slot = &self.announce_tokens[self.announce_token_count];
+                                slot.addr = src_addr;
+                                slot.len = addr_len;
+                                @memcpy(slot.token[0..ts.len], ts);
+                                slot.token_len = @intCast(ts.len);
+                                self.announce_token_count += 1;
+                            }
+                        }
+                    }
                     if (r_dict.dictGet("values")) |values| {
                         if (values.asList()) |peer_list| {
                             for (peer_list) |peer_val| {
@@ -260,6 +290,37 @@ pub const Dht = struct {
         }
 
         return peers.toOwnedSlice(allocator) catch return error.OutOfMemory;
+    }
+
+    /// BEP 5 announce_peer: tell the nodes that issued us tokens that this
+    /// client holds (or is interested in) `info_hash` and is reachable for the
+    /// BitTorrent protocol on `bt_port`. Without this, a carl session is
+    /// invisible to other DHT clients: they can get_peers all day and never
+    /// find us. Fire-and-forget; responses are ignored (the next lookup's
+    /// drain consumes them harmlessly).
+    pub fn announceSelf(self: *Dht, info_hash: [id_len]u8, bt_port: u16) void {
+        const sock = self.sock orelse return;
+        if (bt_port == 0) return;
+
+        for (self.announce_tokens[0..self.announce_token_count]) |*tok| {
+            var a_entries: [5]bencode.Value.DictEntry = undefined;
+            a_entries[0] = .{ .key = "id", .value = .{ .string = &self.our_id } };
+            a_entries[1] = .{ .key = "implied_port", .value = .{ .integer = 0 } };
+            a_entries[2] = .{ .key = "info_hash", .value = .{ .string = &info_hash } };
+            a_entries[3] = .{ .key = "port", .value = .{ .integer = @intCast(bt_port) } };
+            a_entries[4] = .{ .key = "token", .value = .{ .string = tok.token[0..tok.token_len] } };
+
+            var top_entries: [4]bencode.Value.DictEntry = undefined;
+            top_entries[0] = .{ .key = "a", .value = .{ .dict = &a_entries } };
+            top_entries[1] = .{ .key = "q", .value = .{ .string = "announce_peer" } };
+            top_entries[2] = .{ .key = "t", .value = .{ .string = "ap" } };
+            top_entries[3] = .{ .key = "y", .value = .{ .string = "q" } };
+
+            const msg = bencode.encode(self.allocator, .{ .dict = &top_entries }) catch continue;
+            defer self.allocator.free(msg);
+            _ = std.posix.sendto(sock, msg, 0, &tok.addr, tok.len) catch continue;
+        }
+        self.announce_token_count = 0;
     }
 
     fn processResponses(self: *Dht, max_rounds: usize) !void {

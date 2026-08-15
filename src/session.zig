@@ -2512,10 +2512,16 @@ pub const Session = struct {
             return;
         };
 
-        // Persist whatever the walk learned even if it ends up failing: the
-        // routing table is grown by the bootstrap/iteration steps, and
-        // throwing it away on a late error means the next session cold-starts
-        // for no reason.
+        // Both of these run even when the walk ends in an error, because both
+        // consume state the walk has already built by then: getPeers collects
+        // announce tokens and grows the routing table before it can fail, and
+        // discarding either on a late error costs us a cycle of
+        // discoverability and a needless cold start next session.
+        //
+        // BEP 5 announce_peer: make this session (seeder or leecher)
+        // discoverable via DHT for info_hash. `port` is the DHT socket port
+        // (listen_port + 1); the BitTorrent listener is one below it.
+        defer if (port > 1) d.announceSelf(info_hash, port - 1);
         defer if (cache_path.len > 0) dht_mod.saveNodeCache(&d, cache_path);
 
         const peers = d.getPeers(allocator, info_hash, &st.cancel) catch {
