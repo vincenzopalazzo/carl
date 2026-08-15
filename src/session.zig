@@ -83,6 +83,16 @@ pub const Session = struct {
     peers: std.ArrayList(*peer_mod.PeerConnection),
     active_pieces: std.AutoHashMap(u32, *piece_mod.PieceProgress),
 
+    // Web seeding (BEP 19): a shared HTTP client so consecutive piece fetches
+    // reuse keep-alive connections instead of paying TCP setup per piece, and
+    // a progress flag that collapses the run loop's poll timeout to 0ms while
+    // a web-seed batch is making progress (otherwise the 1s poll caps web
+    // seeding at ~1 piece/s no matter how fast the server is).
+    web_seed_client: ?std.http.Client = null,
+    web_seed_progress: bool = false,
+    /// Per-url-list-entry "stop using this seed" flags, allocated on first use.
+    web_seed_off: ?[]bool = null,
+
     // Piece availability counts (how many peers have each piece)
     piece_availability: []u32,
 
@@ -400,6 +410,8 @@ pub const Session = struct {
 
         if (self.dht_instance) |*d| d.deinit();
         if (self.metadata_download) |*md| md.deinit();
+        if (self.web_seed_client) |*c| c.deinit();
+        if (self.web_seed_off) |b| self.allocator.free(b);
         if (self.listener) |*l| l.deinit();
         if (self.torrent_blob) |b| self.allocator.free(b);
         self.freeFileSnapSlice(self.file_snap);
@@ -843,7 +855,13 @@ pub const Session = struct {
             var fds: [max_peers + 1]std.posix.pollfd = undefined;
             const nfds = self.buildPollFds(&fds);
 
-            _ = std.posix.poll(fds[0..nfds], 1000) catch 0;
+            // 0ms while the web seed is the only source and just made progress: the
+            // loop spins straight back to tryWebSeedDownload (socket events are
+            // still serviced every pass), so web-seed throughput is bounded
+            // by the server, not by the poll period. Otherwise 1s as before.
+            const poll_timeout: i32 = if (self.web_seed_progress) 0 else 1000;
+            self.web_seed_progress = false;
+            _ = std.posix.poll(fds[0..nfds], poll_timeout) catch 0;
 
             self.processPollResults(fds[0..nfds]) catch {};
 
@@ -2339,25 +2357,58 @@ pub const Session = struct {
         if (urls.len == 0) return;
         if (self.num_pieces == 0) return;
 
-        // Find a piece we need
+        // Exactly one piece per event-loop pass. downloadWebSeedPiece blocks
+        // for the whole Range GET, so fetching a batch here would leave the
+        // listener, every peer socket, and the shutdown flag unserviced for
+        // the length of the batch — a hung web seed would freeze the session.
+        // Throughput does not need the batch: web_seed_progress collapses the
+        // next poll to 0ms, so the loop comes straight back here and the rate
+        // is bounded by the server, not by the poll period.
+        var piece_idx: ?u32 = null;
         for (0..self.num_pieces) |i| {
             const idx: u32 = @intCast(i);
             if (self.our_bitfield.hasPiece(idx)) continue;
             if (self.active_pieces.contains(idx)) continue;
-
-            // Try each web seed URL
-            for (urls) |base_url| {
-                if (self.downloadWebSeedPiece(base_url, idx) catch false) {
-                    return;
-                } else {
-                    continue; // Try next URL
-                }
-            }
-            return; // Don't try more pieces if all URLs failed
+            piece_idx = idx;
+            break;
         }
+        const idx = piece_idx orelse return; // nothing left to fetch
+
+        // Try each web seed URL, skipping ones already ruled out this session.
+        for (urls, 0..) |base_url, url_i| {
+            if (self.webSeedDisabled(url_i)) continue;
+            if (self.downloadWebSeedPiece(base_url, idx, url_i) catch false) {
+                // Spin the loop at 0ms only while the web seed is the sole
+                // source. With peers connected it stays a low-rate fallback on
+                // the normal 1s poll: peers are usually faster, and every
+                // blocking Range GET is time their sockets are not serviced.
+                if (self.peers.items.len == 0) self.web_seed_progress = true;
+                return;
+            }
+        }
+        // All URLs failed for this piece — retry on the next pass.
     }
 
-    fn downloadWebSeedPiece(self: *Session, base_url: []const u8, piece_idx: u32) !bool {
+    /// Whether web seed `url_i` has been ruled out for the rest of the session.
+    fn webSeedDisabled(self: *Session, url_i: usize) bool {
+        const bits = self.web_seed_off orelse return false;
+        return url_i < bits.len and bits[url_i];
+    }
+
+    /// Stop using web seed `url_i` for the rest of the session.
+    fn disableWebSeed(self: *Session, url_i: usize, reason: []const u8) void {
+        const urls = self.meta.url_list orelse return;
+        if (self.web_seed_off == null) {
+            self.web_seed_off = self.allocator.alloc(bool, urls.len) catch return;
+            @memset(self.web_seed_off.?, false);
+        }
+        const bits = self.web_seed_off.?;
+        if (url_i >= bits.len or bits[url_i]) return;
+        bits[url_i] = true;
+        log.warn("web seed {s} disabled: {s}", .{ urls[url_i], reason });
+    }
+
+    fn downloadWebSeedPiece(self: *Session, base_url: []const u8, piece_idx: u32, url_i: usize) !bool {
         const plen = piece_mod.pieceLength(piece_idx, self.piece_len, self.total_length);
         if (plen == 0) return false;
 
@@ -2385,9 +2436,12 @@ pub const Session = struct {
         var range_buf: [64]u8 = undefined;
         const range_str = std.fmt.bufPrint(&range_buf, "bytes={d}-{d}", .{ start, end }) catch return false;
 
-        // HTTP request with Range header
-        var client: std.http.Client = .{ .allocator = self.allocator };
-        defer client.deinit();
+        // HTTP request with Range header. The client is session-scoped so
+        // consecutive piece fetches reuse keep-alive connections from the
+        // client's connection pool instead of paying a fresh TCP handshake
+        // (and TLS, for https web seeds) per piece.
+        if (self.web_seed_client == null) self.web_seed_client = .{ .allocator = self.allocator };
+        const client = &self.web_seed_client.?;
 
         var response_body: std.ArrayList(u8) = .empty;
         defer response_body.deinit(self.allocator);
@@ -2406,7 +2460,16 @@ pub const Session = struct {
             .extra_headers = &extra_headers,
         }) catch return false;
 
-        // 206 Partial Content or 200 OK
+        // A Range request is answered with 206. A 200 means the server ignored
+        // Range and sent the whole file: the body will not match plen, so the
+        // fetch fails — and retrying it costs a full-file download per piece,
+        // per pass, forever. Rule the seed out instead of burning the
+        // bandwidth. (Python's http.server does exactly this, so it is not a
+        // hypothetical.)
+        if (result.status == .ok and plen != self.total_length) {
+            self.disableWebSeed(url_i, "HTTP 200 to a Range request: server does not support byte ranges");
+            return false;
+        }
         if (result.status != .partial_content and result.status != .ok) return false;
 
         // Flush remaining buffered data from the adapter
