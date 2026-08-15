@@ -79,7 +79,6 @@ pub const DecodeError = error{
     UnexpectedEnd,
     InvalidInteger,
     InvalidStringLength,
-    UnsortedDictKeys,
     DuplicateDictKey,
     LeadingZero,
     NegativeZero,
@@ -204,8 +203,6 @@ fn decodeDict(allocator: Allocator, input: []const u8, pos: *usize) DecodeError!
         entries.deinit(allocator);
     }
 
-    var last_key: ?[]const u8 = null;
-
     while (true) {
         if (pos.* >= input.len) return error.UnexpectedEnd;
         if (input[pos.*] == 'e') {
@@ -218,21 +215,23 @@ fn decodeDict(allocator: Allocator, input: []const u8, pos: *usize) DecodeError!
         const key_value = try decodeString(allocator, input, pos);
         const key = key_value.string;
 
-        if (last_key) |prev| {
-            const ord = std.mem.order(u8, prev, key);
-            switch (ord) {
-                .gt => {
-                    allocator.free(key);
-                    return error.UnsortedDictKeys;
-                },
-                .eq => {
-                    allocator.free(key);
-                    return error.DuplicateDictKey;
-                },
-                .lt => {},
+        // Unsorted keys are accepted: BEP 3 recommends alphabetical order for
+        // encoding, but real-world trackers and peers emit dicts in arbitrary
+        // order and every major client parses them. Rejecting them here made
+        // carl fail announces against trackers that work with
+        // Transmission/libtorrent (seen in loopback sims:
+        // interval-before-complete => error.InvalidResponse).
+        //
+        // Duplicates stay rejected, but without the sort invariant they are no
+        // longer guaranteed adjacent, so scan every key collected so far. Dicts
+        // in this protocol are a handful of keys wide, so the quadratic scan is
+        // cheaper than building a hash set.
+        for (entries.items) |prev| {
+            if (std.mem.eql(u8, prev.key, key)) {
+                allocator.free(key);
+                return error.DuplicateDictKey;
             }
         }
-        last_key = key;
 
         const value = decodeAt(allocator, input, pos) catch |err| {
             allocator.free(key);
@@ -398,14 +397,57 @@ test "decode nested dict with list" {
     try std.testing.expectEqualStrings("b", items[1].string);
 }
 
-test "reject unsorted dict keys" {
+test "accept unsorted dict keys (real-world trackers emit them)" {
     const allocator = std.testing.allocator;
-    try std.testing.expectError(error.UnsortedDictKeys, decode(allocator, "d4:spam4:eggs3:cow3:mooe"));
+    const v = try decode(allocator, "d4:spam4:eggs3:cow3:mooe");
+    defer v.deinit(allocator);
+    try std.testing.expectEqualStrings("eggs", v.dictGet("spam").?.string);
+    try std.testing.expectEqualStrings("moo", v.dictGet("cow").?.string);
+}
+
+test "parse unsorted tracker announce response" {
+    const allocator = std.testing.allocator;
+    // interval first, complete/incomplete before peers — the exact ordering
+    // that used to fail every announce with error.InvalidResponse.
+    var body: [64]u8 = undefined;
+    const peer = "\x7f\x00\x00\x01\x44\x49"; // 127.0.0.1:17481
+    const prefix = "d8:intervali30e8:completei1e10:incompletei0e5:peers6:";
+    @memcpy(body[0..prefix.len], prefix);
+    @memcpy(body[prefix.len .. prefix.len + 6], peer);
+    body[prefix.len + 6] = 'e';
+    const v = try decode(allocator, body[0 .. prefix.len + 7]);
+    defer v.deinit(allocator);
+    try std.testing.expectEqual(@as(i64, 30), v.dictGet("interval").?.asInt().?);
+    try std.testing.expectEqual(@as(i64, 1), v.dictGet("complete").?.asInt().?);
+    const peers = v.dictGet("peers").?.string;
+    try std.testing.expectEqual(@as(usize, 6), peers.len);
 }
 
 test "reject duplicate dict keys" {
     const allocator = std.testing.allocator;
     try std.testing.expectError(error.DuplicateDictKey, decode(allocator, "d3:cow3:moo3:cow4:moone"));
+}
+
+test "reject duplicate dict keys that are not adjacent" {
+    // Dropping the sort requirement means duplicates can be separated by other
+    // keys; a last-key-only check would let this through and dictGet would
+    // silently return the first of two conflicting values.
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.DuplicateDictKey, decode(allocator, "d3:cow3:moo4:spam4:eggs3:cow3:xxxe"));
+}
+
+test "unsorted info dict round-trips to the same bytes" {
+    // metainfo.parse re-encodes the decoded info dict to get the bytes it
+    // hashes. That is only correct while encode emits entries in decoded
+    // order — otherwise an unsorted .torrent gets an info-hash no other
+    // client agrees with, and the download silently finds no peers.
+    const allocator = std.testing.allocator;
+    const src = "d4:name4:test6:lengthi4e12:piece lengthi16384ee";
+    const v = try decode(allocator, src);
+    defer v.deinit(allocator);
+    const re = try encode(allocator, v);
+    defer allocator.free(re);
+    try std.testing.expectEqualStrings(src, re);
 }
 
 test "reject truncated input" {

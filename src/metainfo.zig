@@ -138,8 +138,11 @@ pub fn parse(allocator: Allocator, data: []const u8) MetainfoError!Metainfo {
 
     const info_val = root.dictGet("info") orelse return error.MissingField;
 
-    // Re-encode the info dict to get canonical bytes for info_hash.
-    // This is correct because bencode has a single canonical encoding.
+    // Re-encode the info dict to get the bytes for info_hash. This reproduces
+    // the file's original info-dict bytes because the decoder preserves key
+    // order and the encoder emits entries in that order — so it holds for
+    // unsorted torrents too, which the decoder now accepts. See the
+    // "unsorted info dict round-trips to the same bytes" test in bencode.zig.
     const raw_info = bencode.encode(allocator, info_val) catch return error.OutOfMemory;
     errdefer allocator.free(raw_info);
 
