@@ -25,6 +25,12 @@ pub const handshake_ext_id: u8 = 0;
 /// Metadata piece size per BEP 9.
 pub const metadata_piece_size: usize = 16384;
 
+/// Upper bound on peer-advertised total metadata size (BEP 9). The value is
+/// unauthenticated until the assembled info dict is hash-verified, so it is
+/// capped to bound both the piece-count arithmetic and total buffering.
+/// libtorrent uses a comparable ceiling; real info dicts are far smaller.
+pub const max_metadata_size: u32 = 8 * 1024 * 1024;
+
 /// Parsed extension handshake from a peer.
 pub const ExtensionHandshake = struct {
     ut_metadata_id: ?u8,
@@ -300,7 +306,12 @@ fn decodeAt(allocator: Allocator, input: []const u8, pos: *usize) !bencode.Value
                     while (i < input.len and input[i] >= '0' and input[i] <= '9') : (i += 1) {}
                     if (i >= input.len or input[i] != ':') return error.UnexpectedByte;
                     const slen = std.fmt.parseUnsigned(usize, input[len_start..i], 10) catch return error.InvalidStringLength;
-                    i += 1 + slen;
+                    i += 1; // skip ':'
+                    // Non-wrapping bound: `i + slen` overflows usize for a crafted
+                    // string length, and even without wrapping an out-of-range slen
+                    // would slice `input[start..i]` past the buffer end (remote panic).
+                    if (slen > input.len - i) return error.UnexpectedByte;
+                    i += slen;
                 },
                 else => return error.UnexpectedByte,
             }
@@ -352,8 +363,14 @@ pub const MetadataDownload = struct {
     }
 
     /// Set the total metadata size (learned from peer's extension handshake).
-    pub fn setSize(self: *MetadataDownload, size: u32) error{OutOfMemory}!void {
+    /// The size is peer-supplied and unauthenticated (the info-hash is only
+    /// verified after full assembly), so it is capped: without a bound, a large
+    /// value overflows the piece-count round-up (`size + mps`, remote panic) and
+    /// drives unbounded piece-buffer allocation (remote OOM). libtorrent caps
+    /// ut_metadata size similarly; real info dicts are far under 8 MiB.
+    pub fn setSize(self: *MetadataDownload, size: u32) error{ OutOfMemory, InvalidMetadataSize }!void {
         if (self.metadata_size != null) return; // already set
+        if (size == 0 or size > max_metadata_size) return error.InvalidMetadataSize;
         self.metadata_size = size;
         const mps: u32 = @intCast(metadata_piece_size);
         self.num_pieces = (size + mps - 1) / mps;
@@ -366,6 +383,11 @@ pub const MetadataDownload = struct {
     pub fn addPiece(self: *MetadataDownload, piece_idx: u32, data: []const u8) error{OutOfMemory}!bool {
         if (piece_idx >= self.num_pieces) return false;
         if (self.pieces[piece_idx] != null) return false; // duplicate
+        // A ut_metadata piece is at most metadata_piece_size (16 KiB) bytes.
+        // Reject oversized pieces so the buffered aggregate stays bounded by
+        // num_pieces * metadata_piece_size (peer-supplied data.len is otherwise
+        // capped only by the 2 MiB wire limit — a per-piece over-fill OOM).
+        if (data.len > metadata_piece_size) return false;
 
         const duped = self.allocator.dupe(u8, data) catch return error.OutOfMemory;
         self.pieces[piece_idx] = duped;
@@ -533,6 +555,37 @@ test "metadata download rejects wrong hash" {
 
     const assembled = try dl.assemble();
     try std.testing.expect(assembled == null); // hash mismatch
+}
+
+test "setSize rejects zero and oversized metadata" {
+    const allocator = std.testing.allocator;
+    var dl = MetadataDownload.init(allocator, [_]u8{0} ** 20);
+    defer dl.deinit();
+    try std.testing.expectError(error.InvalidMetadataSize, dl.setSize(0));
+    try std.testing.expectError(error.InvalidMetadataSize, dl.setSize(max_metadata_size + 1));
+    // Near-u32-max would overflow the (size + mps) round-up; must be rejected,
+    // not panic.
+    try std.testing.expectError(error.InvalidMetadataSize, dl.setSize(std.math.maxInt(u32)));
+    try std.testing.expect(dl.metadata_size == null);
+}
+
+test "addPiece rejects oversized piece data" {
+    const allocator = std.testing.allocator;
+    var dl = MetadataDownload.init(allocator, [_]u8{0} ** 20);
+    defer dl.deinit();
+    try dl.setSize(metadata_piece_size * 2); // 2 pieces
+    const big = try allocator.alloc(u8, metadata_piece_size + 1);
+    defer allocator.free(big);
+    try std.testing.expect(!try dl.addPiece(0, big));
+    try std.testing.expectEqual(@as(u32, 0), dl.received_count);
+}
+
+test "parseMetadataMessage rejects overflowing string length" {
+    const allocator = std.testing.allocator;
+    // Dict declares a 99999999-byte string with only a few bytes present:
+    // the dict-end scanner must reject it, not slice past the buffer.
+    const payload = "\x00d99999999:aaa";
+    try std.testing.expectError(error.InvalidMessage, parseMetadataMessage(allocator, payload));
 }
 
 test "serialize extension message" {

@@ -1266,6 +1266,9 @@ fn readPublisherStateFile(a: Allocator, path: []const u8) !struct { last_created
         if (fj.infohash.len != 40) return error.InvalidState;
         var hash: [20]u8 = undefined;
         secp.fromHex(fj.infohash, &hash) catch return error.InvalidState;
+        // Validate the path on reload (see readAppliedStateFile): a poisoned
+        // state.json must not reintroduce traversal paths into the write plane.
+        drive_index.validatePath(fj.path) catch return error.InvalidState;
         const dup = try a.dupe(u8, fj.path);
         errdefer a.free(dup);
         try out.append(a, .{ .path = dup, .info_hash = hash, .size = fj.size, .mtime = fj.mtime });
@@ -1336,6 +1339,11 @@ fn readAppliedStateFile(a: Allocator, path: []const u8) ![]AuthorState {
             if (fj.infohash.len != 40) return error.InvalidState;
             var hash: [20]u8 = undefined;
             secp.fromHex(fj.infohash, &hash) catch return error.InvalidState;
+            // Validate the path on reload, same as the live relay ingress
+            // (drive_index.parseEvent). A poisoned applied.json could otherwise
+            // reintroduce `..`/absolute paths that drive trashLocal/renameLocal
+            // to move or overwrite files OUTSIDE the synced folder.
+            drive_index.validatePath(fj.path) catch return error.InvalidState;
             const dup = try a.dupe(u8, fj.path);
             errdefer a.free(dup);
             try recs.append(a, .{ .path = dup, .info_hash = hash, .size = fj.size, .mtime = fj.mtime });
@@ -1516,4 +1524,32 @@ test "Drive create validates options and dupes strings" {
     const snap = try drive.filesSnapshot(arena.allocator());
     try testing.expectEqual(@as(usize, 0), snap.len);
     drive.destroy();
+}
+
+test "storage reserved_dir matches drive state_dirname" {
+    // The reserved-namespace guard in storage.zig hardcodes ".carl-drive"; keep
+    // it in lockstep with this module's state directory name.
+    const storage = @import("storage.zig");
+    try testing.expectEqualStrings(state_dirname, storage.reserved_dir);
+}
+
+test "readAppliedStateFile rejects a poisoned traversal path" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+    const path = try std.fmt.allocPrint(a, "{s}/applied.json", .{dir});
+    defer a.free(path);
+
+    // Hand-crafted applied.json with a valid pubkey/infohash but a "../" path.
+    // The reload must reject it (InvalidState), not adopt a path that escapes
+    // the synced folder.
+    const poisoned =
+        "{\"authors\":[{\"pubkey\":\"" ++ ("a" ** 64) ++
+        "\",\"created_at\":1,\"files\":[{\"path\":\"../escape\",\"infohash\":\"" ++
+        ("b" ** 40) ++ "\",\"size\":1,\"mtime\":1}]}]}";
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = poisoned });
+
+    try testing.expectError(error.InvalidState, readAppliedStateFile(a, path));
 }

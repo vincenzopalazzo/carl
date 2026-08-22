@@ -82,14 +82,23 @@ pub const DecodeError = error{
     DuplicateDictKey,
     LeadingZero,
     NegativeZero,
+    RecursionLimitExceeded,
     OutOfMemory,
 };
+
+/// Maximum bencode container nesting depth. Peer-supplied bencode (BEP 10
+/// extension handshakes, ut_metadata, tracker/DHT responses) is decoded with
+/// this shared decoder; without a cap a stream of `l`/`d` bytes recurses one
+/// stack frame per level and overflows the thread stack (remote whole-process
+/// DoS). libtorrent's bdecode uses a depth_limit of 100 for the same reason;
+/// 256 is comfortably above any legitimate metainfo/BEP-10 nesting.
+const max_decode_depth: u32 = 256;
 
 /// Decode a bencoded byte string into a Value. The returned value owns
 /// allocated memory -- call `value.deinit(allocator)` when done.
 pub fn decode(allocator: Allocator, input: []const u8) DecodeError!Value {
     var pos: usize = 0;
-    const value = try decodeAt(allocator, input, &pos);
+    const value = try decodeAt(allocator, input, &pos, 0);
     if (pos != input.len) {
         value.deinit(allocator);
         return error.UnexpectedByte;
@@ -97,13 +106,14 @@ pub fn decode(allocator: Allocator, input: []const u8) DecodeError!Value {
     return value;
 }
 
-fn decodeAt(allocator: Allocator, input: []const u8, pos: *usize) DecodeError!Value {
+fn decodeAt(allocator: Allocator, input: []const u8, pos: *usize, depth: u32) DecodeError!Value {
     if (pos.* >= input.len) return error.UnexpectedEnd;
+    if (depth > max_decode_depth) return error.RecursionLimitExceeded;
 
     return switch (input[pos.*]) {
         'i' => decodeInt(input, pos),
-        'l' => decodeList(allocator, input, pos),
-        'd' => decodeDict(allocator, input, pos),
+        'l' => decodeList(allocator, input, pos, depth),
+        'd' => decodeDict(allocator, input, pos, depth),
         '0'...'9' => decodeString(allocator, input, pos),
         else => error.UnexpectedByte,
     };
@@ -166,7 +176,7 @@ fn decodeString(allocator: Allocator, input: []const u8, pos: *usize) DecodeErro
     return .{ .string = data };
 }
 
-fn decodeList(allocator: Allocator, input: []const u8, pos: *usize) DecodeError!Value {
+fn decodeList(allocator: Allocator, input: []const u8, pos: *usize, depth: u32) DecodeError!Value {
     pos.* += 1; // skip 'l'
 
     var items: std.ArrayList(Value) = .empty;
@@ -181,7 +191,7 @@ fn decodeList(allocator: Allocator, input: []const u8, pos: *usize) DecodeError!
             pos.* += 1;
             break;
         }
-        const item = try decodeAt(allocator, input, pos);
+        const item = try decodeAt(allocator, input, pos, depth + 1);
         items.append(allocator, item) catch {
             item.deinit(allocator);
             return error.OutOfMemory;
@@ -191,7 +201,7 @@ fn decodeList(allocator: Allocator, input: []const u8, pos: *usize) DecodeError!
     return .{ .list = items.toOwnedSlice(allocator) catch return error.OutOfMemory };
 }
 
-fn decodeDict(allocator: Allocator, input: []const u8, pos: *usize) DecodeError!Value {
+fn decodeDict(allocator: Allocator, input: []const u8, pos: *usize, depth: u32) DecodeError!Value {
     pos.* += 1; // skip 'd'
 
     var entries: std.ArrayList(Value.DictEntry) = .empty;
@@ -202,6 +212,12 @@ fn decodeDict(allocator: Allocator, input: []const u8, pos: *usize) DecodeError!
         }
         entries.deinit(allocator);
     }
+
+    // Membership set for duplicate-key detection. Keys are owned by `entries`
+    // (freed via the errdefer above / deinit path), so the set only borrows the
+    // slices and never frees them itself.
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(allocator);
 
     while (true) {
         if (pos.* >= input.len) return error.UnexpectedEnd;
@@ -223,17 +239,20 @@ fn decodeDict(allocator: Allocator, input: []const u8, pos: *usize) DecodeError!
         // interval-before-complete => error.InvalidResponse).
         //
         // Duplicates stay rejected, but without the sort invariant they are no
-        // longer guaranteed adjacent, so scan every key collected so far. Dicts
-        // in this protocol are a handful of keys wide, so the quadratic scan is
-        // cheaper than building a hash set.
-        for (entries.items) |prev| {
-            if (std.mem.eql(u8, prev.key, key)) {
-                allocator.free(key);
-                return error.DuplicateDictKey;
-            }
+        // longer guaranteed adjacent. Use an O(1) hash-set membership check
+        // rather than a linear scan of prior keys: peer-supplied dicts (BEP 10)
+        // can be hundreds of thousands of entries wide, and a per-key linear
+        // scan is quadratic (remote CPU-exhaustion DoS).
+        const gop = seen.getOrPut(allocator, key) catch {
+            allocator.free(key);
+            return error.OutOfMemory;
+        };
+        if (gop.found_existing) {
+            allocator.free(key);
+            return error.DuplicateDictKey;
         }
 
-        const value = decodeAt(allocator, input, pos) catch |err| {
+        const value = decodeAt(allocator, input, pos, depth + 1) catch |err| {
             allocator.free(key);
             return err;
         };
@@ -434,6 +453,49 @@ test "reject duplicate dict keys that are not adjacent" {
     // silently return the first of two conflicting values.
     const allocator = std.testing.allocator;
     try std.testing.expectError(error.DuplicateDictKey, decode(allocator, "d3:cow3:moo4:spam4:eggs3:cow3:xxxe"));
+}
+
+test "reject deeply nested containers (recursion guard)" {
+    // A stream of `l` bytes recurses one frame per level; without a depth cap
+    // this overflows the thread stack (remote whole-process DoS). Build a nest
+    // deeper than max_decode_depth and confirm it is rejected, not crashed.
+    const allocator = std.testing.allocator;
+    const depth = max_decode_depth + 10;
+    const buf = try allocator.alloc(u8, depth * 2);
+    defer allocator.free(buf);
+    @memset(buf[0..depth], 'l');
+    @memset(buf[depth..], 'e');
+    try std.testing.expectError(error.RecursionLimitExceeded, decode(allocator, buf));
+}
+
+test "nesting up to the limit is accepted" {
+    const allocator = std.testing.allocator;
+    const depth = max_decode_depth;
+    const buf = try allocator.alloc(u8, depth * 2);
+    defer allocator.free(buf);
+    @memset(buf[0..depth], 'l');
+    @memset(buf[depth..], 'e');
+    const v = try decode(allocator, buf);
+    defer v.deinit(allocator);
+}
+
+test "large flat dict of unique keys decodes without quadratic blowup" {
+    // Duplicate detection uses a hash set, so a wide dict of unique keys stays
+    // linear. This would take tens of seconds under the old O(n^2) scan.
+    const allocator = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try buf.append(allocator, 'd');
+    var i: usize = 0;
+    while (i < 20000) : (i += 1) {
+        var keybuf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&keybuf, "{d}", .{i});
+        try buf.writer(allocator).print("{d}:{s}i0e", .{ key.len, key });
+    }
+    try buf.append(allocator, 'e');
+    const v = try decode(allocator, buf.items);
+    defer v.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 20000), v.dict.len);
 }
 
 test "unsorted info dict round-trips to the same bytes" {

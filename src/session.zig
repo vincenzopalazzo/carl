@@ -1514,6 +1514,26 @@ pub const Session = struct {
             break :blk @as([]const metainfo.FileInfo, file_slice);
         };
 
+        // Validate the peer-supplied geometry BEFORE mutating session state or
+        // allocating piece-tracking structures. A magnet's info-hash can be
+        // attacker-chosen (e.g. a Nostr-drive publisher supplies both the hash
+        // and the metadata that hashes to it), so unbounded piece_length /
+        // piece-count would otherwise panic here — and because the magnet spec is
+        // already persisted, that panic re-arms as a crash loop on restart.
+        // `files` is the only thing allocated so far; free it on rejection.
+        {
+            var total_length: u64 = 0;
+            for (files) |fi| total_length +|= fi.length;
+            metainfo.validateGeometry(piece_length, total_length) catch |err| {
+                for (files) |fi| {
+                    for (fi.path) |comp| self.allocator.free(comp);
+                    self.allocator.free(fi.path);
+                }
+                self.allocator.free(files);
+                return err;
+            };
+        }
+
         const name = self.allocator.dupe(u8, name_str) catch return error.OutOfMemory;
         const pieces = self.allocator.dupe(u8, pieces_str) catch {
             self.allocator.free(name);

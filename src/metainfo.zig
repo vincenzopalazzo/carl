@@ -69,6 +69,32 @@ pub const MetainfoError = error{
     OutOfMemory,
 };
 
+/// Maximum accepted `piece length`. The value is attacker-controlled on the
+/// magnet/BEP-9 path (and untrusted in any .torrent); an unbounded piece length
+/// overflows u32 piece arithmetic (`begin + block_len`, block-count round-up —
+/// remote panic) and drives multi-GiB per-piece buffers. 128 MiB is far above
+/// any real torrent (libtorrent/qBittorrent practical maximum).
+pub const max_piece_length: u64 = 128 * 1024 * 1024;
+
+/// Maximum accepted piece count. Bounds the per-piece bookkeeping the client
+/// allocates up front (bitfield, availability array, verify loop). Without it a
+/// torrent claiming a huge total length with a tiny piece length forces a
+/// multi-GiB allocation (memory-exhaustion DoS, re-armed on every restart).
+/// 8.4M pieces covers any real torrent while capping the allocation.
+pub const max_piece_count: u64 = 1 << 23;
+
+/// Validate peer/file-supplied torrent geometry before it drives allocation and
+/// piece arithmetic. Rejects zero / oversized piece lengths and piece counts
+/// that would exhaust memory or overflow u32 indices. Shared by the .torrent
+/// path (`parse`) and the magnet BEP-9 path (`Session.onMetadataComplete`).
+pub fn validateGeometry(piece_length: u64, total_length: u64) MetainfoError!void {
+    if (piece_length == 0 or piece_length > max_piece_length) return error.InvalidTorrent;
+    // Non-overflowing ceil-divide.
+    const num_pieces = total_length / piece_length +
+        @as(u64, @intFromBool(total_length % piece_length != 0));
+    if (num_pieces > max_piece_count) return error.InvalidTorrent;
+}
+
 /// Parse a .torrent file from raw bytes.
 pub fn parse(allocator: Allocator, data: []const u8) MetainfoError!Metainfo {
     const root = bencode.decode(allocator, data) catch return error.InvalidTorrent;
@@ -203,6 +229,13 @@ pub fn parse(allocator: Allocator, data: []const u8) MetainfoError!Metainfo {
             allocator.free(fi.path);
         }
         allocator.free(files);
+    }
+
+    // Reject unsafe geometry before it reaches the piece-tracking allocations.
+    {
+        var total_length: u64 = 0;
+        for (files) |fi| total_length +|= fi.length;
+        try validateGeometry(piece_length, total_length);
     }
 
     const comment = if (root.dictGet("comment")) |cv|
@@ -788,4 +821,24 @@ test "torrent without announce succeeds with empty announce" {
 test "missing info rejects" {
     const allocator = std.testing.allocator;
     try std.testing.expectError(error.MissingField, parse(allocator, "d8:announce3:fooe"));
+}
+
+test "validateGeometry bounds piece length and count" {
+    // Zero and oversized piece lengths are rejected.
+    try std.testing.expectError(error.InvalidTorrent, validateGeometry(0, 1024));
+    try std.testing.expectError(error.InvalidTorrent, validateGeometry(max_piece_length + 1, 1024));
+    // A tiny piece length against a huge total length would drive an enormous
+    // piece count (memory-exhaustion DoS) — rejected.
+    try std.testing.expectError(error.InvalidTorrent, validateGeometry(1, max_piece_count + 1));
+    // Sane geometry is accepted.
+    try validateGeometry(262144, 1024);
+    try validateGeometry(max_piece_length, max_piece_length * 4);
+}
+
+test "parse rejects a torrent with unsafe geometry" {
+    const allocator = std.testing.allocator;
+    // length near u64 max with piece length 1 => astronomically many pieces.
+    const torrent =
+        "d4:infod6:lengthi9000000000000000000e4:name4:test12:piece lengthi1e6:pieces0:ee";
+    try std.testing.expectError(error.InvalidTorrent, parse(allocator, torrent));
 }

@@ -4,6 +4,12 @@ const Allocator = std.mem.Allocator;
 const metainfo = @import("metainfo.zig");
 const piece_mod = @import("piece.zig");
 
+/// carl's reserved per-drive control-state directory. No torrent may write into
+/// it (enforced in `Storage.init`). Kept in sync with `drive.state_dirname` by
+/// the drift-guard test in drive.zig; storage stays a low-level module and does
+/// not import the drive layer.
+pub const reserved_dir = ".carl-drive";
+
 /// A contiguous region within a single file.
 pub const FileSlice = struct {
     file_index: u32,
@@ -142,6 +148,15 @@ pub const Storage = struct {
 
         // Validate all path components before creating any files (path traversal defense)
         for (meta.files) |file_info| {
+            // Reject the reserved control-state directory as a top-level
+            // component: a malicious drive publisher could otherwise list a file
+            // at `.carl-drive/applied.json` whose piece hashes it controls, and
+            // the subscriber's mirror would overwrite its own per-drive sync
+            // state with attacker bytes (persistent drive hijack / freeze). No
+            // legitimate torrent needs to write into carl's reserved namespace.
+            if (file_info.path.len > 0 and std.mem.eql(u8, file_info.path[0], reserved_dir)) {
+                return error.FileOpenFailed;
+            }
             for (file_info.path) |comp| {
                 if (!isValidPathComponent(comp)) return error.FileOpenFailed;
             }

@@ -249,6 +249,9 @@ fn hrpExpand(allocator: Allocator, hrp: []const u8) ![]u5 {
 
 fn createChecksum(hrp: []const u8, data: []const u5) u32 {
     var expand_buf: [128]u5 = undefined;
+    // The HRP expands to hrp.len*2+1 values; guard before the writes below or an
+    // overlong HRP writes past expand_buf (stack overflow / OOB).
+    if (hrp.len * 2 + 1 > expand_buf.len) return 0;
     for (hrp, 0..) |c, i| expand_buf[i] = @intCast(c >> 5);
     expand_buf[hrp.len] = 0;
     for (hrp, 0..) |c, i| expand_buf[hrp.len + 1 + i] = @intCast(c & 0x1f);
@@ -267,6 +270,10 @@ fn createChecksum(hrp: []const u8, data: []const u5) u32 {
 
 fn verifyChecksum(hrp: []const u8, data: []const u5) bool {
     var expand_buf: [128]u5 = undefined;
+    // The HRP expands to hrp.len*2+1 values; guard before the writes below or an
+    // overlong HRP (from an attacker-supplied npub/bech32 string) writes past
+    // expand_buf — a stack buffer overflow, reached before any checksum check.
+    if (hrp.len * 2 + 1 > expand_buf.len) return false;
     for (hrp, 0..) |c, i| expand_buf[i] = @intCast(c >> 5);
     expand_buf[hrp.len] = 0;
     for (hrp, 0..) |c, i| expand_buf[hrp.len + 1 + i] = @intCast(c & 0x1f);
@@ -396,4 +403,15 @@ test "decode32 rejects mixed case" {
         error.InvalidBech32,
         decode32("npub180CVV07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6"),
     );
+}
+
+test "decodeRaw rejects overlong HRP without overflowing expand_buf" {
+    // An HRP >= 64 chars would expand past verifyChecksum's 128-entry stack
+    // buffer. Must be rejected cleanly (BadChecksum), never a stack overflow.
+    const allocator = std.testing.allocator;
+    var buf: [71]u8 = undefined;
+    @memset(buf[0..64], 'a'); // 64-char HRP
+    buf[64] = '1'; // separator (last '1')
+    @memset(buf[65..71], 'q'); // 6 valid bech32 data chars
+    try std.testing.expectError(error.BadChecksum, decodeRaw(allocator, &buf));
 }

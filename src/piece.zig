@@ -84,7 +84,10 @@ pub const PieceProgress = struct {
     data: []u8,
 
     pub fn init(allocator: Allocator, index: u32, piece_len: u32) error{OutOfMemory}!PieceProgress {
-        const num_blocks = (piece_len + block_size - 1) / block_size;
+        // Non-overflowing ceil-divide: `piece_len + block_size - 1` wraps a u32
+        // for piece lengths near 2^32 (remote panic). piece_length is bounded at
+        // torrent intake (metainfo/session), but keep the arithmetic safe here.
+        const num_blocks = piece_len / block_size + @as(u32, @intFromBool(piece_len % block_size != 0));
         const recv_bytes = (num_blocks + 7) / 8;
         const received = allocator.alloc(u8, recv_bytes) catch return error.OutOfMemory;
         @memset(received, 0);
@@ -119,8 +122,11 @@ pub const PieceProgress = struct {
     pub fn addBlock(self: *PieceProgress, begin: u32, block: []const u8) bool {
         if (begin >= self.piece_len) return false;
         const block_len = std.math.cast(u32, block.len) orelse return false;
+        // Non-wrapping bounds check: `begin + block_len` can overflow u32 for a
+        // crafted `piece` reply against a large-piece torrent (remote panic /
+        // OOB slice). begin < piece_len here, so piece_len - begin is safe.
+        if (block_len > self.piece_len - begin) return false;
         const end = begin + block_len;
-        if (end > self.piece_len) return false;
 
         @memcpy(self.data[begin..end], block);
 
@@ -326,6 +332,22 @@ test "piece progress block assembly" {
     // Verify data was assembled correctly
     try std.testing.expectEqual(@as(u8, 0xAA), pp.data[0]);
     try std.testing.expectEqual(@as(u8, 0xBB), pp.data[16384]);
+}
+
+test "addBlock rejects begin+len overflow without panicking" {
+    const allocator = std.testing.allocator;
+    // A small piece with a huge `begin`: begin < piece_len is false here, but
+    // the guard must also survive begin values near u32 max where begin+len
+    // would wrap. Use a piece_len just above begin so the overflow path is the
+    // one exercised.
+    var pp = try PieceProgress.init(allocator, 0, 32768);
+    defer pp.deinit(allocator);
+    const block = [_]u8{0xCC} ** 16;
+    // begin beyond piece_len is rejected outright.
+    try std.testing.expect(!pp.addBlock(0xFFFF_FFF0, &block));
+    // begin within the piece but begin+len exceeding it is rejected (no wrap).
+    try std.testing.expect(!pp.addBlock(32760, &block));
+    try std.testing.expect(!pp.isComplete());
 }
 
 test "piece progress next missing block" {
