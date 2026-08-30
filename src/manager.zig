@@ -1752,7 +1752,10 @@ fn snapshotTransfer(mt: *ManagedTransfer, arena: Allocator, now: i64) Allocator.
         .up = p.up_rate,
         .eta = eta,
         .peers = p.peers,
-        .seeds = 0,
+        // Tracker-reported seeder count (0 until the first announce lands);
+        // the GUI's "seeds" column used to be hardcoded to 0 even when the
+        // tracker had told us the swarm has seeders.
+        .seeds = p.seeders,
         .meta_have = p.meta_have,
         .meta_total = p.meta_total,
         .ratio = if (status == .seeding or status == .complete) ratio else null,
