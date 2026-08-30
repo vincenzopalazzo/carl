@@ -380,8 +380,11 @@ pub const Session = struct {
             return error.StorageInitFailed;
         errdefer store.deinit();
 
-        // Verify existing pieces (resume + seed)
-        verifyExistingPieces(allocator, &store, meta, total_length, num_pieces, &our_bitfield);
+        // Verify existing pieces (resume + seed). Skipped for a payload that
+        // was just created — re-hashing zeros can only find zero pieces.
+        if (store.had_data) {
+            verifyExistingPieces(allocator, &store, meta, total_length, num_pieces, &our_bitfield);
+        }
 
         // Skip the inbound listener entirely on any anonymized transport
         // (proxy/Tor/I2P): accepting incoming clearnet peers would reveal the
@@ -1624,9 +1627,23 @@ pub const Session = struct {
         // resume pass in init() verified nothing. Now that metadata is in and
         // storage points at the real files, verify what's already on disk —
         // otherwise re-adding a magnet over a partial download silently
-        // re-fetches every piece (libtorrent always rechecks here).
-        verifyExistingPieces(self.allocator, &self.store, self.meta, self.total_length, self.num_pieces, &self.our_bitfield);
-        self.have_pieces.store(self.our_bitfield.count(), .monotonic);
+        // re-fetches every piece (libtorrent always rechecks here). Skipped
+        // when the payload was just created (rechecking zeros finds nothing
+        // and costs a full read of the whole torrent).
+        if (self.store.had_data) {
+            verifyExistingPieces(self.allocator, &self.store, self.meta, self.total_length, self.num_pieces, &self.our_bitfield);
+            self.have_pieces.store(self.our_bitfield.count(), .monotonic);
+        }
+
+        // Tell metadata-phase peers what we already have: they connected
+        // before we knew the piece count, so they never received a bitfield
+        // from us — without this they'd never request our resumed pieces.
+        if (self.our_bitfield.count() > 0) {
+            for (self.peers.items) |p| {
+                if (p.state != .active) continue;
+                p.enqueueMessage(.{ .bitfield = self.our_bitfield.rawBytes() }) catch {};
+            }
+        }
 
         // Metadata is in; clear the fetch-progress atomics BEFORE flipping to
         // download mode, so a snapshot that observes `metadata_only == false`
