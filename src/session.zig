@@ -1867,6 +1867,12 @@ pub const Session = struct {
                 // peer (all supplied by disconnected peers), allow a new piece
                 // so the download doesn't stall.
                 if (self.active_pieces.count() >= max_concurrent_pieces) {
+                    // At the cap: only start a *new* piece when this peer
+                    // cannot contribute to any in-flight one (otherwise we
+                    // would spread blocks across every piece they have and
+                    // none would complete). The previous `!any_requestable`
+                    // inverted that — the cap never held while a peer could
+                    // still fill existing pieces, which is the common case.
                     var any_requestable = false;
                     var it = self.active_pieces.iterator();
                     while (it.next()) |entry| {
@@ -1875,7 +1881,7 @@ pub const Session = struct {
                             break;
                         }
                     }
-                    if (!any_requestable) continue;
+                    if (any_requestable) continue;
                 }
             }
 
@@ -2912,6 +2918,62 @@ test "sampleRate counts block bytes as progress before a piece verifies" {
     // No new bytes: the progress stamp must not advance.
     s.sampleRate(110);
     try std.testing.expectEqual(@as(i64, 104), s.last_progress_s.load(.monotonic));
+}
+
+test "pickRarestPiece concentrates on the concurrent-piece cap" {
+    // Regression: the cap's override used `if (!any_requestable) continue`,
+    // which skipped new pieces only when the peer could NOT fill an in-flight
+    // one — the opposite of concentration. A seed that has every piece then
+    // started a new piece on every pick, spreading blocks across the torrent
+    // instead of finishing the few in flight.
+    const allocator = std.testing.allocator;
+
+    var s: Session = undefined;
+    s.allocator = allocator;
+    s.num_pieces = 10;
+    s.our_bitfield = try piece_mod.Bitfield.init(allocator, 10);
+    defer s.our_bitfield.deinit(allocator);
+    s.piece_availability = try allocator.alloc(u32, 10);
+    defer allocator.free(s.piece_availability);
+    @memset(s.piece_availability, 1);
+    s.active_pieces = std.AutoHashMap(u32, *piece_mod.PieceProgress).init(allocator);
+    defer {
+        var it = s.active_pieces.iterator();
+        while (it.next()) |e| {
+            e.value_ptr.*.deinit(allocator);
+            allocator.destroy(e.value_ptr.*);
+        }
+        s.active_pieces.deinit();
+    }
+
+    var i: u32 = 0;
+    while (i < max_concurrent_pieces) : (i += 1) {
+        const pp = try allocator.create(piece_mod.PieceProgress);
+        pp.* = try piece_mod.PieceProgress.init(allocator, i, piece_mod.block_size * 4);
+        try s.active_pieces.put(i, pp);
+    }
+
+    var peer = peer_mod.PeerConnection.init(allocator, std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 1));
+    defer peer.deinit();
+    peer.peer_bitfield = try piece_mod.Bitfield.init(allocator, 10);
+    for (0..10) |j| peer.peer_bitfield.?.setPiece(@intCast(j));
+
+    // Peer can still fill the in-flight pieces: must return one of them, never
+    // a 5th piece past the cap.
+    const filling = s.pickRarestPiece(&peer);
+    try std.testing.expect(filling != null);
+    try std.testing.expect(filling.? < max_concurrent_pieces);
+
+    // Exhaust every in-flight block so this peer cannot contribute to the cap.
+    var it = s.active_pieces.iterator();
+    while (it.next()) |e| {
+        const pp = e.value_ptr.*;
+        var b: u32 = 0;
+        while (b < pp.num_blocks) : (b += 1) pp.markRequested(b);
+    }
+
+    // Override: a new piece is allowed so the download does not stall.
+    try std.testing.expectEqual(@as(?u32, @intCast(max_concurrent_pieces)), s.pickRarestPiece(&peer));
 }
 
 /// Re-encode a resolved Metainfo into full `.torrent` bytes: a top-level dict
