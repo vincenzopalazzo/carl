@@ -178,7 +178,12 @@ pub const HealthTable = struct {
                 .transient => log.info("relay {s}: unreachable, backing off {d}s", .{ url, @divTrunc(backoffMs(e.fails), std.time.ms_per_s) }),
             }
         } else {
-            log.debug("relay {s}: still failing, backing off {d}s", .{ url, @divTrunc(backoffMs(e.fails), std.time.ms_per_s) });
+            switch (class) {
+                // An unusable URL has no backoff (fails stays 0); saying
+                // "backing off 0s" here made the skip logic look broken.
+                .invalid => log.debug("relay {s}: still unusable, waiting for a config change", .{url}),
+                .transient => log.debug("relay {s}: still failing, backing off {d}s", .{ url, @divTrunc(backoffMs(e.fails), std.time.ms_per_s) }),
+            }
         }
     }
 

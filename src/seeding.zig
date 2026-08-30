@@ -69,8 +69,9 @@ pub fn publish(
 
     var torrent_acks: usize = 0;
     var announce_acks: usize = 0;
+    const gate = relay.oneShotGate(relay_urls);
     for (relay_urls) |url| {
-        var r = relay.Relay.connect(allocator, url, proxy) catch |err| {
+        var r = relay.dial(allocator, url, proxy, gate) catch |err| {
             log.warn("nostr publish: {s}: {}", .{ url, err });
             continue;
         };

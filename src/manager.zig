@@ -1930,8 +1930,11 @@ fn broadcastIfNew(mt: *ManagedTransfer) void {
         .limit = 1,
     };
 
+    // One-shot publish gate: honor the skip list as long as it leaves at
+    // least one relay to ask, otherwise dial anyway.
+    const gate = relay_mod.oneShotGate(relay_urls);
     for (relay_urls) |url| {
-        var r = relay_mod.Relay.connect(a, url, mt.proxy) catch continue;
+        var r = relay_mod.dial(a, url, mt.proxy, gate) catch continue;
         defer r.deinit();
         const events = relay_mod.subscribeAndCollect(a, &r, filter, .{
             .timeout_ms = 8_000,
@@ -2008,7 +2011,9 @@ fn collectNostrPeers(mt: *ManagedTransfer) void {
     var added: usize = 0;
     for (relay_urls) |url| {
         if (!mt.session.running) return;
-        var r = relay_mod.Relay.connect(a, url, mt.proxy) catch continue;
+        // Periodic re-discovery: honor the health gate so a down relay isn't
+        // re-dialed on every round.
+        var r = relay_mod.dial(a, url, mt.proxy, .honor) catch continue;
         defer r.deinit();
         const events = relay_mod.subscribeAndCollect(a, &r, filter, .{
             .timeout_ms = 10_000,

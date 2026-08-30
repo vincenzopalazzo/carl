@@ -296,7 +296,11 @@ pub const Daemon = struct {
             const onion = std.mem.indexOf(u8, url, ".onion") != null;
             var state: []const u8 = "configured";
             if (!(onion and proxy == null)) {
-                if (relay_mod.Relay.connect(a, url, proxy)) |r| {
+                // The prober is a periodic background caller: honor the shared
+                // health gate so a relay that keeps failing (or has an unusable
+                // URL) is skipped instead of re-dialed every cycle. A skipped
+                // relay reports its last known verdict: unreachable.
+                if (relay_mod.dial(a, url, proxy, .honor)) |r| {
                     var rc = r;
                     rc.deinit();
                     state = "connected";

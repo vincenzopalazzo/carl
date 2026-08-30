@@ -462,7 +462,8 @@ fn pollOnce(mirror: *Mirror) void {
     var started: usize = 0;
     for (relay_urls) |url| {
         if (mirror.stopping()) return;
-        var r = relay_mod.Relay.connect(a, url, null) catch |err| {
+        // Periodic mirror poll: honor the health gate.
+        var r = relay_mod.dial(a, url, null, .honor) catch |err| {
             log.debug("relay {s}: {}", .{ url, err });
             continue;
         };
@@ -859,8 +860,9 @@ fn publishAnnounce(a: Allocator, info_hash: [20]u8, endpoint: AnnounceEndpoint) 
     defer nostr_config.freeRelays(a, relay_urls);
 
     var acks: usize = 0;
+    const gate = relay_mod.oneShotGate(relay_urls);
     for (relay_urls) |url| {
-        var r = relay_mod.Relay.connect(a, url, null) catch continue;
+        var r = relay_mod.dial(a, url, null, gate) catch continue;
         defer r.deinit();
         if (relay_mod.publishAndWait(a, &r, ev, 5_000)) acks += 1;
     }
@@ -896,7 +898,8 @@ fn discoverPeers(a: Allocator, info_hash: [20]u8, session: *session_mod.Session)
     var added: usize = 0;
     for (relay_urls) |url| {
         if (!session.running or session_mod.shutdown_requested.load(.acquire)) return;
-        var r = relay_mod.Relay.connect(a, url, null) catch continue;
+        // Peer re-discovery on a schedule: honor the health gate.
+        var r = relay_mod.dial(a, url, null, .honor) catch continue;
         defer r.deinit();
         const events = relay_mod.subscribeAndCollect(a, &r, filter, .{
             .timeout_ms = 10_000,
