@@ -48,7 +48,21 @@ pub const Error = error{
 /// insert as before.
 fn healthKey(buf: []u8, url: []const u8, proxy: ?proxy_mod.Proxy) []const u8 {
     const p = proxy orelse return url;
-    return std.fmt.bufPrint(buf, "{s}\n{s}://{s}:{d}", .{ url, @tagName(p.scheme), p.host, p.port }) catch url;
+    if (std.fmt.bufPrint(buf, "{s}\n{s}://{s}:{d}", .{ url, @tagName(p.scheme), p.host, p.port })) |key| {
+        return key;
+    } else |_| {
+        // Overlong URL+transport: fall back to a hash of BOTH parts, never to
+        // the bare URL — that would silently merge the proxied entry with the
+        // direct one and re-introduce cross-route poisoning (review on #88).
+        var h = std.hash.Wyhash.init(0);
+        h.update(url);
+        h.update(@tagName(p.scheme));
+        h.update(p.host);
+        var port_bytes: [2]u8 = undefined;
+        std.mem.writeInt(u16, &port_bytes, p.port, .big);
+        h.update(&port_bytes);
+        return std.fmt.bufPrint(buf, "hash:{x}", .{h.final()}) catch unreachable;
+    }
 }
 
 /// Why a relay is not dialable right now.
