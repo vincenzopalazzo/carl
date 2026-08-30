@@ -68,11 +68,21 @@ pub fn writeDiscovery(a: Allocator, port: u16, token: []const u8) !void {
     try f.writeAll(j.buf.items);
 }
 
-/// Daemon side: unpublish on clean shutdown. A stale file left by kill -9 is
+/// Daemon side: unpublish on clean shutdown — but only OUR file. Two daemons
+/// can listen on different ports; the later one owns daemon.json, and the
+/// earlier one exiting must not delete it. A stale file left by kill -9 is
 /// filtered out by the reader's liveness probe.
 pub fn removeDiscovery(a: Allocator) void {
     const path = discoveryPath(a) catch return;
     defer a.free(path);
+    const data = std.fs.cwd().readFileAlloc(a, path, 4096) catch return;
+    defer a.free(data);
+    const parsed = std.json.parseFromSlice(std.json.Value, a, data, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    const pid_v = parsed.value.object.get("pid") orelse return;
+    if (pid_v != .integer) return;
+    if (pid_v.integer != std.c.getpid()) return; // a newer daemon's file
     std.fs.cwd().deleteFile(path) catch {};
 }
 

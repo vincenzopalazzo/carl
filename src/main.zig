@@ -78,10 +78,11 @@ pub fn main() !void {
         const proxy_opt = parseProxy(args[3..]);
         // Share the download with the running daemon (GUI-visible, persisted,
         // resumed across restarts) unless the user asked for a standalone
-        // in-process session or picked an explicit output dir the daemon
-        // wouldn't honor.
+        // in-process session or picked a per-session setting the daemon
+        // wouldn't honor (its own output dir and listen port apply there).
         const want_standalone = parseFlagPresent(args[3..], "--standalone") or
-            parseFlag(args[3..], "--output-dir") != null;
+            parseFlag(args[3..], "--output-dir") != null or
+            parseFlag(args[3..], "--port") != null;
         if (!want_standalone) {
             if (carl.daemon_client.read(allocator)) |disc_v| {
                 var disc = disc_v;
