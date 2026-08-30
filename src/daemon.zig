@@ -660,6 +660,14 @@ const Conn = struct {
         const want_nostr = if (obj.get("nostr")) |v| (v == .bool and v.bool) else false;
 
         const id = self.daemon.manager.addTransfer(source, route_val, want_nostr) catch |err| {
+            // The swarm is already live with different behavior (route or
+            // Nostr opt-in): 409 so the caller learns the add did NOT apply
+            // the new settings (it must remove the existing transfer first)
+            // instead of believing it did.
+            if (err == error.DuplicateMismatch) {
+                log.warn("addTransfer: swarm already live on a different route/nostr setting", .{});
+                return self.sendStatus(.conflict);
+            }
             log.warn("addTransfer failed: {}", .{err});
             return self.sendStatus(.bad_request);
         };
@@ -703,6 +711,12 @@ const Conn = struct {
 
         const id = self.daemon.manager.addSeed(full, route_val, want_nostr) catch |err| {
             log.warn("addSeed failed: {}", .{err});
+            // Same conflict semantics as addTransfer: the swarm is already
+            // live with different behavior — the client must remove it first,
+            // and a bare 400 can't say that (review on PR #90).
+            if (err == error.DuplicateMismatch) {
+                return self.sendStatus(.conflict);
+            }
             if (err == error.TorControlFailed) {
                 return self.sendError(.bad_request, "Tor hidden service setup failed: carl couldn't reach Tor's ControlPort. Enable it in your torrc (ControlPort 9051 + CookieAuthentication 1) and restart Tor, then retry the Tor seed.");
             }

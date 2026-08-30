@@ -132,6 +132,7 @@ pub const Status = enum(u16) {
     unauthorized = 401,
     not_found = 404,
     method_not_allowed = 405,
+    conflict = 409,
     internal_error = 500,
 
     fn reason(self: Status) []const u8 {
@@ -142,6 +143,7 @@ pub const Status = enum(u16) {
             .unauthorized => "Unauthorized",
             .not_found => "Not Found",
             .method_not_allowed => "Method Not Allowed",
+            .conflict => "Conflict",
             .internal_error => "Internal Server Error",
         };
     }

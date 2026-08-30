@@ -68,6 +68,14 @@ pub const Error = error{
     /// publisher with no local Nostr identity, or the same drive (role,
     /// author, name, dir) is already running.
     InvalidDrive,
+    /// The swarm is already live but with *different behavior* (route, or
+    /// Nostr opt-in). Returning the existing transfer here would look like
+    /// the add succeeded while the session keeps the old behavior — a silent
+    /// privacy downgrade when the old route is less anonymous, or a GUI that
+    /// shows a Nostr source the live session never subscribed to (the
+    /// discovery callback is only installed at spawn). Fails closed: the
+    /// caller must remove the existing transfer first.
+    DuplicateMismatch,
 } || Allocator.Error;
 
 /// Daemon-level configuration mirrored to the Settings screen. String fields
@@ -659,6 +667,42 @@ pub const Manager = struct {
         mt_owned = true; // mt now owns session, meta, socks, id, name, magnet
 
         self.mutex.lock();
+        // Dedupe by info-hash: one swarm is one row. Re-adding a magnet or
+        // .torrent that is already live returns the existing transfer instead
+        // of spawning a second session that races the first on the same piece
+        // files (seen live: one magnet added twice -> two sessions, same
+        // info-hash, same download dir, one stalled). The check shares the
+        // append's lock so two concurrent adds can't both win.
+        if (self.findByInfoHashLocked(&mt.info_hash)) |existing| {
+            // Same swarm, different behavior (route, Nostr opt-in, or
+            // seed-vs-download mode): succeeding silently would leave the
+            // session on the old behavior while the caller believes the new
+            // one applies — a download and a seed of the same swarm have
+            // different transport wiring (a .tor seed stands up a hidden
+            // service a download never will). Refuse instead.
+            if (existing.route != route or existing.want_nostr != want_nostr or
+                existing.is_seed != is_seed)
+            {
+                self.mutex.unlock();
+                mt.destroy();
+                return error.DuplicateMismatch;
+            }
+            const dup = self.allocator.dupe(u8, existing.id) catch {
+                self.mutex.unlock();
+                mt.destroy();
+                return error.OutOfMemory;
+            };
+            // The transfer is live, so a retained copy of the same source (a
+            // spec that failed to re-add at startup) is stale: drop it now,
+            // under the lock as dropRetained requires, and persist — the
+            // early return would otherwise leave retryRetained re-adding it
+            // on every health tick forever.
+            self.dropRetained(source_src);
+            self.mutex.unlock();
+            mt.destroy();
+            self.persist();
+            return dup;
+        }
         self.transfers.append(self.allocator, mt) catch |err| {
             self.mutex.unlock();
             mt.destroy();
@@ -685,6 +729,15 @@ pub const Manager = struct {
 
         self.persist();
         return self.allocator.dupe(u8, id);
+    }
+
+    /// First live transfer with this info-hash, or null. Caller must hold
+    /// `mutex` (used by `register`'s dedupe check, inside the append lock).
+    fn findByInfoHashLocked(self: *Manager, info_hash: *const [20]u8) ?*ManagedTransfer {
+        for (self.transfers.items) |mt| {
+            if (std.mem.eql(u8, &mt.info_hash, info_hash)) return mt;
+        }
+        return null;
     }
 
     /// Stop and remove the transfer with `id`. Returns true if found.
@@ -2194,6 +2247,33 @@ test "Manager: dropRetained removes a re-added source so persist can't duplicate
     // Unrelated source is a no-op.
     m.dropRetained("magnet:?xt=urn:btih:bb");
     try testing.expectEqual(@as(usize, 1), m.retained_specs.items.len);
+}
+
+test "Manager: findByInfoHashLocked dedupes on the info-hash, not the source" {
+    const allocator = testing.allocator;
+    var m = try Manager.init(allocator, .{ .persist = false });
+    defer m.deinit();
+
+    var hash_a: [20]u8 = undefined;
+    var hash_b: [20]u8 = undefined;
+    std.crypto.random.bytes(&hash_a);
+    std.crypto.random.bytes(&hash_b);
+
+    // Stand-in rows: only the fields the lookup reads are valid, and the
+    // list is cleared before deinit so destroy() never sees them.
+    var t1: ManagedTransfer = undefined;
+    t1.info_hash = hash_a;
+    var t2: ManagedTransfer = undefined;
+    t2.info_hash = hash_b;
+    try m.transfers.append(allocator, &t1);
+    try m.transfers.append(allocator, &t2);
+    defer m.transfers.clearRetainingCapacity();
+
+    try testing.expectEqual(&t1, m.findByInfoHashLocked(&hash_a).?);
+    try testing.expectEqual(&t2, m.findByInfoHashLocked(&hash_b).?);
+    var hash_c: [20]u8 = undefined;
+    std.crypto.random.bytes(&hash_c);
+    try testing.expect(m.findByInfoHashLocked(&hash_c) == null);
 }
 
 test "Manager: init/deinit with config defaults" {
