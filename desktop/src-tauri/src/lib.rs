@@ -242,9 +242,31 @@ fn open_daemon_log() -> SharedLog {
         let path = dir.join("daemon.log");
         const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
         if std::fs::metadata(&path).map(|m| m.len() > MAX_LOG_BYTES).unwrap_or(false) {
-            let _ = std::fs::rename(&path, dir.join("daemon.log.old"));
+            let old = dir.join("daemon.log.old");
+            let _ = std::fs::rename(&path, &old);
+            // Rotated log still has the token + peer addresses; keep it private.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o600));
+            }
         }
-        std::fs::OpenOptions::new().create(true).append(true).open(path).ok()
+        // 0600: the banner includes `token: <hex>` and debug lines include
+        // peer IPs / tracker URLs. A world-readable log is a leak.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(&path)
+                .ok()?;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            Some(file)
+        }
+        #[cfg(not(unix))]
+        std::fs::OpenOptions::new().create(true).append(true).open(&path).ok()
     })();
     std::sync::Arc::new(std::sync::Mutex::new(file))
 }
