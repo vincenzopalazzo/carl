@@ -659,6 +659,22 @@ pub const Manager = struct {
         mt_owned = true; // mt now owns session, meta, socks, id, name, magnet
 
         self.mutex.lock();
+        // Dedupe by info-hash: one swarm is one row. Re-adding a magnet or
+        // .torrent that is already live returns the existing transfer instead
+        // of spawning a second session that races the first on the same piece
+        // files (seen live: one magnet added twice -> two sessions, same
+        // info-hash, same download dir, one stalled). The check shares the
+        // append's lock so two concurrent adds can't both win.
+        if (self.findByInfoHashLocked(&mt.info_hash)) |existing| {
+            const dup = self.allocator.dupe(u8, existing.id) catch {
+                self.mutex.unlock();
+                mt.destroy();
+                return error.OutOfMemory;
+            };
+            self.mutex.unlock();
+            mt.destroy();
+            return dup;
+        }
         self.transfers.append(self.allocator, mt) catch |err| {
             self.mutex.unlock();
             mt.destroy();
@@ -685,6 +701,15 @@ pub const Manager = struct {
 
         self.persist();
         return self.allocator.dupe(u8, id);
+    }
+
+    /// First live transfer with this info-hash, or null. Caller must hold
+    /// `mutex` (used by `register`'s dedupe check, inside the append lock).
+    fn findByInfoHashLocked(self: *Manager, info_hash: *const [20]u8) ?*ManagedTransfer {
+        for (self.transfers.items) |mt| {
+            if (std.mem.eql(u8, &mt.info_hash, info_hash)) return mt;
+        }
+        return null;
     }
 
     /// Stop and remove the transfer with `id`. Returns true if found.
@@ -2194,6 +2219,33 @@ test "Manager: dropRetained removes a re-added source so persist can't duplicate
     // Unrelated source is a no-op.
     m.dropRetained("magnet:?xt=urn:btih:bb");
     try testing.expectEqual(@as(usize, 1), m.retained_specs.items.len);
+}
+
+test "Manager: findByInfoHashLocked dedupes on the info-hash, not the source" {
+    const allocator = testing.allocator;
+    var m = try Manager.init(allocator, .{ .persist = false });
+    defer m.deinit();
+
+    var hash_a: [20]u8 = undefined;
+    var hash_b: [20]u8 = undefined;
+    std.crypto.random.bytes(&hash_a);
+    std.crypto.random.bytes(&hash_b);
+
+    // Stand-in rows: only the fields the lookup reads are valid, and the
+    // list is cleared before deinit so destroy() never sees them.
+    var t1: ManagedTransfer = undefined;
+    t1.info_hash = hash_a;
+    var t2: ManagedTransfer = undefined;
+    t2.info_hash = hash_b;
+    try m.transfers.append(allocator, &t1);
+    try m.transfers.append(allocator, &t2);
+    defer m.transfers.clearRetainingCapacity();
+
+    try testing.expectEqual(&t1, m.findByInfoHashLocked(&hash_a).?);
+    try testing.expectEqual(&t2, m.findByInfoHashLocked(&hash_b).?);
+    var hash_c: [20]u8 = undefined;
+    std.crypto.random.bytes(&hash_c);
+    try testing.expect(m.findByInfoHashLocked(&hash_c) == null);
 }
 
 test "Manager: init/deinit with config defaults" {
