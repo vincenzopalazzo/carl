@@ -102,6 +102,11 @@ pub const Storage = struct {
     paths: [][]u8,
     /// True when `handles` are read-only (seed mode, or after a downgrade).
     read_only: bool,
+    /// True when any payload file already had bytes at init. False means the
+    /// payload was just created (every file empty), so a resume recheck would
+    /// only re-hash zeros — callers skip it (a first-time magnet add used to
+    /// pay a full read+hash of the whole payload for nothing).
+    had_data: bool,
     /// True once `closeFiles` ran; guards double-close from `deinit`.
     files_closed: bool = false,
 
@@ -132,6 +137,7 @@ pub const Storage = struct {
 
         var opened: usize = 0;
         var paths_set: usize = 0;
+        var had_data = false;
         errdefer {
             for (handles[0..opened]) |h| h.close();
             for (paths[0..paths_set]) |p| allocator.free(p);
@@ -193,6 +199,7 @@ pub const Storage = struct {
                 // invalidate every saved bitfield and force a full re-hash on
                 // every single start.
                 const cur_len = handles[i].getEndPos() catch 0;
+                if (cur_len > 0) had_data = true;
                 if (cur_len != file_info.length) {
                     handles[i].setEndPos(file_info.length) catch return error.WriteFailed;
                 }
@@ -201,6 +208,7 @@ pub const Storage = struct {
                 // for other programs (no write lock on data we never modify).
                 handles[i] = dir.openFile(path, .{ .mode = .read_only }) catch return error.FileOpenFailed;
                 opened += 1;
+                had_data = true;
             }
             paths[i] = allocator.dupe(u8, path) catch return error.OutOfMemory;
             paths_set += 1;
@@ -214,6 +222,7 @@ pub const Storage = struct {
             .dir = dir,
             .paths = paths,
             .read_only = !create,
+            .had_data = had_data,
         };
     }
 
