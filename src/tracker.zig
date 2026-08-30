@@ -71,9 +71,14 @@ pub const TrackerError = error{
 /// 60s (or the tracker's own min interval, whichever is larger) and cap at
 /// 6h so a broken tracker cannot silence us until restart.
 pub fn clampInterval(interval: u64, min_interval: ?u64) u64 {
-    const floor: u64 = @max(min_interval orelse 60, 60);
+    const cap: u64 = 6 * 60 * 60;
+    // Bound min_interval *before* using it as clamp's lower bound:
+    // std.math.clamp panics (safety) / returns the oversized floor
+    // (ReleaseFast) when min > max. A tracker sending min interval > 6h
+    // must not crash us or defeat the cap (review on PR #96).
+    const floor: u64 = @min(@max(min_interval orelse 60, 60), cap);
     const raw = if (interval == 0) floor else interval;
-    return std.math.clamp(raw, floor, 6 * 60 * 60);
+    return std.math.clamp(raw, floor, cap);
 }
 
 /// Build the full announce URL with query parameters.
@@ -565,6 +570,10 @@ test "clampInterval floors zero and honors min interval" {
     try std.testing.expectEqual(@as(u64, 1800), clampInterval(1800, null));
     try std.testing.expectEqual(@as(u64, 900), clampInterval(60, 900));
     try std.testing.expectEqual(@as(u64, 6 * 60 * 60), clampInterval(99_999, null));
+    // Hostile min_interval > cap must not panic or defeat the 6h cap.
+    try std.testing.expectEqual(@as(u64, 6 * 60 * 60), clampInterval(0, 99_999));
+    try std.testing.expectEqual(@as(u64, 6 * 60 * 60), clampInterval(1800, 99_999));
+    try std.testing.expectEqual(@as(u64, 6 * 60 * 60), clampInterval(99_999, 99_999));
 }
 
 test "build announce URL never includes ip= (no listen-IP leak)" {

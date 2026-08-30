@@ -2629,6 +2629,12 @@ pub const Session = struct {
         if (st.peers.len > 0) allocator.free(st.peers);
         st.peers = peers;
         st.nodes = node_count;
+        // Empty successful walks must also back off — otherwise the
+        // zero-peer maintenance branch respawns a full walk every tick
+        // (review on PR #96). Failed walks already set retry_after above.
+        if (st.peers.len == 0) {
+            st.retry_after = std.time.timestamp() + dht_retry_backoff_secs;
+        }
     }
 
     // --- BEP 19: Web seed downloads ---
