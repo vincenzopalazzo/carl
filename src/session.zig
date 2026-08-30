@@ -1092,7 +1092,10 @@ pub const Session = struct {
                                 std.math.cast(u32, self.meta.raw_info.len)
                             else
                                 null;
-                            const advertised_port: ?u16 = if (self.anonymized()) null else self.listen_port;
+                            // Omit `p` on proxy/Tor/I2P *and* on a Tor hidden
+                            // service (tor_hidden seeds have proxy==null, so
+                            // anonymized() is false — review on PR #97).
+                            const advertised_port: ?u16 = if (self.anonymized() or self.tor_hidden) null else self.listen_port;
                             const ext_hs = extension.buildExtensionHandshake(self.allocator, ms, advertised_port) catch null;
                             if (ext_hs) |hs_payload| {
                                 defer self.allocator.free(hs_payload);
@@ -2186,11 +2189,12 @@ pub const Session = struct {
         const req = tracker_mod.AnnounceRequest{
             .info_hash = self.info_hash,
             .peer_id = self.peer_id,
-            // BEP 3: port 0 means "not listening". On any anonymized
-            // transport the inbound listener is closed (would leak the
-            // real IP), so advertising listenPort would tell the tracker
-            // and every peer-list consumer a port we will never accept.
-            .port = if (self.anonymized()) 0 else self.listen_port,
+            // BEP 3 requires a port; it does not define 0 as "not
+            // listening", and trackers that validate the field reject 0
+            // (review on PR #97) — which, with DHT already off, stalls
+            // a proxied download. Advertising listenPort without opening
+            // the listener is the same claim a NATed client makes.
+            .port = self.listen_port,
             .uploaded = self.uploaded,
             .downloaded = self.downloaded,
             .left = self.computeLeft(),
