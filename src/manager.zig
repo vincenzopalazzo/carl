@@ -1154,6 +1154,15 @@ pub const Manager = struct {
         self.persist();
     }
 
+    /// Locked snapshot of the configured default route. Connection threads
+    /// must not read `cfg.route` directly — `setRoute` writes it under this
+    /// mutex (review on PR #98).
+    pub fn route(self: *Manager) api.Route {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.cfg.route;
+    }
+
     /// A locked copy of the current download dir (for callers that need to build
     /// a path without racing `setDownloadDir`).
     pub fn downloadDirDup(self: *Manager, a: Allocator) Allocator.Error![]u8 {

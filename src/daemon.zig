@@ -669,7 +669,7 @@ const Conn = struct {
         // GUI-persisted / --route setting). An unknown string is still a
         // 400 — never a silent downgrade to direct, which would put a
         // proxied daemon's CLI/API add on the clearnet.
-        const route_val = defaultTransferRoute(self.daemon.manager.cfg.route, strField(obj, "route")) orelse {
+        const route_val = defaultTransferRoute(self.daemon.manager.route(), strField(obj, "route")) orelse {
             log.warn("addTransfer: unknown route '{s}'", .{strField(obj, "route") orelse ""});
             return self.sendStatus(.bad_request);
         };
