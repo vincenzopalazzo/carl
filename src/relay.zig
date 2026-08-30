@@ -30,11 +30,40 @@ pub const Error = error{
 // ===========================================================================
 // Every subsystem that dials relays (the daemon's prober, the GUI search, the
 // manager's peer discovery and completion broadcast, `seeding.publish`, the
-// follow poller) shares one table keyed by relay URL. A relay that fails is
-// backed off individually, so a permanently-503 relay stops being hammered
-// even while its neighbours answer fine -- the exact hole in the old global
-// "were ALL relays down this cycle?" streak, which a single healthy relay
-// reset forever.
+// follow poller) shares one table keyed by (relay URL, transport). A relay
+// that fails is backed off individually, so a permanently-503 relay stops
+// being hammered even while its neighbours answer fine -- the exact hole in
+// the old global "were ALL relays down this cycle?" streak, which a single
+// healthy relay reset forever.
+//
+// The transport is part of the key because a dial's outcome depends on the
+// route: a relay unreachable *through a dead proxy* says nothing about
+// reaching it directly. Keying by URL alone let one route's outage (e.g. Tor
+// down, every proxied dial failing) poison another route's view of the same
+// perfectly reachable relay.
+
+/// Composite map key: bare URL for direct dials, "URL\ntransport" for proxied
+/// ones. Falls back to the bare URL if the buffer can't hold both (old
+/// behavior, never a crash). Lookup keys are stack slices; the table dupes on
+/// insert as before.
+fn healthKey(buf: []u8, url: []const u8, proxy: ?proxy_mod.Proxy) []const u8 {
+    const p = proxy orelse return url;
+    if (std.fmt.bufPrint(buf, "{s}\n{s}://{s}:{d}", .{ url, @tagName(p.scheme), p.host, p.port })) |key| {
+        return key;
+    } else |_| {
+        // Overlong URL+transport: fall back to a hash of BOTH parts, never to
+        // the bare URL — that would silently merge the proxied entry with the
+        // direct one and re-introduce cross-route poisoning (review on #88).
+        var h = std.hash.Wyhash.init(0);
+        h.update(url);
+        h.update(@tagName(p.scheme));
+        h.update(p.host);
+        var port_bytes: [2]u8 = undefined;
+        std.mem.writeInt(u16, &port_bytes, p.port, .big);
+        h.update(&port_bytes);
+        return std.fmt.bufPrint(buf, "hash:{x}", .{h.final()}) catch unreachable;
+    }
+}
 
 /// Why a relay is not dialable right now.
 pub const Skip = enum {
@@ -128,23 +157,27 @@ pub const HealthTable = struct {
         self.map = .empty;
     }
 
-    pub fn skipAt(self: *HealthTable, url: []const u8, now_ms: i64) Skip {
+    pub fn skipAt(self: *HealthTable, url: []const u8, proxy: ?proxy_mod.Proxy, now_ms: i64) Skip {
+        var kbuf: [1024]u8 = undefined;
+        const key = healthKey(&kbuf, url, proxy);
         self.mutex.lock();
         defer self.mutex.unlock();
-        const e = self.map.get(url) orelse return .none;
+        const e = self.map.get(key) orelse return .none;
         return e.skip(now_ms);
     }
 
-    pub fn skip(self: *HealthTable, url: []const u8) Skip {
-        return self.skipAt(url, std.time.milliTimestamp());
+    pub fn skip(self: *HealthTable, url: []const u8, proxy: ?proxy_mod.Proxy) Skip {
+        return self.skipAt(url, proxy, std.time.milliTimestamp());
     }
 
     /// Clear this relay's backoff. Untracked relays are healthy by definition,
     /// so a success on one allocates nothing.
-    pub fn recordSuccess(self: *HealthTable, url: []const u8) void {
+    pub fn recordSuccess(self: *HealthTable, url: []const u8, proxy: ?proxy_mod.Proxy) void {
+        var kbuf: [1024]u8 = undefined;
+        const key = healthKey(&kbuf, url, proxy);
         self.mutex.lock();
         defer self.mutex.unlock();
-        const e = self.map.getPtr(url) orelse return;
+        const e = self.map.getPtr(key) orelse return;
         // Say so when a relay comes back, otherwise recovery is invisible in
         // the log (successes are silent) and a later first-failure line looks
         // like the backoff forgot its history.
@@ -152,21 +185,23 @@ pub const HealthTable = struct {
         e.onSuccess();
     }
 
-    pub fn recordFailureAt(self: *HealthTable, url: []const u8, class: Failure, now_ms: i64) void {
+    pub fn recordFailureAt(self: *HealthTable, url: []const u8, proxy: ?proxy_mod.Proxy, class: Failure, now_ms: i64) void {
+        var kbuf: [1024]u8 = undefined;
+        const hkey = healthKey(&kbuf, url, proxy);
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        var e: RelayHealth = self.map.get(url) orelse blk: {
+        var e: RelayHealth = self.map.get(hkey) orelse blk: {
             if (self.map.count() >= max_entries) return;
             break :blk .{};
         };
         const first = e.fails == 0 and !e.invalid;
         e.onFailure(now_ms, class);
 
-        const key = self.map.getKey(url) orelse (self.allocator.dupe(u8, url) catch return);
+        const key = self.map.getKey(hkey) orelse (self.allocator.dupe(u8, hkey) catch return);
         self.map.put(self.allocator, key, e) catch {
             // Only reachable when the key was freshly duped and the put OOM'd.
-            if (self.map.getKey(url) == null) self.allocator.free(key);
+            if (self.map.getKey(hkey) == null) self.allocator.free(key);
             return;
         };
 
@@ -178,12 +213,17 @@ pub const HealthTable = struct {
                 .transient => log.info("relay {s}: unreachable, backing off {d}s", .{ url, @divTrunc(backoffMs(e.fails), std.time.ms_per_s) }),
             }
         } else {
-            log.debug("relay {s}: still failing, backing off {d}s", .{ url, @divTrunc(backoffMs(e.fails), std.time.ms_per_s) });
+            switch (class) {
+                // An unusable URL has no backoff (fails stays 0); saying
+                // "backing off 0s" here made the skip logic look broken.
+                .invalid => log.debug("relay {s}: still unusable, waiting for a config change", .{url}),
+                .transient => log.debug("relay {s}: still failing, backing off {d}s", .{ url, @divTrunc(backoffMs(e.fails), std.time.ms_per_s) }),
+            }
         }
     }
 
-    pub fn recordFailure(self: *HealthTable, url: []const u8, class: Failure) void {
-        self.recordFailureAt(url, class, std.time.milliTimestamp());
+    pub fn recordFailure(self: *HealthTable, url: []const u8, proxy: ?proxy_mod.Proxy, class: Failure) void {
+        self.recordFailureAt(url, proxy, class, std.time.milliTimestamp());
     }
 };
 
@@ -213,13 +253,13 @@ pub const Gate = enum {
 /// leaves at least one relay to talk to, otherwise force the dial. This is what
 /// keeps the skip list from silently turning a publish or a search into a
 /// no-op when every relay happens to be in backoff.
-pub fn oneShotGate(urls: []const []const u8) Gate {
-    return gateFor(health(), urls, std.time.milliTimestamp());
+pub fn oneShotGate(urls: []const []const u8, proxy: ?proxy_mod.Proxy) Gate {
+    return gateFor(health(), urls, proxy, std.time.milliTimestamp());
 }
 
-fn gateFor(table: *HealthTable, urls: []const []const u8, now_ms: i64) Gate {
+fn gateFor(table: *HealthTable, urls: []const []const u8, proxy: ?proxy_mod.Proxy, now_ms: i64) Gate {
     for (urls) |u| {
-        if (table.skipAt(u, now_ms) == .none) return .honor;
+        if (table.skipAt(u, proxy, now_ms) == .none) return .honor;
     }
     return .force;
 }
@@ -229,7 +269,7 @@ fn gateFor(table: *HealthTable, urls: []const []const u8, now_ms: i64) Gate {
 /// backing off (or its URL is unusable).
 pub fn dial(allocator: Allocator, url: []const u8, proxy: ?proxy_mod.Proxy, gate: Gate) Error!Relay {
     if (gate == .honor) {
-        switch (health().skip(url)) {
+        switch (health().skip(url, proxy)) {
             .none => {},
             .backoff => {
                 log.debug("relay {s}: skipped, backing off", .{url});
@@ -270,10 +310,10 @@ pub const Relay = struct {
         // proxied stream (the proxy only ever sees ciphertext).
         const conn = ws.Conn.connect(allocator, url, .{ .proxy = proxy }) catch |err| {
             log.debug("relay connect to {s} failed: {}", .{ url, err });
-            health().recordFailure(url, classify(err));
+            health().recordFailure(url, proxy, classify(err));
             return error.ConnectFailed;
         };
-        health().recordSuccess(url);
+        health().recordSuccess(url, proxy);
         return .{ .allocator = allocator, .url = url, .conn = conn };
     }
 
@@ -575,35 +615,56 @@ test "HealthTable: tracks relays independently" {
 
     // One relay 503s forever while its neighbour answers: the healthy one must
     // not reset the failing one's backoff (the bug this whole thing fixes).
-    t.recordFailureAt("wss://relay.damus.io", .transient, 0);
-    t.recordSuccess("wss://nos.lol");
-    try std.testing.expectEqual(Skip.backoff, t.skipAt("wss://relay.damus.io", 0));
-    try std.testing.expectEqual(Skip.none, t.skipAt("wss://nos.lol", 0));
+    t.recordFailureAt("wss://relay.damus.io", null, .transient, 0);
+    t.recordSuccess("wss://nos.lol", null);
+    try std.testing.expectEqual(Skip.backoff, t.skipAt("wss://relay.damus.io", null, 0));
+    try std.testing.expectEqual(Skip.none, t.skipAt("wss://nos.lol", null, 0));
 
     // Repeated failures keep growing that one relay's wait.
-    t.recordFailureAt("wss://relay.damus.io", .transient, 30_000);
-    try std.testing.expectEqual(Skip.backoff, t.skipAt("wss://relay.damus.io", 89_999));
-    try std.testing.expectEqual(Skip.none, t.skipAt("wss://relay.damus.io", 90_000));
+    t.recordFailureAt("wss://relay.damus.io", null, .transient, 30_000);
+    try std.testing.expectEqual(Skip.backoff, t.skipAt("wss://relay.damus.io", null, 89_999));
+    try std.testing.expectEqual(Skip.none, t.skipAt("wss://relay.damus.io", null, 90_000));
 
     // And a success wipes it.
-    t.recordSuccess("wss://relay.damus.io");
-    try std.testing.expectEqual(Skip.none, t.skipAt("wss://relay.damus.io", 0));
+    t.recordSuccess("wss://relay.damus.io", null);
+    try std.testing.expectEqual(Skip.none, t.skipAt("wss://relay.damus.io", null, 0));
 }
 
 test "HealthTable: unknown relays are dialable and cost nothing" {
     var t: HealthTable = .{ .allocator = std.testing.allocator };
     defer t.deinit();
-    try std.testing.expectEqual(Skip.none, t.skipAt("wss://never.seen", 0));
-    t.recordSuccess("wss://never.seen"); // must not allocate an entry
+    try std.testing.expectEqual(Skip.none, t.skipAt("wss://never.seen", null, 0));
+    t.recordSuccess("wss://never.seen", null); // must not allocate an entry
     try std.testing.expectEqual(@as(usize, 0), t.map.count());
 }
 
 test "HealthTable: invalid URLs stay skipped" {
     var t: HealthTable = .{ .allocator = std.testing.allocator };
     defer t.deinit();
-    t.recordFailureAt("ftp://nope", .invalid, 0);
-    try std.testing.expectEqual(Skip.invalid, t.skipAt("ftp://nope", 0));
-    try std.testing.expectEqual(Skip.invalid, t.skipAt("ftp://nope", backoff_max_ms * 100));
+    t.recordFailureAt("ftp://nope", null, .invalid, 0);
+    try std.testing.expectEqual(Skip.invalid, t.skipAt("ftp://nope", null, 0));
+    try std.testing.expectEqual(Skip.invalid, t.skipAt("ftp://nope", null, backoff_max_ms * 100));
+}
+
+test "HealthTable: backoff is scoped per transport, not per URL alone" {
+    var t: HealthTable = .{ .allocator = std.testing.allocator };
+    defer t.deinit();
+    const px: proxy_mod.Proxy = .{ .scheme = .socks5h, .host = "127.0.0.1", .port = 9050 };
+
+    // The relay is unreachable *through the proxy* (e.g. Tor is down): the
+    // direct view of the same URL must stay dialable, and vice versa.
+    t.recordFailureAt("wss://nos.lol", px, .transient, 0);
+    try std.testing.expectEqual(Skip.backoff, t.skipAt("wss://nos.lol", px, 0));
+    try std.testing.expectEqual(Skip.none, t.skipAt("wss://nos.lol", null, 0));
+
+    // A direct failure likewise doesn't poison the proxied entry.
+    t.recordFailureAt("wss://relay.damus.io", null, .transient, 0);
+    try std.testing.expectEqual(Skip.backoff, t.skipAt("wss://relay.damus.io", null, 0));
+    try std.testing.expectEqual(Skip.none, t.skipAt("wss://relay.damus.io", px, 0));
+
+    // Success through the proxy clears only the proxied entry.
+    t.recordSuccess("wss://nos.lol", px);
+    try std.testing.expectEqual(Skip.none, t.skipAt("wss://nos.lol", px, 0));
 }
 
 test "gateFor: honors the skip list until it would silence every relay" {
@@ -612,22 +673,22 @@ test "gateFor: honors the skip list until it would silence every relay" {
     const urls = [_][]const u8{ "wss://relay.damus.io", "wss://nos.lol" };
 
     // All healthy -> honor.
-    try std.testing.expectEqual(Gate.honor, gateFor(&t, &urls, 0));
+    try std.testing.expectEqual(Gate.honor, gateFor(&t, &urls, null, 0));
 
     // One backing off, one fine -> still honor (the publish reaches nos.lol).
-    t.recordFailureAt("wss://relay.damus.io", .transient, 0);
-    try std.testing.expectEqual(Gate.honor, gateFor(&t, &urls, 0));
+    t.recordFailureAt("wss://relay.damus.io", null, .transient, 0);
+    try std.testing.expectEqual(Gate.honor, gateFor(&t, &urls, null, 0));
 
     // Every relay unusable -> force, so a one-shot publish/search still tries
     // instead of silently doing nothing.
-    t.recordFailureAt("wss://nos.lol", .invalid, 0);
-    try std.testing.expectEqual(Gate.force, gateFor(&t, &urls, 0));
+    t.recordFailureAt("wss://nos.lol", null, .invalid, 0);
+    try std.testing.expectEqual(Gate.force, gateFor(&t, &urls, null, 0));
 
     // Once the backoff expires the healthy-again relay pulls it back to honor.
-    try std.testing.expectEqual(Gate.honor, gateFor(&t, &urls, 30_000));
+    try std.testing.expectEqual(Gate.honor, gateFor(&t, &urls, null, 30_000));
 
     // An empty relay list has nothing to protect; force is the harmless answer.
-    try std.testing.expectEqual(Gate.force, gateFor(&t, &.{}, 0));
+    try std.testing.expectEqual(Gate.force, gateFor(&t, &.{}, null, 0));
 }
 
 test "SearchOptions defaults are sensible" {

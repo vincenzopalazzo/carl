@@ -726,9 +726,10 @@ pub const Drive = struct {
 
         const relay_urls = nostr_config.readRelays(a) catch return;
         var acks: usize = 0;
+        const gate = relay_mod.oneShotGate(relay_urls, null);
         for (relay_urls) |url| {
             if (self.stopping()) break;
-            var r = relay_mod.Relay.connect(a, url, null) catch |err| {
+            var r = relay_mod.dial(a, url, null, gate) catch |err| {
                 log.debug("relay {s}: {}", .{ url, err });
                 continue;
             };
@@ -833,7 +834,8 @@ pub const Drive = struct {
 
             for (relay_urls) |url| {
                 if (self.stopping()) return;
-                var r = relay_mod.Relay.connect(a, url, null) catch |err| {
+                // Periodic subscriber poll: honor the health gate.
+                var r = relay_mod.dial(a, url, null, .honor) catch |err| {
                     log.debug("relay {s}: {}", .{ url, err });
                     continue;
                 };

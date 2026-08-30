@@ -296,7 +296,11 @@ pub const Daemon = struct {
             const onion = std.mem.indexOf(u8, url, ".onion") != null;
             var state: []const u8 = "configured";
             if (!(onion and proxy == null)) {
-                if (relay_mod.Relay.connect(a, url, proxy)) |r| {
+                // The prober is a periodic background caller: honor the shared
+                // health gate so a relay that keeps failing (or has an unusable
+                // URL) is skipped instead of re-dialed every cycle. A skipped
+                // relay reports its last known verdict: unreachable.
+                if (relay_mod.dial(a, url, proxy, .honor)) |r| {
                     var rc = r;
                     rc.deinit();
                     state = "connected";
@@ -1272,11 +1276,20 @@ fn runSearch(arena: Allocator, daemon: *Daemon, query: []const u8) ![]u8 {
     var seen: std.ArrayList([40]u8) = .empty;
     const now = std.time.timestamp();
 
+    // One-shot user search over the prober-known relays: honor the shared
+    // health gate unless skipping would silence every relay (review on #88).
+    var search_urls: std.ArrayList([]const u8) = .empty;
+    for (health) |relay| {
+        if (std.mem.eql(u8, relay.state, "unreachable")) continue;
+        search_urls.append(arena, relay.url) catch break;
+    }
+    const gate = relay_mod.oneShotGate(search_urls.items, proxy);
+
     for (health) |relay| {
         if (results.items.len >= 50) break;
         if (std.mem.eql(u8, relay.state, "unreachable")) continue;
         const url = relay.url;
-        var r = relay_mod.Relay.connect(arena, url, proxy) catch continue;
+        var r = relay_mod.dial(arena, url, proxy, gate) catch continue;
         defer r.deinit();
         const events = relay_mod.subscribeAndCollect(arena, &r, filter, .{
             .timeout_ms = 7_000,
@@ -1389,7 +1402,7 @@ test "formatAge: buckets" {
 
 test "buildStateJson: produces the five top-level keys" {
     const a = testing.allocator;
-    var mgr = try manager_mod.Manager.init(a, .{});
+    var mgr = try manager_mod.Manager.init(a, .{ .persist = false });
     defer mgr.deinit();
     var d = Daemon{ .allocator = a, .manager = &mgr, .token = "tok" };
 

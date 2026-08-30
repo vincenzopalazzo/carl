@@ -89,6 +89,12 @@ pub const Config = struct {
     /// the CLI (which honors $CARL_DIR first) would diverge on the work dir.
     download_dir_pinned: bool = false,
     listen_port: u16 = 6881,
+    /// False turns `persist` into a no-op. Tests set this: a Manager built
+    /// with config defaults otherwise writes the *real* `<config>/carl.db`
+    /// (route + download dir + an empty transfer list) on any state change,
+    /// silently wiping the running daemon's saved transfers — which is how
+    /// `zig build test` on a developer machine destroyed live GUI state.
+    persist: bool = true,
     max_active: u32 = 8,
     peer_limit: u32 = 60,
     publish_nip35: bool = true,
@@ -275,6 +281,7 @@ pub const Manager = struct {
                 .download_dir = try allocator.dupe(u8, if (cfg.download_dir.len > 0) cfg.download_dir else "."),
                 .download_dir_pinned = cfg.download_dir_pinned,
                 .listen_port = cfg.listen_port,
+                .persist = cfg.persist,
                 .max_active = cfg.max_active,
                 .peer_limit = cfg.peer_limit,
                 .publish_nip35 = cfg.publish_nip35,
@@ -1129,6 +1136,7 @@ pub const Manager = struct {
     /// a no-op while `restore` is replaying. Snapshots under the lock, then does
     /// file I/O unlocked.
     pub fn persist(self: *Manager) void {
+        if (!self.cfg.persist) return;
         if (self.restoring.load(.acquire)) return;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
@@ -1922,8 +1930,11 @@ fn broadcastIfNew(mt: *ManagedTransfer) void {
         .limit = 1,
     };
 
+    // One-shot publish gate: honor the skip list as long as it leaves at
+    // least one relay to ask, otherwise dial anyway.
+    const gate = relay_mod.oneShotGate(relay_urls, mt.proxy);
     for (relay_urls) |url| {
-        var r = relay_mod.Relay.connect(a, url, mt.proxy) catch continue;
+        var r = relay_mod.dial(a, url, mt.proxy, gate) catch continue;
         defer r.deinit();
         const events = relay_mod.subscribeAndCollect(a, &r, filter, .{
             .timeout_ms = 8_000,
@@ -2000,7 +2011,9 @@ fn collectNostrPeers(mt: *ManagedTransfer) void {
     var added: usize = 0;
     for (relay_urls) |url| {
         if (!mt.session.running) return;
-        var r = relay_mod.Relay.connect(a, url, mt.proxy) catch continue;
+        // Periodic re-discovery: honor the health gate so a down relay isn't
+        // re-dialed on every round.
+        var r = relay_mod.dial(a, url, mt.proxy, .honor) catch continue;
         defer r.deinit();
         const events = relay_mod.subscribeAndCollect(a, &r, filter, .{
             .timeout_ms = 10_000,
@@ -2164,7 +2177,7 @@ test "formatEta" {
 
 test "Manager: dropRetained removes a re-added source so persist can't duplicate it" {
     const allocator = testing.allocator;
-    var m = try Manager.init(allocator, .{});
+    var m = try Manager.init(allocator, .{ .persist = false });
     defer m.deinit();
 
     try testing.expect(m.retainSpec(.{ .kind = .download, .source = "magnet:?xt=urn:btih:aa", .route = .i2p, .nostr = true }));
@@ -2185,7 +2198,8 @@ test "Manager: dropRetained removes a re-added source so persist can't duplicate
 
 test "Manager: init/deinit with config defaults" {
     const allocator = testing.allocator;
-    var m = try Manager.init(allocator, .{});
+    // persist=false: setRoute below must not rewrite the real carl.db.
+    var m = try Manager.init(allocator, .{ .persist = false });
     defer m.deinit();
     try testing.expectEqualStrings("socks5h://127.0.0.1:9050", m.cfg.socks);
     try testing.expectEqualStrings(".", m.cfg.download_dir);
