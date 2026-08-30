@@ -674,10 +674,15 @@ pub const Manager = struct {
         // info-hash, same download dir, one stalled). The check shares the
         // append's lock so two concurrent adds can't both win.
         if (self.findByInfoHashLocked(&mt.info_hash)) |existing| {
-            // Same swarm, different behavior (route or Nostr opt-in):
-            // succeeding silently would leave the session on the old behavior
-            // while the caller believes the new one applies. Refuse instead.
-            if (existing.route != route or existing.want_nostr != want_nostr) {
+            // Same swarm, different behavior (route, Nostr opt-in, or
+            // seed-vs-download mode): succeeding silently would leave the
+            // session on the old behavior while the caller believes the new
+            // one applies — a download and a seed of the same swarm have
+            // different transport wiring (a .tor seed stands up a hidden
+            // service a download never will). Refuse instead.
+            if (existing.route != route or existing.want_nostr != want_nostr or
+                existing.is_seed != is_seed)
+            {
                 self.mutex.unlock();
                 mt.destroy();
                 return error.DuplicateMismatch;
