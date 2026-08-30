@@ -688,8 +688,17 @@ pub const Session = struct {
         return out;
     }
 
-    fn publishPeerSnap(self: *Session) void {
-        const count = self.peers.items.len;
+    fn publishPeerSnap(self: *Session) Allocator.Error!void {
+        // Only fully handshaked peers belong in the GUI's peer list;
+        // connecting/handshaking attempts are churn, not connections.
+        // Pre-count so the allocation is exact: shrinking later with realloc
+        // (or worse, publishing a sub-slice whose length no longer matches
+        // the allocation) is what produced the free-length mismatch the
+        // review on PR #93 flagged.
+        var count: usize = 0;
+        for (self.peers.items) |p| {
+            if (p.state == .active) count += 1;
+        }
         if (count == 0) {
             self.peer_snap_mutex.lock();
             const old = self.peer_snap;
@@ -699,18 +708,29 @@ pub const Session = struct {
             return;
         }
 
-        const snap = self.allocator.alloc(PeerInfo, count) catch return;
+        const snap = try self.allocator.alloc(PeerInfo, count);
         var written: usize = 0;
+        // A failed row build discards the whole tick instead of publishing a
+        // shortened slice: every row is independently owned, the backing
+        // array is freed at full length, and the previous snapshot stays
+        // valid for one more second.
+        errdefer {
+            for (snap[0..written]) |row| {
+                self.allocator.free(row.addr);
+                self.allocator.free(row.client);
+                self.allocator.free(row.flags);
+            }
+            self.allocator.free(snap);
+        }
         for (self.peers.items) |p| {
-            if (p.state == .disconnected) continue;
-            snap[written] = self.buildPeerInfo(p) catch continue;
+            if (p.state != .active) continue;
+            snap[written] = try self.buildPeerInfo(p);
             written += 1;
         }
 
-        const published = self.allocator.realloc(snap, written) catch snap[0..written];
         self.peer_snap_mutex.lock();
         const old = self.peer_snap;
-        self.peer_snap = published;
+        self.peer_snap = snap;
         self.peer_snap_mutex.unlock();
         self.freePeerSnapSlice(old);
     }
@@ -738,6 +758,12 @@ pub const Session = struct {
             addr_owned = try self.allocator.dupe(u8, formatted);
             port = p.address.getPort();
         }
+        // On any later failure the partially built row must not leak —
+        // publishPeerSnap runs every second, so a leak here compounds.
+        // Registered only now that addr_owned is definitely initialized:
+        // registering it earlier would free an undefined slice when the
+        // dupe itself is what fails (review on PR #93).
+        errdefer self.allocator.free(addr_owned);
 
         var client_buf: [64]u8 = undefined;
         const client_src: []const u8 = if (p.client_name) |name|
@@ -745,6 +771,7 @@ pub const Session = struct {
         else
             decodeClientName(&client_buf, p.peer_id);
         const client_owned = try self.allocator.dupe(u8, client_src);
+        errdefer self.allocator.free(client_owned);
 
         const peer_pct: u8 = if (p.peer_bitfield) |bf| blk: {
             if (self.num_pieces == 0) break :blk 0;
@@ -754,6 +781,7 @@ pub const Session = struct {
 
         var flags_buf: [4]u8 = undefined;
         const flags_owned = try self.allocator.dupe(u8, peerFlags(&flags_buf, p));
+        errdefer self.allocator.free(flags_owned);
 
         return .{
             .addr = addr_owned,
@@ -2043,6 +2071,11 @@ pub const Session = struct {
             }
             // Publish per-file snapshot for the daemon's cross-thread reads.
             self.publishFileSnap();
+            // Publish the per-peer snapshot too — without this the daemon's
+            // peerSnapshot() always returned empty and the GUI's peer tab
+            // showed "No peers connected" while the swarm was fully connected.
+            // A failed publish keeps last tick's snapshot; never fatal.
+            self.publishPeerSnap() catch {};
             // Publish the DHT node count from the last completed lookup and
             // consume any peers it found (connects happen on this thread).
             if (self.dht_state) |st| {
