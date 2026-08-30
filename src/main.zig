@@ -834,10 +834,13 @@ fn cmdSearch(
     // from printing up to 30 unique results.
     var printed: u32 = 0;
     var found_any = false;
+    // One-shot user search: honor the skip list unless it would silence every
+    // relay (same gate as the daemon-side one-shots).
+    const gate = carl.relay.oneShotGate(relay_urls, proxy);
     relay_loop: for (relay_urls) |url| {
         if (printed >= limit) break;
 
-        var r = carl.relay.Relay.connect(allocator, url, proxy) catch |err| {
+        var r = carl.relay.dial(allocator, url, proxy, gate) catch |err| {
             log.warn("relay {s}: {}", .{ url, err });
             continue;
         };
@@ -1367,8 +1370,10 @@ fn fetchNip35Entry(
     var best: ?carl.nip35.TorrentEntry = null;
     var best_created: i64 = std.math.minInt(i64);
 
+    // One-shot metadata enrichment during a download: oneShotGate.
+    const gate = carl.relay.oneShotGate(relay_urls, proxy);
     for (relay_urls) |url| {
-        var r = carl.relay.Relay.connect(allocator, url, proxy) catch continue;
+        var r = carl.relay.dial(allocator, url, proxy, gate) catch continue;
         defer r.deinit();
         const events = carl.relay.subscribeAndCollect(allocator, &r, filter, .{
             .timeout_ms = 10_000,
@@ -1430,7 +1435,9 @@ fn collectNostrPeers(
         // callback inside the session loop, so a Ctrl-C mid-query must be honored
         // without waiting out every relay's timeout.
         if (!session.running) return;
-        var r = carl.relay.Relay.connect(allocator, url, session.proxy) catch |err| {
+        // Periodic re-discovery: honor the health gate so a down or unusable
+        // relay isn't re-dialed on every round (review on PR #88).
+        var r = carl.relay.dial(allocator, url, session.proxy, .honor) catch |err| {
             log.debug("nostr peer-discover: {s}: {}", .{ url, err });
             continue;
         };
