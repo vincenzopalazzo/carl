@@ -29,6 +29,7 @@ pub const ws_server = @import("ws_server.zig");
 pub const http = @import("http.zig");
 pub const manager = @import("manager.zig");
 pub const daemon = @import("daemon.zig");
+pub const daemon_client = @import("daemon_client.zig");
 pub const state = @import("state.zig");
 pub const workdir = @import("workdir.zig");
 pub const follow = @import("follow.zig");

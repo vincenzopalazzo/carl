@@ -46,6 +46,29 @@ carl daemon [--port p] [--bt-port p] [--route direct|proxy|tor|i2p] [--socks url
 
   The Tauri sidecar parses the `token:` line and presents it on every request.
 
+## CLI bridge (discovery file)
+
+At startup the daemon also writes `<config>/daemon.json` (mode 0600):
+
+```json
+{ "port": 8088, "token": "<hex>", "pid": 1234 }
+```
+
+This is how the CLI shares one reality with the GUI instead of running
+invisible parallel sessions:
+
+- `carl download <source>` forwards the add to the running daemon
+  (`POST /api/transfers`), inheriting the daemon's configured default route
+  unless `--proxy` was passed. The transfer is GUI-visible, persisted, and
+  resumed across restarts like any GUI-added transfer. `--standalone` or an
+  explicit `--output-dir` keeps the old in-process behavior.
+- `carl status` prints the daemon's transfers (`GET /api/state`) — the same
+  rows the GUI renders.
+
+The file is removed on clean shutdown; after `kill -9` the reader's
+authenticated liveness probe filters the stale file out and the CLI falls
+back to standalone sessions.
+
 ## Persistence
 
 The daemon persists its transfers, seeds, and editable settings (route +

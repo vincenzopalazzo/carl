@@ -75,7 +75,31 @@ pub fn main() !void {
         const port = parsePort(args[3..]);
         const want_nostr = parseFlagPresent(args[3..], "--nostr");
         const want_seed = parseFlagPresent(args[3..], "--seed");
-        try cmdDownload(allocator, source, output_dir, port, parseProxy(args[3..]), want_nostr, want_seed);
+        const proxy_opt = parseProxy(args[3..]);
+        // Share the download with the running daemon (GUI-visible, persisted,
+        // resumed across restarts) unless the user asked for a standalone
+        // in-process session or picked an explicit output dir the daemon
+        // wouldn't honor.
+        const want_standalone = parseFlagPresent(args[3..], "--standalone") or
+            parseFlag(args[3..], "--output-dir") != null;
+        if (!want_standalone) {
+            if (carl.daemon_client.read(allocator)) |disc_v| {
+                var disc = disc_v;
+                defer disc.deinit(allocator);
+                if (carl.daemon_client.forwardDownload(allocator, &disc, source, proxy_opt != null, want_nostr)) |res_v| {
+                    var res = res_v;
+                    defer res.deinit(allocator);
+                    try stdout.print("added to the running carl daemon as {s} (route: {s})\n", .{ res.id, res.route });
+                    try stdout.print("track it in the GUI or with `carl status`; pass --standalone to download in this process\n", .{});
+                    return;
+                } else |err| {
+                    log.warn("daemon add failed ({}); falling back to a standalone session", .{err});
+                }
+            }
+        }
+        try cmdDownload(allocator, source, output_dir, port, proxy_opt, want_nostr, want_seed);
+    } else if (std.mem.eql(u8, command, "status")) {
+        try cmdStatus(allocator);
     } else if (std.mem.eql(u8, command, "seed")) {
         if (args.len < 3) {
             log.err("usage: carl seed <file.torrent> [data-dir] [--port p] [--nostr] [--external-ip ip] [--tor-seed] [--tor-control addr] [--tor-cookie path] [--tor-onion-port p] [--tor-socks url] [--i2p-seed] [--i2p-sam host:port] [--description \"...\"]", .{});
@@ -151,12 +175,17 @@ fn printUsage() void {
         \\commands:
         \\  info <file.torrent>                              show torrent metadata
         \\  announce <file.torrent> [--proxy url]            query tracker for peers
-        \\  download <source> [--output-dir d] [--port p] [--proxy url] [--nostr] [--seed]
+        \\  download <source> [--output-dir d] [--port p] [--proxy url] [--nostr] [--seed] [--standalone]
         \\           source: file.torrent, magnet:?..., or http(s):// URL
+        \\           with a daemon running the download is added to it (GUI-visible,
+        \\           persisted); --standalone or an explicit --output-dir downloads
+        \\           in this process instead
         \\           --output-dir: defaults to the carl work dir (see below)
         \\           --nostr: also subscribe to nostr peer-announce events
         \\           --seed: keep seeding after the download completes
         \\                   (default: exit once the download is done)
+        \\  status                                           show the running daemon's transfers
+        \\                                                   (the same rows the GUI renders)
         \\  seed <file.torrent> [data-dir] [--port p] [--proxy url] [--nostr] [--external-ip <ip>]
         \\           [--tor-seed] [--tor-control host:port] [--tor-cookie path]
         \\           [--tor-onion-port p] [--tor-socks url]
@@ -309,6 +338,96 @@ fn cmdAnnounce(allocator: std.mem.Allocator, stdout: anytype, path: []const u8, 
             peer.ip[0], peer.ip[1], peer.ip[2], peer.ip[3], peer.port,
         });
     }
+}
+
+/// `carl status`: print the running daemon's transfers — the same rows the
+/// GUI renders — so the CLI and the desktop app share one view of the world.
+fn cmdStatus(allocator: std.mem.Allocator) !void {
+    const stdout = std.fs.File.stdout().deprecatedWriter();
+    var disc = carl.daemon_client.read(allocator) orelse {
+        try stdout.print("no carl daemon running (start one with `carl daemon` or the desktop app)\n", .{});
+        return;
+    };
+    defer disc.deinit(allocator);
+
+    const body = carl.daemon_client.fetch(allocator, &disc, "GET", "/api/state", null) catch |err| {
+        log.err("could not read daemon state: {}", .{err});
+        std.process.exit(1);
+    };
+    defer allocator.free(body);
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        log.err("could not parse daemon state", .{});
+        std.process.exit(1);
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+
+    const obj = parsed.value.object;
+    var route: []const u8 = "?";
+    var download_dir: []const u8 = "?";
+    if (obj.get("settings")) |s| {
+        if (s == .object) {
+            if (s.object.get("route")) |r| {
+                if (r == .string) route = r.string;
+            }
+            if (s.object.get("downloadDir")) |d| {
+                if (d == .string) download_dir = d.string;
+            }
+        }
+    }
+    try stdout.print("daemon http://127.0.0.1:{d} (route: {s}) - download dir: {s}\n", .{ disc.port, route, download_dir });
+
+    const transfers_v = obj.get("transfers") orelse {
+        try stdout.print("no transfers\n", .{});
+        return;
+    };
+    if (transfers_v != .array or transfers_v.array.items.len == 0) {
+        try stdout.print("no transfers\n", .{});
+        return;
+    }
+    try stdout.print("{s:<5} {s:<12} {s:>4} {s:>11} {s:>11} {s:>6} {s:>6} {s:<10} {s}\n", .{ "ID", "STATUS", "PCT", "DOWN", "UP", "PEERS", "SEEDS", "ETA", "NAME" });
+    for (transfers_v.array.items) |t| {
+        if (t != .object) continue;
+        const tobj = t.object;
+        const id = jsonStr(tobj, "id") orelse "?";
+        const name = jsonStr(tobj, "name") orelse "?";
+        const status = jsonStr(tobj, "status") orelse "?";
+        const eta = jsonStr(tobj, "eta") orelse "-";
+        const pct = jsonInt(tobj, "pct") orelse 0;
+        const down = jsonInt(tobj, "down") orelse 0;
+        const up = jsonInt(tobj, "up") orelse 0;
+        const peers = jsonInt(tobj, "peers") orelse 0;
+        const seeds = jsonInt(tobj, "seeds") orelse 0;
+        var down_buf: [24]u8 = undefined;
+        var up_buf: [24]u8 = undefined;
+        try stdout.print("{s:<5} {s:<12} {d:>3}% {s:>11} {s:>11} {d:>6} {d:>6} {s:<10} {s}\n", .{
+            id, status, pct, humanRate(&down_buf, down), humanRate(&up_buf, up), peers, seeds, eta, name,
+        });
+    }
+}
+
+fn jsonStr(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const v = obj.get(key) orelse return null;
+    if (v != .string) return null;
+    return v.string;
+}
+
+fn jsonInt(obj: std.json.ObjectMap, key: []const u8) ?u64 {
+    const v = obj.get(key) orelse return null;
+    return switch (v) {
+        .integer => |i| if (i >= 0) @intCast(i) else null,
+        else => null,
+    };
+}
+
+/// "72.5 KB/s" style, into a caller buffer.
+fn humanRate(buf: []u8, bytes_per_s: u64) []const u8 {
+    const units = [_][]const u8{ "B/s", "KB/s", "MB/s", "GB/s" };
+    var v: f64 = @floatFromInt(bytes_per_s);
+    var unit: usize = 0;
+    while (v >= 1024 and unit < units.len - 1) : (unit += 1) v /= 1024;
+    if (unit == 0) return std.fmt.bufPrint(buf, "{d} {s}", .{ bytes_per_s, units[unit] }) catch "?";
+    return std.fmt.bufPrint(buf, "{d:.1} {s}", .{ v, units[unit] }) catch "?";
 }
 
 fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []const u8, port: u16, proxy: ?carl.proxy.Proxy, want_nostr: bool, want_seed: bool) !void {
@@ -1303,6 +1422,13 @@ fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u
     try stdout.print("listen: http://127.0.0.1:{d}\n", .{port});
     try stdout.print("token: {s}\n", .{token});
     try stdout.print("route: {s}\n", .{route_str});
+
+    // Publish the CLI discovery file so `carl download` / `carl status` can
+    // find (and authenticate to) this daemon. Removed on clean shutdown; a
+    // stale file after kill -9 is filtered by the reader's liveness probe.
+    carl.daemon_client.writeDiscovery(allocator, port, token) catch |err|
+        log.warn("could not write the CLI discovery file: {} — carl download/status won't find this daemon", .{err});
+    defer carl.daemon_client.removeDiscovery(allocator);
 
     // On a proxy/tor route, check the SOCKS proxy up front and say clearly why
     // it's unreachable (the daemon keeps running and the GUI shows live health).
