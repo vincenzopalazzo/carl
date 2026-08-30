@@ -2235,8 +2235,11 @@ pub const Session = struct {
         // Stamp even on failure so a down tracker cannot re-fire every
         // maintenance tick (the interval check is `now - last_announce_time`).
         // Back off at least 60s; keep a previously-clamped interval if larger.
+        // Clear src_tracker_state so the GUI does not keep showing "working"
+        // from an earlier success for the whole backoff (review on PR #96).
         self.last_announce_time = std.time.timestamp();
         if (self.tracker_interval < 60) self.tracker_interval = 60;
+        self.src_tracker_state.store(0, .monotonic);
         self.src_last_announce_s.store(self.last_announce_time, .monotonic);
         self.src_announce_interval_s.store(@intCast(self.tracker_interval), .monotonic);
 
