@@ -84,50 +84,68 @@ pub fn main() !void {
             parseFlag(args[3..], "--output-dir") != null or
             parseFlag(args[3..], "--port") != null;
         if (!want_standalone) {
-            if (carl.daemon_client.read(allocator)) |disc_v| {
-                var disc = disc_v;
-                defer disc.deinit(allocator);
-                // A local .torrent path must be absolute before forwarding:
-                // the daemon's cwd is unrelated to the CLI's (the desktop
-                // sidecar's is /), so a relative path would fail to open
-                // there even though it's valid here.
-                var forward_source = source;
-                var abs_owned: ?[]u8 = null;
-                defer if (abs_owned) |p| allocator.free(p);
-                if (!std.mem.startsWith(u8, source, "magnet:") and
-                    !std.mem.startsWith(u8, source, "http://") and
-                    !std.mem.startsWith(u8, source, "https://") and
-                    !std.fs.path.isAbsolute(source))
-                {
-                    abs_owned = std.fs.cwd().realpathAlloc(allocator, source) catch null;
-                    if (abs_owned) |p| forward_source = p;
-                }
-                if (carl.daemon_client.forwardDownload(allocator, &disc, forward_source, proxy_opt != null, want_nostr)) |res_v| {
-                    var res = res_v;
-                    defer res.deinit(allocator);
-                    try stdout.print("added to the running carl daemon as {s} (route: {s})\n", .{ res.id, res.route });
-                    try stdout.print("track it in the GUI or with `carl status`; pass --standalone to download in this process\n", .{});
-                    return;
-                } else |err| switch (err) {
-                    // The swarm is already live on another route (daemon said
-                    // 409). Falling back to a standalone session would race
-                    // the daemon on the same files — refuse instead.
-                    error.Conflict => {
-                        log.err("this swarm is already downloading on a different route; remove it from the daemon first (or use --standalone to force a separate copy)", .{});
+            probe: switch (carl.daemon_client.probe(allocator)) {
+                // No daemon (or a stale file): standalone is safe.
+                .none => break :probe,
+                // Something alive is failing the probe (auth rejected, not
+                // answering): falling back to standalone could turn a
+                // temporary daemon problem into a clearnet download on an
+                // anonymizing setup. Fail closed unless the user explicitly
+                // chose a route or standalone mode... --proxy implies they
+                // know what they're doing; anything else aborts.
+                .fail_closed => {
+                    if (proxy_opt == null) {
+                        log.err("a carl daemon appears to be running but is not answering correctly; refusing to fall back to a clearnet standalone session. Retry, or use --proxy <url> / --standalone", .{});
                         std.process.exit(1);
-                    },
-                    // Couldn't learn the daemon's route: forwarding "direct"
-                    // would silently de-anonymize. Only proceed standalone
-                    // when the user picked the route explicitly (--proxy).
-                    error.RouteUnreadable => {
-                        if (proxy_opt == null) {
-                            log.err("could not read the daemon's route; refusing to fall back to a clearnet standalone session. Re-run with --proxy <url> or --standalone", .{});
+                    }
+                    log.warn("daemon probe failed; using the explicit --proxy for a standalone session", .{});
+                    break :probe;
+                },
+                .daemon => |disc_v| {
+                    var disc = disc_v;
+                    defer disc.deinit(allocator);
+                    // A local .torrent path must be absolute before forwarding:
+                    // the daemon's cwd is unrelated to the CLI's (the desktop
+                    // sidecar's is /), so a relative path would fail to open
+                    // there even though it's valid here.
+                    var forward_source = source;
+                    var abs_owned: ?[]u8 = null;
+                    defer if (abs_owned) |p| allocator.free(p);
+                    if (!std.mem.startsWith(u8, source, "magnet:") and
+                        !std.mem.startsWith(u8, source, "http://") and
+                        !std.mem.startsWith(u8, source, "https://") and
+                        !std.fs.path.isAbsolute(source))
+                    {
+                        abs_owned = std.fs.cwd().realpathAlloc(allocator, source) catch null;
+                        if (abs_owned) |p| forward_source = p;
+                    }
+                    if (carl.daemon_client.forwardDownload(allocator, &disc, forward_source, proxy_opt != null, want_nostr)) |res_v| {
+                        var res = res_v;
+                        defer res.deinit(allocator);
+                        try stdout.print("added to the running carl daemon as {s} (route: {s})\n", .{ res.id, res.route });
+                        try stdout.print("track it in the GUI or with `carl status`; pass --standalone to download in this process\n", .{});
+                        return;
+                    } else |err| switch (err) {
+                        // The swarm is already live on another route (daemon said
+                        // 409). Falling back to a standalone session would race
+                        // the daemon on the same files — refuse instead.
+                        error.Conflict => {
+                            log.err("this swarm is already downloading on a different route; remove it from the daemon first (or use --standalone to force a separate copy)", .{});
                             std.process.exit(1);
-                        }
-                        log.warn("daemon route unreadable; using the explicit --proxy for a standalone session", .{});
-                    },
-                    else => log.warn("daemon add failed ({}); falling back to a standalone session", .{err}),
-                }
+                        },
+                        // Couldn't learn the daemon's route: forwarding "direct"
+                        // would silently de-anonymize. Only proceed standalone
+                        // when the user picked the route explicitly (--proxy).
+                        error.RouteUnreadable => {
+                            if (proxy_opt == null) {
+                                log.err("could not read the daemon's route; refusing to fall back to a clearnet standalone session. Re-run with --proxy <url> or --standalone", .{});
+                                std.process.exit(1);
+                            }
+                            log.warn("daemon route unreadable; using the explicit --proxy for a standalone session", .{});
+                        },
+                        else => log.warn("daemon add failed ({}); falling back to a standalone session", .{err}),
+                    }
+                },
             }
         }
         try cmdDownload(allocator, source, output_dir, port, proxy_opt, want_nostr, want_seed);

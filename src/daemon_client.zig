@@ -48,9 +48,14 @@ pub fn discoveryPath(a: Allocator) ![]u8 {
 
 /// Daemon side: publish the discovery file (0600 — it carries the auth token).
 /// Best-effort: a daemon that can't write it still serves; only the CLI
-/// integration degrades (to standalone sessions).
+/// integration degrades (to standalone sessions). ensureConfigDir first: on
+/// a fresh profile the config dir may not exist yet, and createFile's plain
+/// FileNotFound would leave the daemon undiscoverable for its whole lifetime
+/// (review on PR #92).
 pub fn writeDiscovery(a: Allocator, port: u16, token: []const u8) !void {
-    const path = try discoveryPath(a);
+    const dir = try nostr_config.ensureConfigDir(a);
+    defer a.free(dir);
+    const path = try std.fmt.allocPrint(a, "{s}/daemon.json", .{dir});
     defer a.free(path);
     var j = api.Json.init(a);
     defer j.buf.deinit(a);
@@ -86,35 +91,60 @@ pub fn removeDiscovery(a: Allocator) void {
     std.fs.cwd().deleteFile(path) catch {};
 }
 
+/// What the discovery probe found. Distinguishing these matters for the
+/// download path's fail-closed behavior (review on PR #92).
+pub const Probe = union(enum) {
+    /// No file, an unreadable file, or a stale one (the port refuses
+    /// connections — the daemon is simply gone). Falling back to a
+    /// standalone session is safe.
+    none,
+    /// A live daemon answered the authenticated liveness probe.
+    daemon: Discovery,
+    /// The file is valid and *something* is listening, but the probe failed:
+    /// auth rejected (another daemon owns the port), a non-answer, a shed
+    /// connection. Treating this as "no daemon" would silently convert a
+    /// temporary daemon problem into a clearnet standalone download on an
+    /// anonymizing setup — the caller must fail closed instead.
+    fail_closed,
+};
+
+/// Read and validate the discovery file, probing liveness.
+pub fn probe(a: Allocator) Probe {
+    const path = discoveryPath(a) catch return .none;
+    defer a.free(path);
+    const data = std.fs.cwd().readFileAlloc(a, path, 4096) catch return .none;
+    defer a.free(data);
+    const parsed = std.json.parseFromSlice(std.json.Value, a, data, .{}) catch return .none;
+    defer parsed.deinit();
+    if (parsed.value != .object) return .none;
+    const obj = parsed.value.object;
+    const port_v = obj.get("port") orelse return .none;
+    const token_v = obj.get("token") orelse return .none;
+    if (port_v != .integer or token_v != .string) return .none;
+    const pid_v = obj.get("pid");
+    var disc: Discovery = .{
+        .port = @intCast(port_v.integer),
+        .token = a.dupe(u8, token_v.string) catch return .none,
+        .pid = if (pid_v != null and pid_v.? == .integer) @intCast(pid_v.?.integer) else 0,
+    };
+    // Liveness: an authenticated GET must succeed. A refused connection means
+    // the file is stale; anything else means something is alive but broken.
+    const body = fetch(a, &disc, "GET", "/api/transfers", null) catch |err| {
+        disc.deinit(a);
+        return if (err == error.DaemonUnreachable) .none else .fail_closed;
+    };
+    a.free(body);
+    return .{ .daemon = disc };
+}
+
 /// Read and validate the discovery file: the daemon must answer an
 /// authenticated request on the published port (this is also the liveness
 /// probe). Returns null when no usable daemon is around.
 pub fn read(a: Allocator) ?Discovery {
-    const path = discoveryPath(a) catch return null;
-    defer a.free(path);
-    const data = std.fs.cwd().readFileAlloc(a, path, 4096) catch return null;
-    defer a.free(data);
-    const parsed = std.json.parseFromSlice(std.json.Value, a, data, .{}) catch return null;
-    defer parsed.deinit();
-    if (parsed.value != .object) return null;
-    const obj = parsed.value.object;
-    const port_v = obj.get("port") orelse return null;
-    const token_v = obj.get("token") orelse return null;
-    if (port_v != .integer or token_v != .string) return null;
-    const pid_v = obj.get("pid");
-    var disc: Discovery = .{
-        .port = @intCast(port_v.integer),
-        .token = a.dupe(u8, token_v.string) catch return null,
-        .pid = if (pid_v != null and pid_v.? == .integer) @intCast(pid_v.?.integer) else 0,
+    return switch (probe(a)) {
+        .daemon => |d| d,
+        else => null,
     };
-    // Liveness: an authenticated GET must succeed, otherwise the file is
-    // stale (or something else owns the port now).
-    const body = fetch(a, &disc, "GET", "/api/transfers", null) catch {
-        disc.deinit(a);
-        return null;
-    };
-    a.free(body);
-    return disc;
 }
 
 pub const ForwardResult = struct {
@@ -187,6 +217,13 @@ pub fn fetch(a: Allocator, disc: *const Discovery, method: []const u8, path: []c
     const addr = try std.net.Address.parseIp4("127.0.0.1", disc.port);
     const stream = std.net.tcpConnectToAddress(addr) catch return error.DaemonUnreachable;
     defer stream.close();
+    // Idle timeout on reads: if a stale file's port was reused by a service
+    // that accepts but never answers, read() would otherwise block forever
+    // and `carl status`/`carl download` would hang (review on PR #92). 30s
+    // exceeds the daemon's 20s interim-response interval, so a slow but
+    // healthy daemon never trips it.
+    const rcvtimeo = std.posix.timeval{ .sec = 30, .usec = 0 };
+    std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&rcvtimeo)) catch {};
 
     var req: std.ArrayList(u8) = .empty;
     defer req.deinit(a);
@@ -209,7 +246,10 @@ pub fn fetch(a: Allocator, disc: *const Discovery, method: []const u8, path: []c
     defer raw.deinit(a);
     var chunk: [16384]u8 = undefined;
     while (raw.items.len < max_response_bytes) {
-        const n = try stream.read(&chunk);
+        const n = stream.read(&chunk) catch |err| switch (err) {
+            error.WouldBlock => return error.Timeout, // idle read timeout
+            else => return error.ReadFailed,
+        };
         if (n == 0) break;
         try raw.appendSlice(a, chunk[0..n]);
     }
