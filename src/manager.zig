@@ -1932,7 +1932,7 @@ fn broadcastIfNew(mt: *ManagedTransfer) void {
 
     // One-shot publish gate: honor the skip list as long as it leaves at
     // least one relay to ask, otherwise dial anyway.
-    const gate = relay_mod.oneShotGate(relay_urls);
+    const gate = relay_mod.oneShotGate(relay_urls, mt.proxy);
     for (relay_urls) |url| {
         var r = relay_mod.dial(a, url, mt.proxy, gate) catch continue;
         defer r.deinit();

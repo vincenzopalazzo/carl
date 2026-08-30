@@ -860,7 +860,7 @@ fn publishAnnounce(a: Allocator, info_hash: [20]u8, endpoint: AnnounceEndpoint) 
     defer nostr_config.freeRelays(a, relay_urls);
 
     var acks: usize = 0;
-    const gate = relay_mod.oneShotGate(relay_urls);
+    const gate = relay_mod.oneShotGate(relay_urls, null);
     for (relay_urls) |url| {
         var r = relay_mod.dial(a, url, null, gate) catch continue;
         defer r.deinit();

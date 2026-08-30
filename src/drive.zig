@@ -726,7 +726,7 @@ pub const Drive = struct {
 
         const relay_urls = nostr_config.readRelays(a) catch return;
         var acks: usize = 0;
-        const gate = relay_mod.oneShotGate(relay_urls);
+        const gate = relay_mod.oneShotGate(relay_urls, null);
         for (relay_urls) |url| {
             if (self.stopping()) break;
             var r = relay_mod.dial(a, url, null, gate) catch |err| {
