@@ -86,7 +86,22 @@ pub fn main() !void {
             if (carl.daemon_client.read(allocator)) |disc_v| {
                 var disc = disc_v;
                 defer disc.deinit(allocator);
-                if (carl.daemon_client.forwardDownload(allocator, &disc, source, proxy_opt != null, want_nostr)) |res_v| {
+                // A local .torrent path must be absolute before forwarding:
+                // the daemon's cwd is unrelated to the CLI's (the desktop
+                // sidecar's is /), so a relative path would fail to open
+                // there even though it's valid here.
+                var forward_source = source;
+                var abs_owned: ?[]u8 = null;
+                defer if (abs_owned) |p| allocator.free(p);
+                if (!std.mem.startsWith(u8, source, "magnet:") and
+                    !std.mem.startsWith(u8, source, "http://") and
+                    !std.mem.startsWith(u8, source, "https://") and
+                    !std.fs.path.isAbsolute(source))
+                {
+                    abs_owned = std.fs.cwd().realpathAlloc(allocator, source) catch null;
+                    if (abs_owned) |p| forward_source = p;
+                }
+                if (carl.daemon_client.forwardDownload(allocator, &disc, forward_source, proxy_opt != null, want_nostr)) |res_v| {
                     var res = res_v;
                     defer res.deinit(allocator);
                     try stdout.print("added to the running carl daemon as {s} (route: {s})\n", .{ res.id, res.route });

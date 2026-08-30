@@ -665,7 +665,14 @@ const Conn = struct {
             return self.sendStatus(.bad_request);
         const obj = if (parsed.value == .object) parsed.value.object else return self.sendStatus(.bad_request);
         const source = strField(obj, "source") orelse return self.sendStatus(.bad_request);
-        const route_val = api.Route.parse(strField(obj, "route") orelse "direct") orelse .direct;
+        // An unknown route string is a 400, never a silent downgrade to
+        // direct: the CLI forwards the daemon's own settings route verbatim,
+        // and a version-skewed value must fail closed, not go clearnet.
+        const route_str = strField(obj, "route") orelse "direct";
+        const route_val = api.Route.parse(route_str) orelse {
+            log.warn("addTransfer: unknown route '{s}'", .{route_str});
+            return self.sendStatus(.bad_request);
+        };
         const want_nostr = if (obj.get("nostr")) |v| (v == .bool and v.bool) else false;
 
         const id = self.daemon.manager.addTransfer(source, route_val, want_nostr) catch |err| {

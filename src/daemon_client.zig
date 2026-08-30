@@ -61,6 +61,10 @@ pub fn writeDiscovery(a: Allocator, port: u16, token: []const u8) !void {
     try j.endObject();
     var f = try std.fs.cwd().createFile(path, .{ .truncate = true, .mode = 0o600 });
     defer f.close();
+    // createFile's mode only applies to newly created files; a pre-existing
+    // permissive daemon.json would keep its bits while we rewrite the token
+    // it carries. Reassert 0600 on every write.
+    f.chmod(0o600) catch {};
     try f.writeAll(j.buf.items);
 }
 
@@ -159,6 +163,10 @@ fn daemonRoute(a: Allocator, disc: *const Discovery) ![]u8 {
     if (settings != .object) return error.RouteUnreadable;
     const route = settings.object.get("route") orelse return error.RouteUnreadable;
     if (route != .string) return error.RouteUnreadable;
+    // Validate before forwarding: a version-skewed daemon could answer a
+    // route string this build doesn't know, and forwarding it verbatim would
+    // hit the daemon's lenient parse. Unknown fails closed.
+    if (api.Route.parse(route.string) == null) return error.RouteUnreadable;
     return a.dupe(u8, route.string);
 }
 
