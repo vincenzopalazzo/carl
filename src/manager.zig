@@ -68,12 +68,14 @@ pub const Error = error{
     /// publisher with no local Nostr identity, or the same drive (role,
     /// author, name, dir) is already running.
     InvalidDrive,
-    /// The swarm is already live on a *different* route. Returning the
-    /// existing transfer here would look like the add succeeded while the
-    /// session keeps making connections on the old route — a silent privacy
-    /// downgrade when the old route is less anonymous than the requested one.
-    /// Fails closed: the caller must remove the existing transfer first.
-    DuplicateRouteMismatch,
+    /// The swarm is already live but with *different behavior* (route, or
+    /// Nostr opt-in). Returning the existing transfer here would look like
+    /// the add succeeded while the session keeps the old behavior — a silent
+    /// privacy downgrade when the old route is less anonymous, or a GUI that
+    /// shows a Nostr source the live session never subscribed to (the
+    /// discovery callback is only installed at spawn). Fails closed: the
+    /// caller must remove the existing transfer first.
+    DuplicateMismatch,
 } || Allocator.Error;
 
 /// Daemon-level configuration mirrored to the Settings screen. String fields
@@ -672,13 +674,13 @@ pub const Manager = struct {
         // info-hash, same download dir, one stalled). The check shares the
         // append's lock so two concurrent adds can't both win.
         if (self.findByInfoHashLocked(&mt.info_hash)) |existing| {
-            // Same swarm, different route: succeeding silently would leave the
-            // traffic on the old (possibly less anonymous) route while the
-            // caller believes the new route applies. Refuse instead.
-            if (existing.route != route) {
+            // Same swarm, different behavior (route or Nostr opt-in):
+            // succeeding silently would leave the session on the old behavior
+            // while the caller believes the new one applies. Refuse instead.
+            if (existing.route != route or existing.want_nostr != want_nostr) {
                 self.mutex.unlock();
                 mt.destroy();
-                return error.DuplicateRouteMismatch;
+                return error.DuplicateMismatch;
             }
             const dup = self.allocator.dupe(u8, existing.id) catch {
                 self.mutex.unlock();

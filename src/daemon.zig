@@ -660,11 +660,12 @@ const Conn = struct {
         const want_nostr = if (obj.get("nostr")) |v| (v == .bool and v.bool) else false;
 
         const id = self.daemon.manager.addTransfer(source, route_val, want_nostr) catch |err| {
-            // The swarm is already live on another route: 409 so the caller
-            // learns the add did NOT switch the route (it must remove the
-            // existing transfer first) instead of believing it did.
-            if (err == error.DuplicateRouteMismatch) {
-                log.warn("addTransfer: swarm already live on a different route", .{});
+            // The swarm is already live with different behavior (route or
+            // Nostr opt-in): 409 so the caller learns the add did NOT apply
+            // the new settings (it must remove the existing transfer first)
+            // instead of believing it did.
+            if (err == error.DuplicateMismatch) {
+                log.warn("addTransfer: swarm already live on a different route/nostr setting", .{});
                 return self.sendStatus(.conflict);
             }
             log.warn("addTransfer failed: {}", .{err});
