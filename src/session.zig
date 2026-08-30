@@ -1083,23 +1083,21 @@ pub const Session = struct {
                             p.enqueueMessage(.{ .bitfield = self.our_bitfield.rawBytes() }) catch {};
                         }
 
-                        // Send BEP 10 extension handshake if peer supports it
+                        // Send BEP 10 extension handshake if peer supports it.
+                        // Omit `p` (listen port) on anonymized transports: we
+                        // do not accept incoming peers, and advertising the
+                        // configured listenPort is a fingerprint.
                         if (p.supports_extensions) {
                             const ms = if (self.meta.raw_info.len > 0)
                                 std.math.cast(u32, self.meta.raw_info.len)
                             else
                                 null;
-                            const ext_hs = extension.buildExtensionHandshake(self.allocator, ms, self.listen_port) catch null;
+                            const advertised_port: ?u16 = if (self.anonymized()) null else self.listen_port;
+                            const ext_hs = extension.buildExtensionHandshake(self.allocator, ms, advertised_port) catch null;
                             if (ext_hs) |hs_payload| {
                                 defer self.allocator.free(hs_payload);
                                 p.enqueueMessage(.{ .extended = hs_payload }) catch {};
                             }
-                        }
-
-                        // Some strict clients stall
-                        // (never unchoke) waiting for a bitfield that never comes.
-                        if (self.num_pieces > 0) {
-                            p.enqueueMessage(.{ .bitfield = self.our_bitfield.rawBytes() }) catch {};
                         }
 
                         // Only express interest once we know the piece layout
@@ -2188,7 +2186,11 @@ pub const Session = struct {
         const req = tracker_mod.AnnounceRequest{
             .info_hash = self.info_hash,
             .peer_id = self.peer_id,
-            .port = self.listen_port,
+            // BEP 3: port 0 means "not listening". On any anonymized
+            // transport the inbound listener is closed (would leak the
+            // real IP), so advertising listenPort would tell the tracker
+            // and every peer-list consumer a port we will never accept.
+            .port = if (self.anonymized()) 0 else self.listen_port,
             .uploaded = self.uploaded,
             .downloaded = self.downloaded,
             .left = self.computeLeft(),
