@@ -2149,8 +2149,11 @@ pub const Session = struct {
                 self.doMultiTrackerAnnounce(.none) catch {};
             }
 
-            // DHT: retry more aggressively when we have zero peers
-            if (self.peers.items.len == 0 and now - self.last_announce_time > 30) {
+            // DHT: retry when we have zero peers. tryDhtPeerDiscovery has its
+            // own in-flight / retry_after gate — do NOT key this off
+            // last_announce_time, which is the tracker-failure backoff and
+            // can be 60s–6h (review on PR #96).
+            if (self.peers.items.len == 0) {
                 self.tryDhtPeerDiscovery() catch {};
             }
         }
@@ -2322,16 +2325,14 @@ pub const Session = struct {
     }
 
     fn connectToPeers(self: *Session, peer_list: []const tracker_mod.Peer) !void {
-        // Clearnet and SOCKS5/SOCKS5h connects are non-blocking (`startConnect`
-        // returns after sending CONNECT; the poll loop finishes the circuit).
-        // HTTP CONNECT proxies still handshake synchronously, so keep a small
-        // per-call cap there. The peer-pool cap (`max_peers`) is the real bound.
-        const max_attempts: usize = blk: {
-            if (self.proxy) |px| {
-                if (px.scheme == .http) break :blk 10;
-            }
-            break :blk 200;
-        };
+        // Clearnet connects are non-blocking (`startConnect` returns on
+        // EINPROGRESS). SOCKS5/SOCKS5h finish the CONNECT *reply* on the poll
+        // loop, but the local TCP+method/auth handshake still blocks in
+        // `connectThroughProxyAddrStart` (up to proxy_timeout_secs). A stalled
+        // proxy would freeze the session for N × 10s, so keep a small cap on
+        // any proxied attempt; HTTP CONNECT is fully synchronous too.
+        // The peer-pool cap (`max_peers`) is the real bound on clearnet.
+        const max_attempts: usize = if (self.proxy != null) 10 else 200;
         var attempts: usize = 0;
 
         // Rotate start offset so repeated announces don't always retry
