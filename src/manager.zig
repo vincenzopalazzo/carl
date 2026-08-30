@@ -1157,7 +1157,7 @@ pub const Manager = struct {
     /// Locked snapshot of the configured default route. Connection threads
     /// must not read `cfg.route` directly — `setRoute` writes it under this
     /// mutex (review on PR #98).
-    pub fn route(self: *Manager) api.Route {
+    pub fn configuredRoute(self: *Manager) api.Route {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.cfg.route;
