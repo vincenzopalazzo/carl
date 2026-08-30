@@ -719,9 +719,6 @@ pub const Session = struct {
 
     fn buildPeerInfo(self: *Session, p: *peer_mod.PeerConnection) Allocator.Error!PeerInfo {
         var addr_owned: []u8 = undefined;
-        // On any later failure the partially built row must not leak —
-        // publishPeerSnap runs every second, so a leak here compounds.
-        errdefer self.allocator.free(addr_owned);
         var port: u16 = 0;
         var is_onion = false;
 
@@ -743,6 +740,12 @@ pub const Session = struct {
             addr_owned = try self.allocator.dupe(u8, formatted);
             port = p.address.getPort();
         }
+        // On any later failure the partially built row must not leak —
+        // publishPeerSnap runs every second, so a leak here compounds.
+        // Registered only now that addr_owned is definitely initialized:
+        // registering it earlier would free an undefined slice when the
+        // dupe itself is what fails (review on PR #93).
+        errdefer self.allocator.free(addr_owned);
 
         var client_buf: [64]u8 = undefined;
         const client_src: []const u8 = if (p.client_name) |name|
