@@ -702,7 +702,9 @@ pub const Session = struct {
         const snap = self.allocator.alloc(PeerInfo, count) catch return;
         var written: usize = 0;
         for (self.peers.items) |p| {
-            if (p.state == .disconnected) continue;
+            // Only fully handshaked peers belong in the GUI's peer list;
+            // connecting/handshaking attempts are churn, not connections.
+            if (p.state != .active) continue;
             snap[written] = self.buildPeerInfo(p) catch continue;
             written += 1;
         }
@@ -717,6 +719,9 @@ pub const Session = struct {
 
     fn buildPeerInfo(self: *Session, p: *peer_mod.PeerConnection) Allocator.Error!PeerInfo {
         var addr_owned: []u8 = undefined;
+        // On any later failure the partially built row must not leak —
+        // publishPeerSnap runs every second, so a leak here compounds.
+        errdefer self.allocator.free(addr_owned);
         var port: u16 = 0;
         var is_onion = false;
 
@@ -745,6 +750,7 @@ pub const Session = struct {
         else
             decodeClientName(&client_buf, p.peer_id);
         const client_owned = try self.allocator.dupe(u8, client_src);
+        errdefer self.allocator.free(client_owned);
 
         const peer_pct: u8 = if (p.peer_bitfield) |bf| blk: {
             if (self.num_pieces == 0) break :blk 0;
@@ -754,6 +760,7 @@ pub const Session = struct {
 
         var flags_buf: [4]u8 = undefined;
         const flags_owned = try self.allocator.dupe(u8, peerFlags(&flags_buf, p));
+        errdefer self.allocator.free(flags_owned);
 
         return .{
             .addr = addr_owned,
