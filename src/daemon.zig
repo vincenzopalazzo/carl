@@ -1389,7 +1389,7 @@ test "formatAge: buckets" {
 
 test "buildStateJson: produces the five top-level keys" {
     const a = testing.allocator;
-    var mgr = try manager_mod.Manager.init(a, .{});
+    var mgr = try manager_mod.Manager.init(a, .{ .persist = false });
     defer mgr.deinit();
     var d = Daemon{ .allocator = a, .manager = &mgr, .token = "tok" };
 
