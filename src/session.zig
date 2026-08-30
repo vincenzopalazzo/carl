@@ -2229,6 +2229,14 @@ pub const Session = struct {
             self.tryDhtPeerDiscovery() catch {};
         }
 
+        // Stamp even on failure so a down tracker cannot re-fire every
+        // maintenance tick (the interval check is `now - last_announce_time`).
+        // Back off at least 60s; keep a previously-clamped interval if larger.
+        self.last_announce_time = std.time.timestamp();
+        if (self.tracker_interval < 60) self.tracker_interval = 60;
+        self.src_last_announce_s.store(self.last_announce_time, .monotonic);
+        self.src_announce_interval_s.store(@intCast(self.tracker_interval), .monotonic);
+
         return error.TrackerFailed;
     }
 
@@ -2270,14 +2278,14 @@ pub const Session = struct {
             return;
         }
 
-        self.tracker_interval = resp.interval;
+        self.tracker_interval = tracker_mod.clampInterval(resp.interval, resp.min_interval);
         self.last_announce_time = std.time.timestamp();
 
         // Publish source snapshot data for cross-thread reads.
         self.src_tracker_state.store(1, .monotonic);
         self.src_seeders.store(@intCast(resp.complete orelse 0), .monotonic);
         self.src_leechers.store(@intCast(resp.incomplete orelse 0), .monotonic);
-        self.src_announce_interval_s.store(@intCast(resp.interval), .monotonic);
+        self.src_announce_interval_s.store(@intCast(self.tracker_interval), .monotonic);
         self.src_last_announce_s.store(self.last_announce_time, .monotonic);
 
         const stderr = std.fs.File.stderr().deprecatedWriter();
@@ -2314,15 +2322,16 @@ pub const Session = struct {
     }
 
     fn connectToPeers(self: *Session, peer_list: []const tracker_mod.Peer) !void {
-        // Each proxied connection attempt takes ~10s through Tor (SOCKS
-        // handshake + circuit). Trying all 50 peers serially would block
-        // the session thread for minutes. Cap attempts per call; the
-        // tracker re-announce cycle gradually fills the peer pool.
-        // Clearnet connects are now non-blocking (startConnect returns on
-        // EINPROGRESS), so attempting the whole tracker response is cheap —
-        // the peer-pool cap (max_peers) bounds how many sockets we hold. Proxied
-        // connects still block per attempt, so keep that cap small.
-        const max_attempts: usize = if (self.proxy != null) 10 else 200;
+        // Clearnet and SOCKS5/SOCKS5h connects are non-blocking (`startConnect`
+        // returns after sending CONNECT; the poll loop finishes the circuit).
+        // HTTP CONNECT proxies still handshake synchronously, so keep a small
+        // per-call cap there. The peer-pool cap (`max_peers`) is the real bound.
+        const max_attempts: usize = blk: {
+            if (self.proxy) |px| {
+                if (px.scheme == .http) break :blk 10;
+            }
+            break :blk 200;
+        };
         var attempts: usize = 0;
 
         // Rotate start offset so repeated announces don't always retry

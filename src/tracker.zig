@@ -65,6 +65,17 @@ pub const TrackerError = error{
     OutOfMemory,
 };
 
+/// BEP 3 `interval` is required, but a tracker can still send 0 (or a
+/// multi-hour value). 0 would re-announce every maintenance tick and, on a
+/// proxied session, block the event loop on a SOCKS GET forever. Floor at
+/// 60s (or the tracker's own min interval, whichever is larger) and cap at
+/// 6h so a broken tracker cannot silence us until restart.
+pub fn clampInterval(interval: u64, min_interval: ?u64) u64 {
+    const floor: u64 = @max(min_interval orelse 60, 60);
+    const raw = if (interval == 0) floor else interval;
+    return std.math.clamp(raw, floor, 6 * 60 * 60);
+}
+
 /// Build the full announce URL with query parameters.
 pub fn buildAnnounceUrl(
     allocator: Allocator,
@@ -546,4 +557,29 @@ test "udp as http url rewrite" {
         "http://tracker.example.com:1337/announce",
         udpAsHttpUrl(&buf, "udp://tracker.example.com:1337").?,
     );
+}
+
+test "clampInterval floors zero and honors min interval" {
+    try std.testing.expectEqual(@as(u64, 60), clampInterval(0, null));
+    try std.testing.expectEqual(@as(u64, 120), clampInterval(0, 120));
+    try std.testing.expectEqual(@as(u64, 1800), clampInterval(1800, null));
+    try std.testing.expectEqual(@as(u64, 900), clampInterval(60, 900));
+    try std.testing.expectEqual(@as(u64, 6 * 60 * 60), clampInterval(99_999, null));
+}
+
+test "build announce URL never includes ip= (no listen-IP leak)" {
+    const allocator = std.testing.allocator;
+    const url = try buildAnnounceUrl(allocator, "http://tracker.example.com/announce", .{
+        .info_hash = [_]u8{0} ** 20,
+        .peer_id = [_]u8{0} ** 20,
+        .port = 0,
+        .uploaded = 0,
+        .downloaded = 0,
+        .left = 1,
+        .compact = true,
+        .event = .none,
+    });
+    defer allocator.free(url);
+    try std.testing.expect(std.mem.indexOf(u8, url, "ip=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "&port=0") != null);
 }
