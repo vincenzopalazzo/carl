@@ -236,6 +236,14 @@ fn saveTo(
     }
 
     try exec(db, "COMMIT");
+
+    // Magnets, routes, follow pubkeys, drive dirs. sqlite3_open creates
+    // the file with the process umask (typically 0644). Re-assert 0600
+    // after every save so an existing world-readable db is tightened too.
+    if (std.fs.cwd().openFile(path, .{})) |f| {
+        defer f.close();
+        f.chmod(0o600) catch {};
+    } else |_| {}
 }
 
 /// Load persisted state, or null if no database exists yet. Caller frees via
@@ -429,6 +437,22 @@ test "sqlite save/load round-trips settings + transfers" {
     try testing.expect(st.transfers[0].nostr);
     try testing.expectEqual(Kind.seed, st.transfers[1].kind);
     try testing.expect(!st.transfers[1].nostr);
+}
+
+test "sqlite save creates the db with mode 0600" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/carl.db", .{dir}, 0);
+    defer a.free(path);
+
+    try saveTo(path, .proxy, "/home/u/dl", &.{}, &.{}, &.{});
+    var f = try std.fs.cwd().openFile(path, .{});
+    defer f.close();
+    const st = try f.stat();
+    try testing.expectEqual(@as(u32, 0o600), st.mode & 0o777);
 }
 
 test "sqlite save replaces prior transfers (no accumulation)" {
