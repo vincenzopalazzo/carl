@@ -48,7 +48,9 @@ carl daemon [--port p] [--bt-port p] [--route direct|proxy|tor|i2p] [--socks url
 
 ## CLI bridge (discovery file)
 
-At startup the daemon also writes `<config>/daemon.json` (mode 0600):
+Once its listen socket is bound (never before, so a colliding second daemon
+can't clobber the file and then die on the bind error) the daemon also
+writes `<config>/daemon.json` (mode 0600):
 
 ```json
 { "port": 8088, "token": "<hex>", "pid": 1234 }

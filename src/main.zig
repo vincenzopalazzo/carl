@@ -92,8 +92,25 @@ pub fn main() !void {
                     try stdout.print("added to the running carl daemon as {s} (route: {s})\n", .{ res.id, res.route });
                     try stdout.print("track it in the GUI or with `carl status`; pass --standalone to download in this process\n", .{});
                     return;
-                } else |err| {
-                    log.warn("daemon add failed ({}); falling back to a standalone session", .{err});
+                } else |err| switch (err) {
+                    // The swarm is already live on another route (daemon said
+                    // 409). Falling back to a standalone session would race
+                    // the daemon on the same files — refuse instead.
+                    error.Conflict => {
+                        log.err("this swarm is already downloading on a different route; remove it from the daemon first (or use --standalone to force a separate copy)", .{});
+                        std.process.exit(1);
+                    },
+                    // Couldn't learn the daemon's route: forwarding "direct"
+                    // would silently de-anonymize. Only proceed standalone
+                    // when the user picked the route explicitly (--proxy).
+                    error.RouteUnreadable => {
+                        if (proxy_opt == null) {
+                            log.err("could not read the daemon's route; refusing to fall back to a clearnet standalone session. Re-run with --proxy <url> or --standalone", .{});
+                            std.process.exit(1);
+                        }
+                        log.warn("daemon route unreadable; using the explicit --proxy for a standalone session", .{});
+                    },
+                    else => log.warn("daemon add failed ({}); falling back to a standalone session", .{err}),
                 }
             }
         }
@@ -1423,12 +1440,10 @@ fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u
     try stdout.print("token: {s}\n", .{token});
     try stdout.print("route: {s}\n", .{route_str});
 
-    // Publish the CLI discovery file so `carl download` / `carl status` can
-    // find (and authenticate to) this daemon. Removed on clean shutdown; a
-    // stale file after kill -9 is filtered by the reader's liveness probe.
-    carl.daemon_client.writeDiscovery(allocator, port, token) catch |err|
-        log.warn("could not write the CLI discovery file: {} — carl download/status won't find this daemon", .{err});
-    defer carl.daemon_client.removeDiscovery(allocator);
+    // The CLI discovery file (for `carl download` / `carl status`) is
+    // published by daemon.serve() once the listen socket is bound — writing
+    // it here would let a colliding second daemon clobber the file before
+    // its bind fails.
 
     // On a proxy/tor route, check the SOCKS proxy up front and say clearly why
     // it's unreachable (the daemon keeps running and the GUI shows live health).

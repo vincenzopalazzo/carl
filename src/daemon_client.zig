@@ -143,20 +143,22 @@ pub fn forwardDownload(a: Allocator, disc: *const Discovery, source: []const u8,
 }
 
 /// The daemon's configured default route (from GET /api/state -> settings).
-/// Doubles as a second liveness probe. Falls back to "direct" only when the
-/// state payload is unreadable.
+/// Doubles as a second liveness probe. Fails closed with
+/// error.RouteUnreadable when the route can't be determined: falling back to
+/// "direct" here would send a plain `carl download` onto the clearnet while
+/// the user believes the daemon anonymizes it.
 fn daemonRoute(a: Allocator, disc: *const Discovery) ![]u8 {
     const body = fetch(a, disc, "GET", "/api/state", null) catch
-        return a.dupe(u8, "direct");
+        return error.RouteUnreadable;
     defer a.free(body);
     const parsed = std.json.parseFromSlice(std.json.Value, a, body, .{}) catch
-        return a.dupe(u8, "direct");
+        return error.RouteUnreadable;
     defer parsed.deinit();
-    if (parsed.value != .object) return a.dupe(u8, "direct");
-    const settings = parsed.value.object.get("settings") orelse return a.dupe(u8, "direct");
-    if (settings != .object) return a.dupe(u8, "direct");
-    const route = settings.object.get("route") orelse return a.dupe(u8, "direct");
-    if (route != .string) return a.dupe(u8, "direct");
+    if (parsed.value != .object) return error.RouteUnreadable;
+    const settings = parsed.value.object.get("settings") orelse return error.RouteUnreadable;
+    if (settings != .object) return error.RouteUnreadable;
+    const route = settings.object.get("route") orelse return error.RouteUnreadable;
+    if (route != .string) return error.RouteUnreadable;
     return a.dupe(u8, route.string);
 }
 
@@ -194,14 +196,27 @@ pub fn fetch(a: Allocator, disc: *const Discovery, method: []const u8, path: []c
         try raw.appendSlice(a, chunk[0..n]);
     }
 
-    const header_end = std.mem.indexOf(u8, raw.items, "\r\n\r\n") orelse return error.BadResponse;
-    const head = raw.items[0..header_end];
-    // "HTTP/1.1 200 OK" — only the status code matters.
-    const sp1 = std.mem.indexOfScalar(u8, head, ' ') orelse return error.BadResponse;
-    const rest = head[sp1 + 1 ..];
-    const sp2 = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
-    const code = std.fmt.parseInt(u16, rest[0..sp2], 10) catch return error.BadResponse;
-    if (code == 401) return error.Unauthorized;
-    if (code < 200 or code >= 300) return error.HttpStatus;
-    return try a.dupe(u8, raw.items[header_end + 4 ..]);
+    // Walk header blocks: the daemon's keep-alive ticker emits interim
+    // `102 Processing` responses ahead of the final one on slow POSTs
+    // (anonymized adds can take minutes). Treating an interim 1xx as
+    // terminal made the CLI report failure for an add that later succeeded
+    // — and fall back to a standalone session duplicating it.
+    var pos: usize = 0;
+    while (true) {
+        const rel_end = std.mem.indexOfPos(u8, raw.items, pos, "\r\n\r\n") orelse return error.BadResponse;
+        const head = raw.items[pos..rel_end];
+        // "HTTP/1.1 200 OK" — only the status code matters.
+        const sp1 = std.mem.indexOfScalar(u8, head, ' ') orelse return error.BadResponse;
+        const rest = head[sp1 + 1 ..];
+        const sp2 = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+        const code = std.fmt.parseInt(u16, rest[0..sp2], 10) catch return error.BadResponse;
+        if (code >= 100 and code < 200) {
+            pos = rel_end + 4; // interim response: on to the final one
+            continue;
+        }
+        if (code == 401) return error.Unauthorized;
+        if (code == 409) return error.Conflict;
+        if (code < 200 or code >= 300) return error.HttpStatus;
+        return try a.dupe(u8, raw.items[rel_end + 4 ..]);
+    }
 }

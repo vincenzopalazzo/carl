@@ -22,6 +22,7 @@ const nostr_config = @import("nostr_config.zig");
 const proxy_mod = @import("proxy.zig");
 const i2p_sam = @import("i2p_sam.zig");
 const relay_mod = @import("relay.zig");
+const daemon_client = @import("daemon_client.zig");
 const nip35 = @import("nip35.zig");
 const nostr_mod = @import("nostr.zig");
 const secp = @import("secp.zig");
@@ -78,6 +79,14 @@ pub const Daemon = struct {
         const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
         var server = try addr.listen(.{ .reuse_address = true });
         defer server.deinit();
+
+        // Publish the CLI discovery file only now that the port is ours:
+        // writing it earlier let a second daemon started on an occupied port
+        // clobber the running daemon's file with a token it would reject,
+        // then die on the bind error — breaking `carl download`/`status`.
+        daemon_client.writeDiscovery(self.allocator, port, self.token) catch |err|
+            log.warn("could not write the CLI discovery file: {} — carl download/status won't find this daemon", .{err});
+        defer daemon_client.removeDiscovery(self.allocator);
 
         log.info("daemon listening on http://127.0.0.1:{d}", .{port});
 
