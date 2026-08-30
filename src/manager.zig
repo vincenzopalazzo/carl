@@ -68,6 +68,12 @@ pub const Error = error{
     /// publisher with no local Nostr identity, or the same drive (role,
     /// author, name, dir) is already running.
     InvalidDrive,
+    /// The swarm is already live on a *different* route. Returning the
+    /// existing transfer here would look like the add succeeded while the
+    /// session keeps making connections on the old route — a silent privacy
+    /// downgrade when the old route is less anonymous than the requested one.
+    /// Fails closed: the caller must remove the existing transfer first.
+    DuplicateRouteMismatch,
 } || Allocator.Error;
 
 /// Daemon-level configuration mirrored to the Settings screen. String fields
@@ -666,13 +672,28 @@ pub const Manager = struct {
         // info-hash, same download dir, one stalled). The check shares the
         // append's lock so two concurrent adds can't both win.
         if (self.findByInfoHashLocked(&mt.info_hash)) |existing| {
+            // Same swarm, different route: succeeding silently would leave the
+            // traffic on the old (possibly less anonymous) route while the
+            // caller believes the new route applies. Refuse instead.
+            if (existing.route != route) {
+                self.mutex.unlock();
+                mt.destroy();
+                return error.DuplicateRouteMismatch;
+            }
             const dup = self.allocator.dupe(u8, existing.id) catch {
                 self.mutex.unlock();
                 mt.destroy();
                 return error.OutOfMemory;
             };
+            // The transfer is live, so a retained copy of the same source (a
+            // spec that failed to re-add at startup) is stale: drop it now,
+            // under the lock as dropRetained requires, and persist — the
+            // early return would otherwise leave retryRetained re-adding it
+            // on every health tick forever.
+            self.dropRetained(source_src);
             self.mutex.unlock();
             mt.destroy();
+            self.persist();
             return dup;
         }
         self.transfers.append(self.allocator, mt) catch |err| {
