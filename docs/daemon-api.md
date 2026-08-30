@@ -41,10 +41,12 @@ carl daemon [--port p] [--bt-port p] [--route direct|proxy|tor|i2p] [--socks url
   carl daemon
   listen: http://127.0.0.1:8088
   token: <hex>
-  route: direct
+  route: <direct|proxy|tor|i2p>
   ```
 
-  The Tauri sidecar parses the `token:` line and presents it on every request.
+  `route:` is the route the daemon will actually use (persisted GUI setting
+  unless `--route` was explicit), printed after `restoreSettings`. The Tauri
+  sidecar parses the `token:` line and presents it on every request.
 
 ## CLI bridge (discovery file)
 
@@ -150,7 +152,10 @@ greeting only — no CONNECT, so it opens no upstream connection) and publishes
 ### `POST /api/transfers`
 
 Body: `{ "source": "<magnet|.torrent path|http(s) url>", "route": "direct|proxy|tor|i2p", "nostr": bool }`.
-Adds and starts a transfer. Returns `{ "id": "t<N>" }`. `400` on a bad source.
+`route` is optional: omitted inherits the daemon's configured default (the
+GUI-persisted / `--route` setting). A present-but-unknown string is `400`,
+never a silent fallback to `direct`. Adds and starts a transfer. Returns
+`{ "id": "t<N>" }`. `400` on a bad source.
 
 **Long-running POSTs (`/api/transfers`, `/api/seeds`, `/api/torrents`)** may
 block for minutes while the daemon builds an anonymized network session (Tor
