@@ -51,7 +51,7 @@ const SCHEMA =
     \\  id TEXT PRIMARY KEY, role TEXT, dir TEXT, name TEXT, author TEXT, also TEXT, route TEXT);
 ;
 
-pub const Error = error{ DbOpen, DbExec, DbPrepare } || Allocator.Error;
+pub const Error = error{ DbOpen, DbExec, DbPrepare, DbPerms } || Allocator.Error;
 
 pub const Kind = enum {
     download,
@@ -175,6 +175,17 @@ pub fn save(
     try saveTo(path, route, download_dir, specs, follows, drives);
 }
 
+/// Create `path` at 0600 if missing, or chmod an existing file to 0600.
+/// Fail-closed: a world-readable db we cannot restrict is a leak, not a
+/// warning (review on PR #100). Must run *before* sqlite3_open writes
+/// magnets/pubkeys, so a crash between COMMIT and chmod cannot leave
+/// secrets at 0644.
+fn restrictDbFile(path: [:0]const u8) Error!void {
+    var f = std.fs.cwd().createFile(path, .{ .truncate = false, .read = true, .mode = 0o600 }) catch return error.DbPerms;
+    defer f.close();
+    f.chmod(0o600) catch return error.DbPerms;
+}
+
 fn saveTo(
     path: [:0]const u8,
     route: api.Route,
@@ -183,6 +194,7 @@ fn saveTo(
     follows: []const FollowSpec,
     drives: []const DriveSpec,
 ) Error!void {
+    try restrictDbFile(path);
     const db = try open(path);
     defer _ = sqlite3_close(db);
 
@@ -237,13 +249,9 @@ fn saveTo(
 
     try exec(db, "COMMIT");
 
-    // Magnets, routes, follow pubkeys, drive dirs. sqlite3_open creates
-    // the file with the process umask (typically 0644). Re-assert 0600
-    // after every save so an existing world-readable db is tightened too.
-    if (std.fs.cwd().openFile(path, .{})) |f| {
-        defer f.close();
-        f.chmod(0o600) catch {};
-    } else |_| {}
+    // Re-assert after the write in case the journal/VACUUM path recreated
+    // the inode. Failure here is still a leak — surface it.
+    try restrictDbFile(path);
 }
 
 /// Load persisted state, or null if no database exists yet. Caller frees via
