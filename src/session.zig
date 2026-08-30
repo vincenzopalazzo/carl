@@ -2043,6 +2043,10 @@ pub const Session = struct {
             }
             // Publish per-file snapshot for the daemon's cross-thread reads.
             self.publishFileSnap();
+            // Publish the per-peer snapshot too — without this the daemon's
+            // peerSnapshot() always returned empty and the GUI's peer tab
+            // showed "No peers connected" while the swarm was fully connected.
+            self.publishPeerSnap();
             // Publish the DHT node count from the last completed lookup and
             // consume any peers it found (connects happen on this thread).
             if (self.dht_state) |st| {
