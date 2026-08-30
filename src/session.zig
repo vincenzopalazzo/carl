@@ -1638,10 +1638,18 @@ pub const Session = struct {
         // Tell metadata-phase peers what we already have: they connected
         // before we knew the piece count, so they never received a bitfield
         // from us — without this they'd never request our resumed pieces.
+        // `have` per piece, not a late bitfield: BEP 3 only allows bitfield
+        // immediately after the handshake, and strict peers disconnect on a
+        // delayed one (review on PR #94).
         if (self.our_bitfield.count() > 0) {
             for (self.peers.items) |p| {
                 if (p.state != .active) continue;
-                p.enqueueMessage(.{ .bitfield = self.our_bitfield.rawBytes() }) catch {};
+                var idx: u32 = 0;
+                while (idx < self.num_pieces) : (idx += 1) {
+                    if (self.our_bitfield.hasPiece(idx)) {
+                        p.enqueueMessage(.{ .have = idx }) catch break;
+                    }
+                }
             }
         }
 
