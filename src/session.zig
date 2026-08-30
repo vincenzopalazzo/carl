@@ -107,6 +107,30 @@ const DhtState = struct {
     }
 };
 
+/// Re-hash every piece already on disk into `our_bitfield` (the resume pass).
+/// Runs at init for .torrent-origin sessions, and again from
+/// `onMetadataComplete` for magnet-origin ones — a magnet session inits with
+/// zero pieces, so without the second pass a magnet (re-)add over a partial
+/// download silently re-fetched everything.
+fn verifyExistingPieces(allocator: Allocator, store: *storage_mod.Storage, meta: metainfo.Metainfo, total_length: u64, num_pieces: u32, our_bitfield: *piece_mod.Bitfield) void {
+    const stderr = std.fs.File.stderr().deprecatedWriter();
+    stderr.print("verifying existing pieces...\n", .{}) catch {};
+    for (0..num_pieces) |i| {
+        const idx: u32 = @intCast(i);
+        const plen = piece_mod.pieceLength(idx, meta.piece_length, total_length);
+        const data = store.readPiece(allocator, idx, plen) catch continue;
+        defer allocator.free(data);
+        const hash = piece_mod.pieceHash(meta.pieces, idx) orelse continue;
+        if (piece_mod.verifyPiece(data, hash)) {
+            our_bitfield.setPiece(idx);
+        }
+    }
+    const verified = our_bitfield.count();
+    if (verified > 0) {
+        stderr.print("resume: {d}/{d} pieces already verified\n", .{ verified, num_pieces }) catch {};
+    }
+}
+
 pub const Session = struct {
     allocator: Allocator,
     meta: metainfo.Metainfo,
@@ -357,24 +381,7 @@ pub const Session = struct {
         errdefer store.deinit();
 
         // Verify existing pieces (resume + seed)
-        {
-            const stderr = std.fs.File.stderr().deprecatedWriter();
-            stderr.print("verifying existing pieces...\n", .{}) catch {};
-            for (0..num_pieces) |i| {
-                const idx: u32 = @intCast(i);
-                const plen = piece_mod.pieceLength(idx, meta.piece_length, total_length);
-                const data = store.readPiece(allocator, idx, plen) catch continue;
-                defer allocator.free(data);
-                const hash = piece_mod.pieceHash(meta.pieces, idx) orelse continue;
-                if (piece_mod.verifyPiece(data, hash)) {
-                    our_bitfield.setPiece(idx);
-                }
-            }
-            const verified = our_bitfield.count();
-            if (verified > 0) {
-                stderr.print("resume: {d}/{d} pieces already verified\n", .{ verified, num_pieces }) catch {};
-            }
-        }
+        verifyExistingPieces(allocator, &store, meta, total_length, num_pieces, &our_bitfield);
 
         // Skip the inbound listener entirely on any anonymized transport
         // (proxy/Tor/I2P): accepting incoming clearnet peers would reveal the
@@ -1612,6 +1619,14 @@ pub const Session = struct {
         self.store.deinit();
         self.store = storage_mod.Storage.init(self.allocator, self.meta, self.output_dir, true) catch
             return error.StorageInitFailed;
+
+        // A magnet session inits with zero pieces (no metadata yet), so the
+        // resume pass in init() verified nothing. Now that metadata is in and
+        // storage points at the real files, verify what's already on disk —
+        // otherwise re-adding a magnet over a partial download silently
+        // re-fetches every piece (libtorrent always rechecks here).
+        verifyExistingPieces(self.allocator, &self.store, self.meta, self.total_length, self.num_pieces, &self.our_bitfield);
+        self.have_pieces.store(self.our_bitfield.count(), .monotonic);
 
         // Metadata is in; clear the fetch-progress atomics BEFORE flipping to
         // download mode, so a snapshot that observes `metadata_only == false`
