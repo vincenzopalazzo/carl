@@ -52,6 +52,7 @@ pub const TorrentEntry = struct {
 /// Build a signed kind-2003 event from a parsed metainfo + computed infohash.
 /// The event is signed under `sk` and returned with all fields populated.
 pub fn buildFromMetainfo(
+    io: std.Io,
     allocator: Allocator,
     sk: secp.SecretKey,
     pk: secp.PublicKey,
@@ -104,7 +105,7 @@ pub fn buildFromMetainfo(
     var ev: nostr.Event = .{
         .id = undefined,
         .pubkey = pk,
-        .created_at = std.time.timestamp(),
+        .created_at = std.Io.Clock.real.now(io).toSeconds(),
         .kind = kind_torrent,
         .tags = tags_owned,
         .content = content_dup,
@@ -311,7 +312,15 @@ test "buildFromMetainfo + parseEvent round trip" {
     var info_hash: [20]u8 = undefined;
     @memset(&info_hash, 0xAB);
 
-    var ev = try buildFromMetainfo(allocator, sk, pk, meta, info_hash, "a description");
+    var ev = try buildFromMetainfo(
+        std.testing.io,
+        allocator,
+        sk,
+        pk,
+        meta,
+        info_hash,
+        "a description",
+    );
     defer ev.deinit(allocator);
 
     try std.testing.expect(nostr.verify(ev, allocator));

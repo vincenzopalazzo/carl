@@ -10,6 +10,11 @@ const Allocator = std.mem.Allocator;
 const bencode = @import("bencode.zig");
 const tracker_mod = @import("tracker.zig");
 
+const Net = std.Io.net;
+const IpAddress = Net.IpAddress;
+const Socket = Net.Socket;
+const HostName = Net.HostName;
+
 const log = std.log.scoped(.dht);
 
 /// k parameter: max nodes per bucket.
@@ -21,7 +26,7 @@ pub const id_len: usize = 20;
 /// A DHT node: ID + address.
 pub const Node = struct {
     id: [id_len]u8,
-    address: std.net.Address,
+    address: IpAddress,
 };
 
 /// Well-known bootstrap nodes. Kept deliberately broad: routers die or
@@ -67,10 +72,10 @@ fn bucketIndex(dist: [id_len]u8) u8 {
 }
 
 pub const AnnounceToken = struct {
-    addr: std.posix.sockaddr,
-    len: std.posix.socklen_t,
+    addr: IpAddress,
     token: [32]u8,
     token_len: u8,
+
     /// Responder's node ID, kept so the bounded cache can hold the nodes
     /// closest to the target rather than the first to answer.
     id: [id_len]u8,
@@ -84,9 +89,10 @@ fn cancelled(tok: ?*std.atomic.Value(bool)) bool {
 }
 
 pub const Dht = struct {
+    io: std.Io,
     allocator: Allocator,
     our_id: [id_len]u8,
-    sock: ?std.posix.fd_t,
+    sock: ?Socket,
     port: u16,
 
     /// (addr, token) pairs learned from get_peers responses, used by
@@ -99,25 +105,25 @@ pub const Dht = struct {
 
     // Routing table: 160 buckets, each up to k nodes
     buckets: [160]std.ArrayList(Node),
-
-    pub fn init(allocator: Allocator, port: u16) Dht {
+    pub fn init(io: std.Io, allocator: Allocator, port: u16) Dht {
         var our_id: [id_len]u8 = undefined;
-        std.crypto.random.bytes(&our_id);
-        return initWithId(allocator, port, our_id);
+        io.random(&our_id);
+        return initWithId(io, allocator, port, our_id);
     }
 
-    /// Like `init` but with a caller-supplied node ID. BEP 5 nodes are
-    /// expected to keep a stable ID: every fresh ID starts us over in the
-    /// keyspace and litters other nodes' routing tables with entries that
-    /// never answer again, so a client that runs repeated lookups must reuse
-    /// one ID rather than rolling a new one per lookup.
-    pub fn initWithId(allocator: Allocator, port: u16, our_id: [id_len]u8) Dht {
+    pub fn initWithId(
+        io: std.Io,
+        allocator: Allocator,
+        port: u16,
+        our_id: [id_len]u8,
+    ) Dht {
         var buckets: [160]std.ArrayList(Node) = undefined;
         for (&buckets) |*b| {
             b.* = .empty;
         }
 
         return .{
+            .io = io,
             .allocator = allocator,
             .our_id = our_id,
             .sock = null,
@@ -127,53 +133,71 @@ pub const Dht = struct {
     }
 
     pub fn deinit(self: *Dht) void {
-        if (self.sock) |s| std.posix.close(s);
+        if (self.sock) |s| s.close(self.io);
+
         for (&self.buckets) |*b| {
             b.deinit(self.allocator);
         }
     }
 
-    /// Start the DHT: bind UDP socket and bootstrap.
     pub fn start(self: *Dht) !void {
-        const sock = std.posix.socket(
-            std.posix.AF.INET,
-            std.posix.SOCK.DGRAM | std.posix.SOCK.CLOEXEC,
-            std.posix.IPPROTO.UDP,
-        ) catch return error.SocketFailed;
-
-        // Set receive timeout
-        const tv = std.posix.timeval{ .sec = 2, .usec = 0 };
-        std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
-
-        // Bind to port
-        const bind_addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, self.port);
-        std.posix.bind(sock, &bind_addr.any, @sizeOf(std.posix.sockaddr.in)) catch {
-            std.posix.close(sock);
-            return error.BindFailed;
+        const bind_addr: IpAddress = .{
+            .ip4 = .{
+                .bytes = .{ 0, 0, 0, 0 },
+                .port = self.port,
+            },
         };
+
+        const sock = bind_addr.bind(self.io, .{
+            .mode = .dgram,
+        }) catch return error.SocketFailed;
 
         self.sock = sock;
 
-        // Bootstrap from well-known nodes
         self.bootstrap() catch |err| {
             log.warn("DHT bootstrap failed: {}", .{err});
         };
     }
 
-    fn bootstrap(self: *Dht) !void {
-        for (bootstrap_nodes) |bn| {
-            const addr_list = std.net.getAddressList(self.allocator, bn.host, bn.port) catch continue;
-            defer addr_list.deinit();
+    fn resolveIp4(
+        self: *Dht,
+        host: []const u8,
+        port: u16,
+    ) ?IpAddress {
+        const host_name = HostName.init(host) catch return null;
 
-            for (addr_list.addrs) |addr| {
-                if (addr.any.family == std.posix.AF.INET) {
-                    self.sendFindNode(addr, self.our_id) catch continue;
-                    break;
-                }
+        var result_storage: [16]HostName.LookupResult = undefined;
+        var resolved =
+            std.Io.Queue(HostName.LookupResult).init(&result_storage);
+
+        host_name.lookup(self.io, &resolved, .{
+            .port = port,
+            .family = .ip4,
+        }) catch return null;
+
+        while (true) {
+            const result = resolved.getOne(self.io) catch break;
+
+            switch (result) {
+                .address => |addr| switch (addr) {
+                    .ip4 => return addr,
+                    .ip6 => continue,
+                },
+                .canonical_name => {},
             }
         }
 
-        // Wait for responses
+        return null;
+    }
+
+    fn bootstrap(self: *Dht) !void {
+        for (bootstrap_nodes) |bn| {
+            const addr =
+                self.resolveIp4(bn.host, bn.port) orelse continue;
+
+            self.sendFindNode(addr, self.our_id) catch continue;
+        }
+
         self.processResponses(3) catch {};
     }
 
@@ -206,15 +230,11 @@ pub const Dht = struct {
 
         // Also query bootstrap nodes directly
         for (bootstrap_nodes) |bn| {
-            if (cancelled(cancel)) return peers.toOwnedSlice(allocator) catch error.OutOfMemory;
-            const addr_list = std.net.getAddressList(self.allocator, bn.host, bn.port) catch continue;
-            defer addr_list.deinit();
-            for (addr_list.addrs) |addr| {
-                if (addr.any.family == std.posix.AF.INET) {
-                    self.sendGetPeers(addr, info_hash) catch continue;
-                    break;
-                }
-            }
+            if (cancelled(cancel))
+                return peers.toOwnedSlice(allocator) catch error.OutOfMemory;
+
+            const addr = self.resolveIp4(bn.host, bn.port) orelse continue;
+            self.sendGetPeers(addr, info_hash) catch continue;
         }
 
         // Iterative lookup: collect responses and query closer nodes we discover.
@@ -228,13 +248,20 @@ pub const Dht = struct {
             var rounds: usize = 0;
             while (rounds < 8) : (rounds += 1) {
                 if (cancelled(cancel)) break;
-                var src_addr: std.posix.sockaddr = undefined;
-                var addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
-                const n = std.posix.recvfrom(sock, &recv_buf, 0, &src_addr, &addr_len) catch break;
-                if (n == 0) break;
+                const incoming = sock.receiveTimeout(
+                    self.io,
+                    &recv_buf,
+                    .{ .duration = .{
+                        .raw = .fromSeconds(2),
+                        .clock = .awake,
+                    } },
+                ) catch break;
+
+                const data = incoming.data;
+                if (data.len == 0) break;
 
                 // Parse response
-                const resp = bencode.decode(allocator, recv_buf[0..n]) catch continue;
+                const resp = bencode.decode(allocator, data) catch continue;
                 defer resp.deinit(allocator);
 
                 // Check for "values" (peers)
@@ -250,7 +277,12 @@ pub const Dht = struct {
                                 if (ids.len != id_len) break :blk info_hash;
                                 break :blk ids[0..id_len].*;
                             };
-                            self.rememberToken(info_hash, rid, src_addr, addr_len, ts);
+                            self.rememberToken(
+                                info_hash,
+                                rid,
+                                incoming.from,
+                                ts,
+                            );
                         }
                     }
                     if (r_dict.dictGet("values")) |values| {
@@ -316,8 +348,7 @@ pub const Dht = struct {
         self: *Dht,
         target: [id_len]u8,
         node_id: [id_len]u8,
-        addr: std.posix.sockaddr,
-        addr_len: std.posix.socklen_t,
+        addr: IpAddress,
         token: []const u8,
     ) void {
         if (token.len == 0 or token.len > 32) return;
@@ -325,7 +356,16 @@ pub const Dht = struct {
         // Same node answering twice replaces its own slot; a stale token for
         // an address must not occupy a second one.
         for (self.announce_tokens[0..self.announce_token_count]) |*t| {
-            if (std.mem.eql(u8, std.mem.asBytes(&t.addr), std.mem.asBytes(&addr))) {
+            const same_addr = switch (t.addr) {
+                .ip4 => |a| switch (addr) {
+                    .ip4 => |b| a.port == b.port and
+                        std.mem.eql(u8, &a.bytes, &b.bytes),
+                    .ip6 => false,
+                },
+                .ip6 => false,
+            };
+
+            if (same_addr) {
                 @memcpy(t.token[0..token.len], token);
                 t.token_len = @intCast(token.len);
                 t.id = node_id;
@@ -354,7 +394,6 @@ pub const Dht = struct {
         }
 
         slot.addr = addr;
-        slot.len = addr_len;
         @memcpy(slot.token[0..token.len], token);
         slot.token_len = @intCast(token.len);
         slot.id = node_id;
@@ -380,7 +419,7 @@ pub const Dht = struct {
 
             const msg = bencode.encode(self.allocator, .{ .dict = &top_entries }) catch continue;
             defer self.allocator.free(msg);
-            _ = std.posix.sendto(sock, msg, 0, &tok.addr, tok.len) catch continue;
+            sock.send(self.io, &tok.addr, msg) catch continue;
         }
         self.announce_token_count = 0;
     }
@@ -391,12 +430,19 @@ pub const Dht = struct {
 
         var rounds: usize = 0;
         while (rounds < max_rounds) : (rounds += 1) {
-            var src_addr: std.posix.sockaddr = undefined;
-            var addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
-            const n = std.posix.recvfrom(sock, &recv_buf, 0, &src_addr, &addr_len) catch break;
-            if (n == 0) break;
+            const incoming = sock.receiveTimeout(
+                self.io,
+                &recv_buf,
+                .{ .duration = .{
+                    .raw = .fromSeconds(2),
+                    .clock = .awake,
+                } },
+            ) catch break;
 
-            const resp = bencode.decode(self.allocator, recv_buf[0..n]) catch continue;
+            if (incoming.data.len == 0) break;
+
+            const resp =
+                bencode.decode(self.allocator, incoming.data) catch continue;
             defer resp.deinit(self.allocator);
 
             if (resp.dictGet("r")) |r_dict| {
@@ -424,7 +470,12 @@ pub const Dht = struct {
 
             if (port == 0) continue;
 
-            const addr = std.net.Address.initIp4(ip, port);
+            const addr: IpAddress = .{
+                .ip4 = .{
+                    .bytes = ip,
+                    .port = port,
+                },
+            };
             self.addNode(.{ .id = node_id, .address = addr });
         }
     }
@@ -475,7 +526,7 @@ pub const Dht = struct {
         return result;
     }
 
-    fn sendFindNode(self: *Dht, addr: std.net.Address, target: [id_len]u8) !void {
+    fn sendFindNode(self: *Dht, addr: IpAddress, target: [id_len]u8) !void {
         // Use bencode encoder for correctness
         var args_entries: [2]bencode.Value.DictEntry = undefined;
         args_entries[0] = .{ .key = "id", .value = .{ .string = &self.our_id } };
@@ -492,10 +543,14 @@ pub const Dht = struct {
         defer self.allocator.free(msg);
 
         const sock = self.sock orelse return;
-        _ = std.posix.sendto(sock, msg, 0, &addr.any, @sizeOf(std.posix.sockaddr.in)) catch {};
+        sock.send(self.io, &addr, msg) catch {};
     }
 
-    fn sendGetPeers(self: *Dht, addr: std.net.Address, info_hash: [id_len]u8) !void {
+    fn sendGetPeers(
+        self: *Dht,
+        addr: IpAddress,
+        info_hash: [id_len]u8,
+    ) !void {
         var args_entries: [2]bencode.Value.DictEntry = undefined;
         args_entries[0] = .{ .key = "id", .value = .{ .string = &self.our_id } };
         args_entries[1] = .{ .key = "info_hash", .value = .{ .string = &info_hash } };
@@ -510,7 +565,7 @@ pub const Dht = struct {
         defer self.allocator.free(msg);
 
         const sock = self.sock orelse return;
-        _ = std.posix.sendto(sock, msg, 0, &addr.any, @sizeOf(std.posix.sockaddr.in)) catch {};
+        sock.send(self.io, &addr, msg) catch {};
     }
 };
 
@@ -541,14 +596,14 @@ test "bucket index" {
 
 test "DHT init and deinit" {
     const allocator = std.testing.allocator;
-    var dht = Dht.init(allocator, 16881);
+    var dht = Dht.init(std.testing.io, allocator, 16881);
     defer dht.deinit();
     try std.testing.expectEqual(@as(usize, 20), dht.our_id.len);
 }
 
 test "add compact nodes" {
     const allocator = std.testing.allocator;
-    var dht = Dht.init(allocator, 16881);
+    var dht = Dht.init(std.testing.io, allocator, 16881);
     defer dht.deinit();
 
     // Build a compact node entry: 20 bytes ID + 4 bytes IP + 2 bytes port
@@ -608,14 +663,19 @@ pub fn saveNodeCache(self: *const Dht, path: []const u8) void {
     outer: for (&self.buckets) |*b| {
         for (b.items) |node| {
             if (n >= node_cache_max) break :outer;
-            if (node.address.any.family != std.posix.AF.INET) continue;
+            const ip4 = switch (node.address) {
+                .ip4 => |addr| addr,
+                .ip6 => continue,
+            };
+
             @memcpy(buf[4 + n * 26 ..][0..20], &node.id);
-            const ip4: [4]u8 = @bitCast(node.address.in.sa.addr);
-            buf[4 + n * 26 + 20] = ip4[0];
-            buf[4 + n * 26 + 21] = ip4[1];
-            buf[4 + n * 26 + 22] = ip4[2];
-            buf[4 + n * 26 + 23] = ip4[3];
-            const port = node.address.getPort();
+
+            buf[4 + n * 26 + 20] = ip4.bytes[0];
+            buf[4 + n * 26 + 21] = ip4.bytes[1];
+            buf[4 + n * 26 + 22] = ip4.bytes[2];
+            buf[4 + n * 26 + 23] = ip4.bytes[3];
+
+            const port = ip4.port;
             buf[4 + n * 26 + 24] = @intCast(port >> 8);
             buf[4 + n * 26 + 25] = @intCast(port & 0xff);
             n += 1;
@@ -686,7 +746,17 @@ pub fn loadNodeCache(self: *Dht, path: []const u8) usize {
         if (port == 0) continue;
         var id: [id_len]u8 = undefined;
         @memcpy(&id, entry[0..20]);
-        const addr = std.net.Address.initIp4(.{ entry[20], entry[21], entry[22], entry[23] }, port);
+        const addr: IpAddress = .{
+            .ip4 = .{
+                .bytes = .{
+                    entry[20],
+                    entry[21],
+                    entry[22],
+                    entry[23],
+                },
+                .port = port,
+            },
+        };
         self.addNode(.{ .id = id, .address = addr });
         inserted += 1;
     }
@@ -705,7 +775,7 @@ fn readFull(c: anytype, fd: c_int, buf: []u8) bool {
 
 test "saveNodeCache writes only the payload, not the stack tail" {
     const a = std.testing.allocator;
-    var d = Dht.init(a, 16999);
+    var d = Dht.init(std.testing.io, a, 16999);
     defer d.deinit();
 
     // Two IPv4 nodes -> header(4) + 2*26 = 56 bytes on disk. Writing
@@ -715,53 +785,81 @@ test "saveNodeCache writes only the payload, not the stack tail" {
     const id2: [id_len]u8 = [_]u8{2} ** id_len;
     d.buckets[0].append(a, .{
         .id = id1,
-        .address = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 6881),
+        .address = .{
+            .ip4 = .{
+                .bytes = .{ 10, 0, 0, 1 },
+                .port = 6881,
+            },
+        },
     }) catch unreachable;
     d.buckets[0].append(a, .{
         .id = id2,
-        .address = std.net.Address.initIp4(.{ 10, 0, 0, 2 }, 6882),
+        .address = .{
+            .ip4 = .{
+                .bytes = .{ 10, 0, 0, 2 },
+                .port = 6882,
+            },
+        },
     }) catch unreachable;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const dir = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        a,
+    );
     defer a.free(dir);
     const path = try std.fmt.allocPrint(a, "{s}/nodes.dat", .{dir});
     defer a.free(path);
 
     saveNodeCache(&d, path);
 
-    const f = try std.fs.openFileAbsolute(path, .{});
-    defer f.close();
-    const size = (try f.stat()).size;
+    const f = try std.Io.Dir.openFileAbsolute(
+        std.testing.io,
+        path,
+        .{},
+    );
+    defer f.close(std.testing.io);
+    const size = (try f.stat(std.testing.io)).size;
     try std.testing.expectEqual(@as(u64, 4 + 2 * 26), size);
 
     // And it round-trips back into an empty table.
-    var d2 = Dht.init(a, 16998);
+    var d2 = Dht.init(std.testing.io, a, 16998);
     defer d2.deinit();
     try std.testing.expectEqual(@as(usize, 2), loadNodeCache(&d2, path));
 }
 
 test "announce tokens keep the nodes closest to the target" {
     const a = std.testing.allocator;
-    var d = Dht.init(a, 16997);
+    var d = Dht.init(std.testing.io, a, 16997);
     defer d.deinit();
 
     const target: [id_len]u8 = [_]u8{0} ** id_len;
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6881);
+    const addr: IpAddress = .{
+        .ip4 = .{
+            .bytes = .{ 127, 0, 0, 1 },
+            .port = 6881,
+        },
+    };
 
     // Fill every slot with far nodes (high first byte), then offer a near one.
     var i: u8 = 0;
     while (i < d.announce_tokens.len) : (i += 1) {
         var id: [id_len]u8 = [_]u8{0xf0} ** id_len;
         id[id_len - 1] = i; // distinct ids
-        var sa = std.net.Address.initIp4(.{ 10, 0, 0, i + 1 }, 6881);
-        d.rememberToken(target, id, sa.any, sa.getOsSockLen(), "tok");
+        const sa: IpAddress = .{
+            .ip4 = .{
+                .bytes = .{ 10, 0, 0, i + 1 },
+                .port = 6881,
+            },
+        };
+        d.rememberToken(target, id, sa, "tok");
     }
     try std.testing.expectEqual(d.announce_tokens.len, d.announce_token_count);
 
     const near: [id_len]u8 = [_]u8{0x00} ** id_len;
-    d.rememberToken(target, near, addr.any, addr.getOsSockLen(), "near");
+    d.rememberToken(target, near, addr, "near");
 
     var found_near = false;
     for (d.announce_tokens[0..d.announce_token_count]) |t| {
@@ -773,8 +871,13 @@ test "announce tokens keep the nodes closest to the target" {
 
     // A farther node offered against a full cache is rejected outright.
     const farther: [id_len]u8 = [_]u8{0xff} ** id_len;
-    var sa2 = std.net.Address.initIp4(.{ 10, 1, 1, 1 }, 6881);
-    d.rememberToken(target, farther, sa2.any, sa2.getOsSockLen(), "far");
+    const sa2: IpAddress = .{
+        .ip4 = .{
+            .bytes = .{ 10, 1, 1, 1 },
+            .port = 6881,
+        },
+    };
+    d.rememberToken(target, farther, sa2, "far");
     for (d.announce_tokens[0..d.announce_token_count]) |t| {
         try std.testing.expect(!std.mem.eql(u8, &t.id, &farther));
     }
@@ -782,13 +885,18 @@ test "announce tokens keep the nodes closest to the target" {
 
 test "the same responder does not consume two token slots" {
     const a = std.testing.allocator;
-    var d = Dht.init(a, 16996);
+    var d = Dht.init(std.testing.io, a, 16996);
     defer d.deinit();
     const target: [id_len]u8 = [_]u8{0} ** id_len;
     const id: [id_len]u8 = [_]u8{7} ** id_len;
-    var sa = std.net.Address.initIp4(.{ 10, 2, 2, 2 }, 6881);
-    d.rememberToken(target, id, sa.any, sa.getOsSockLen(), "t1");
-    d.rememberToken(target, id, sa.any, sa.getOsSockLen(), "t2");
+    const sa: IpAddress = .{
+        .ip4 = .{
+            .bytes = .{ 10, 2, 2, 2 },
+            .port = 6881,
+        },
+    };
+    d.rememberToken(target, id, sa, "t1");
+    d.rememberToken(target, id, sa, "t2");
     try std.testing.expectEqual(@as(usize, 1), d.announce_token_count);
     try std.testing.expectEqualStrings("t2", d.announce_tokens[0].token[0..d.announce_tokens[0].token_len]);
 }

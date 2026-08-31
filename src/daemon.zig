@@ -63,7 +63,7 @@ pub const Daemon = struct {
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
     conns: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// Last relay-health probe result (owned). Guarded by `health_mutex`.
-    health_mutex: std.Thread.Mutex = .{},
+    health_mutex: std.Io.Mutex = .init,
     health: []api.Relay = &.{},
     /// Last SOCKS-proxy-health probe (proxy/tor route), guarded by `health_mutex`.
     /// `proxy_probed` is false until the first probe lands (UI shows "checking").
@@ -75,9 +75,18 @@ pub const Daemon = struct {
 
     /// Bind to 127.0.0.1:`port` and serve until `running` is cleared. Blocking.
     pub fn serve(self: *Daemon, port: u16) !void {
-        const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
-        var server = try addr.listen(.{ .reuse_address = true });
-        defer server.deinit();
+        const addr: std.Io.net.IpAddress = .{
+            .ip4 = .{
+                .bytes = .{ 127, 0, 0, 1 },
+                .port = port,
+            },
+        };
+
+        var server = try addr.listen(
+            self.manager.io,
+            .{ .reuse_address = true },
+        );
+        defer server.deinit(self.manager.io);
 
         log.info("daemon listening on http://127.0.0.1:{d}", .{port});
 
@@ -91,31 +100,31 @@ pub const Daemon = struct {
         // accept(): Zig's accept() retries on EINTR, so a bare accept would
         // never observe the SIGINT-set `shutdown_requested`. Polling lets the
         // loop re-check the shutdown flags ~twice a second and exit cleanly.
-        var pfd = [_]posix.pollfd{.{ .fd = server.stream.handle, .events = posix.POLL.IN, .revents = 0 }};
+        var pfd = [_]posix.pollfd{.{ .fd = server.socket.handle, .events = posix.POLL.IN, .revents = 0 }};
         while (self.running.load(.acquire) and !session_mod.shutdown_requested.load(.acquire)) {
             const ready = posix.poll(&pfd, 500) catch 0;
             if (ready == 0) continue;
-            const conn = server.accept() catch {
+            const conn = server.accept(self.manager.io) catch {
                 continue;
             };
 
             // Shed load past the cap rather than spawning unbounded threads.
             if (self.conns.fetchAdd(1, .monotonic) >= max_conns) {
                 _ = self.conns.fetchSub(1, .monotonic);
-                conn.stream.close();
+                conn.close(self.manager.io);
                 continue;
             }
-            setRecvTimeout(conn.stream, recv_timeout_secs);
+            setRecvTimeout(conn, recv_timeout_secs);
 
             const ctx = self.allocator.create(Conn) catch {
                 _ = self.conns.fetchSub(1, .monotonic);
-                conn.stream.close();
+                conn.close(self.manager.io);
                 continue;
             };
-            ctx.* = .{ .daemon = self, .stream = conn.stream };
+            ctx.* = .{ .daemon = self, .stream = conn };
             const t = std.Thread.spawn(.{}, Conn.run, .{ctx}) catch {
                 _ = self.conns.fetchSub(1, .monotonic);
-                conn.stream.close();
+                conn.close(self.manager.io);
                 self.allocator.destroy(ctx);
                 continue;
             };
@@ -130,20 +139,23 @@ pub const Daemon = struct {
     /// Free the cached relay health. Call after `serve` returns (and the prober
     /// has wound down) before the allocator is torn down.
     pub fn deinit(self: *Daemon) void {
-        self.health_mutex.lock();
+        self.health_mutex.lockUncancelable(self.manager.io);
         const h = self.health;
         self.health = &.{};
-        self.health_mutex.unlock();
+        self.health_mutex.unlock(self.manager.io);
         freeHealth(self.allocator, h);
     }
 
     /// Snapshot current relay health into `arena`. Before the first probe lands,
     /// falls back to the configured list (state "configured").
     fn healthSnapshot(self: *Daemon, arena: Allocator) ![]api.Relay {
-        self.health_mutex.lock();
-        defer self.health_mutex.unlock();
+        self.health_mutex.lockUncancelable(self.manager.io);
+        defer self.health_mutex.unlock(self.manager.io);
         if (self.health.len == 0) {
-            const urls = try nostr_config.readRelays(arena);
+            const urls = try nostr_config.readRelays(
+                self.manager.nostr_ctx,
+                arena,
+            );
             const out = try arena.alloc(api.Relay, urls.len);
             for (urls, 0..) |url, i| {
                 out[i] = .{ .url = url, .state = "configured", .net = relayNet(url), .events = 0 };
@@ -178,11 +190,11 @@ pub const Daemon = struct {
         if (route == .direct)
             return .{ .state = "disabled", .endpoint = endpoint };
 
-        self.health_mutex.lock();
+        self.health_mutex.lockUncancelable(self.manager.io);
         const probed = self.proxy_probed;
         const st = self.proxy_state;
         const reply = self.proxy_reply;
-        self.health_mutex.unlock();
+        self.health_mutex.unlock(self.manager.io);
 
         if (!probed) return .{ .state = "checking", .endpoint = endpoint };
 
@@ -208,9 +220,9 @@ pub const Daemon = struct {
             // switches to an anonymized one, the snapshot shows an honest
             // "checking" until a real probe lands. The direct route is reported
             // as "disabled" by the snapshot regardless.
-            self.health_mutex.lock();
+            self.health_mutex.lockUncancelable(self.manager.io);
             self.proxy_probed = false;
-            self.health_mutex.unlock();
+            self.health_mutex.unlock(self.manager.io);
             return;
         }
         if (route == .i2p) {
@@ -221,7 +233,11 @@ pub const Daemon = struct {
                 return;
             };
             // Map SAM health onto the shared ProxyState shape.
-            const state: proxy_mod.ProxyState = switch (i2p_sam.classifyBridge(self.allocator, bridge, 5)) {
+            const state: proxy_mod.ProxyState = switch (i2p_sam.classifyBridge(
+                self.manager.io,
+                bridge,
+                5,
+            )) {
                 .ok => .ok,
                 .not_running => .not_running,
                 .timeout => .timeout,
@@ -236,16 +252,21 @@ pub const Daemon = struct {
             self.publishProxy(.rejected, null);
             return;
         };
-        const probe = proxy_mod.classifySocks5(self.allocator, proxy, 5);
+        const probe = proxy_mod.classifySocks5(
+            self.manager.io,
+            self.allocator,
+            proxy,
+            5,
+        );
         self.publishProxy(probe.state, probe.reply);
     }
 
     fn publishProxy(self: *Daemon, state: proxy_mod.ProxyState, reply: ?u8) void {
-        self.health_mutex.lock();
+        self.health_mutex.lockUncancelable(self.manager.io);
         self.proxy_state = state;
         self.proxy_reply = reply;
         self.proxy_probed = true;
-        self.health_mutex.unlock();
+        self.health_mutex.unlock(self.manager.io);
     }
 
     fn relayHealthLoop(self: *Daemon) void {
@@ -269,7 +290,7 @@ pub const Daemon = struct {
                 self.running.load(.acquire) and
                 !session_mod.shutdown_requested.load(.acquire)) : (slept += 250 * std.time.ns_per_ms)
             {
-                std.Thread.sleep(250 * std.time.ns_per_ms);
+                self.manager.io.sleep(.fromMilliseconds(250), .awake) catch return;
             }
         }
     }
@@ -279,7 +300,7 @@ pub const Daemon = struct {
     /// proxy is set (otherwise they're unreachable by definition).
     fn probeRelays(self: *Daemon) void {
         const a = self.allocator;
-        const urls = nostr_config.readRelays(a) catch return;
+        const urls = nostr_config.readRelays(self.manager.nostr_ctx, a) catch return;
         defer nostr_config.freeRelays(a, urls);
 
         var proxy: ?proxy_mod.Proxy = null;
@@ -296,11 +317,13 @@ pub const Daemon = struct {
             const onion = std.mem.indexOf(u8, url, ".onion") != null;
             var state: []const u8 = "configured";
             if (!(onion and proxy == null)) {
-                // The prober is a periodic background caller: honor the shared
-                // health gate so a relay that keeps failing (or has an unusable
-                // URL) is skipped instead of re-dialed every cycle. A skipped
-                // relay reports its last known verdict: unreachable.
-                if (relay_mod.dial(a, url, proxy, .honor)) |r| {
+                if (relay_mod.dial(
+                    self.manager.io,
+                    a,
+                    url,
+                    proxy,
+                    .honor,
+                )) |r| {
                     var rc = r;
                     rc.deinit();
                     state = "connected";
@@ -336,27 +359,27 @@ pub const Daemon = struct {
             }
         }
 
-        self.health_mutex.lock();
+        self.health_mutex.lockUncancelable(self.manager.io);
         const old = self.health;
         self.health = fresh;
-        self.health_mutex.unlock();
+        self.health_mutex.unlock(self.manager.io);
         freeHealth(a, old);
     }
 };
 
 const Conn = struct {
     daemon: *Daemon,
-    stream: std.net.Stream,
+    stream: std.Io.net.Stream,
     /// Serializes socket writes so the keep-alive ticker (see `withKeepalive`)
     /// can't interleave its interim 102 bytes into a response the handler is
     /// sending. Only contended while a slow POST handler is in flight.
-    write_mutex: std.Thread.Mutex = .{},
+    write_mutex: std.Io.Mutex = .init,
 
     fn run(self: *Conn) void {
         const a = self.daemon.allocator;
         defer {
             _ = self.daemon.conns.fetchSub(1, .monotonic);
-            self.stream.close();
+            self.stream.close(self.daemon.manager.io);
             a.destroy(self);
         }
         self.handle() catch |err| {
@@ -370,9 +393,16 @@ const Conn = struct {
         defer buf.deinit(a);
 
         // Read until the header block is complete.
+        var reader_buf: [4096]u8 = undefined;
+        var stream_reader = self.stream.reader(
+            self.daemon.manager.io,
+            &reader_buf,
+        );
+
         var tmp: [4096]u8 = undefined;
         while (std.mem.indexOf(u8, buf.items, "\r\n\r\n") == null) {
-            const n = posix.recv(self.stream.handle, &tmp, 0) catch return;
+            var slices = [_][]u8{tmp[0..]};
+            const n = stream_reader.interface.readVec(&slices) catch return;
             if (n == 0) return;
             try buf.appendSlice(a, tmp[0..n]);
             if (buf.items.len > 256 * 1024) return self.sendStatus(.bad_request);
@@ -384,7 +414,8 @@ const Conn = struct {
         const need = probe.head_len + probe.contentLength();
         if (need > max_body) return self.sendStatus(.bad_request);
         while (buf.items.len < need) {
-            const n = posix.recv(self.stream.handle, &tmp, 0) catch break;
+            var slices = [_][]u8{tmp[0..]};
+            const n = stream_reader.interface.readVec(&slices) catch break;
             if (n == 0) break;
             try buf.appendSlice(a, tmp[0..n]);
         }
@@ -475,7 +506,10 @@ const Conn = struct {
         defer arena.deinit();
         const aa = arena.allocator();
         const relays = try self.daemon.healthSnapshot(aa);
-        const npub = try readNpub(aa);
+        const npub = try readNpub(
+            self.daemon.manager.nostr_ctx,
+            aa,
+        );
         const json = try buildStateJson(aa, self.daemon, relays, npub);
         try self.sendJson(.ok, json);
     }
@@ -522,7 +556,12 @@ const Conn = struct {
         defer arena.deinit();
         const aa = arena.allocator();
         var j = api.Json.init(aa);
-        try api.writeIdentity(&j, .{ .npub = try readNpub(aa) });
+        try api.writeIdentity(&j, .{
+            .npub = try readNpub(
+                self.daemon.manager.nostr_ctx,
+                aa,
+            ),
+        });
         try self.sendJson(.ok, j.buf.items);
     }
 
@@ -531,7 +570,10 @@ const Conn = struct {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const aa = arena.allocator();
-        const relays = try nostr_config.readRelays(aa);
+        const relays = try nostr_config.readRelays(
+            self.daemon.manager.nostr_ctx,
+            aa,
+        );
         var j = api.Json.init(aa);
         try api.writeSettings(&j, self.daemon.manager.settings(relays));
         try self.sendJson(.ok, j.buf.items);
@@ -691,14 +733,26 @@ const Conn = struct {
         const want_nostr = if (req.header("x-carl-nostr")) |h| std.mem.eql(u8, h, "true") else false;
 
         const dir = self.daemon.manager.downloadDirDup(aa) catch return self.sendStatus(.internal_error);
-        std.fs.cwd().makePath(dir) catch {};
+        std.Io.Dir.cwd().createDirPath(
+            self.daemon.manager.io,
+            dir,
+        ) catch {};
+
         const full = std.fmt.allocPrint(aa, "{s}/{s}", .{ dir, filename }) catch
             return self.sendStatus(.internal_error);
+
         {
-            var f = std.fs.cwd().createFile(full, .{ .truncate = true }) catch
-                return self.sendStatus(.internal_error);
-            defer f.close();
-            f.writeAll(body) catch return self.sendStatus(.internal_error);
+            const f = std.Io.Dir.cwd().createFile(
+                self.daemon.manager.io,
+                full,
+                .{ .truncate = true },
+            ) catch return self.sendStatus(.internal_error);
+            defer f.close(self.daemon.manager.io);
+
+            f.writeStreamingAll(
+                self.daemon.manager.io,
+                body,
+            ) catch return self.sendStatus(.internal_error);
         }
 
         const id = self.daemon.manager.addSeed(full, route_val, want_nostr) catch |err| {
@@ -739,24 +793,38 @@ const Conn = struct {
         trackers: []const []const u8,
         comment: ?[]const u8,
     ) !TorrentBuilt {
-        const res = metainfo.buildTorrent(self.daemon.allocator, src_path, .{
-            .trackers = trackers,
-            .comment = comment,
-            .created_by = "carl",
-            .creation_date = std.time.timestamp(),
-        }) catch return error.CreateFailed;
+        const res = metainfo.buildTorrent(
+            self.daemon.manager.io,
+            self.daemon.allocator,
+            src_path,
+            .{
+                .trackers = trackers,
+                .comment = comment,
+                .created_by = "carl",
+                .creation_date = std.Io.Clock.real
+                    .now(self.daemon.manager.io)
+                    .toSeconds(),
+            },
+        ) catch return error.CreateFailed;
         defer self.daemon.allocator.free(res.data);
 
         // Derive `<src>.torrent`, trimming a trailing slash so a directory path
         // "/a/b/" yields "/a/b.torrent" (beside it), not "/a/b/.torrent" (inside).
         const sep = [_]u8{std.fs.path.sep};
-        const trimmed = std.mem.trimRight(u8, src_path, &sep);
+        const trimmed = std.mem.trimEnd(u8, src_path, &sep);
         const base_path = if (trimmed.len == 0) src_path else trimmed;
         const out_path = try std.fmt.allocPrint(aa, "{s}.torrent", .{base_path});
         {
-            var f = std.fs.cwd().createFile(out_path, .{ .truncate = true }) catch return error.WriteFailed;
-            defer f.close();
-            f.writeAll(res.data) catch return error.WriteFailed;
+            const f = std.Io.Dir.cwd().createFile(
+                self.daemon.manager.io,
+                out_path,
+                .{ .truncate = true },
+            ) catch return error.WriteFailed;
+            defer f.close(self.daemon.manager.io);
+            f.writeStreamingAll(
+                self.daemon.manager.io,
+                res.data,
+            ) catch return error.WriteFailed;
         }
 
         var hex: [40]u8 = undefined;
@@ -848,12 +916,19 @@ const Conn = struct {
                             if (t.len > 0) try list.append(aa, t);
                         }
                     }
-                    nostr_config.writeRelays(a, list.items) catch {};
+                    nostr_config.writeRelays(
+                        self.daemon.manager.nostr_ctx,
+                        a,
+                        list.items,
+                    ) catch {};
                 }
             }
         }
         // Echo the (possibly updated) settings back.
-        const relays = try nostr_config.readRelays(aa);
+        const relays = try nostr_config.readRelays(
+            self.daemon.manager.nostr_ctx,
+            aa,
+        );
         var j = api.Json.init(aa);
         try api.writeSettings(&j, self.daemon.manager.settings(relays));
         try self.sendJson(.ok, j.buf.items);
@@ -903,7 +978,10 @@ const Conn = struct {
         // relay health is an in-memory snapshot taken cheaply per tick.
         var conn_arena = std.heap.ArenaAllocator.init(a);
         defer conn_arena.deinit();
-        const npub: []const u8 = readNpub(conn_arena.allocator()) catch "";
+        const npub: []const u8 = readNpub(
+            self.daemon.manager.nostr_ctx,
+            conn_arena.allocator(),
+        ) catch "";
 
         // Push a fresh snapshot every interval until the client closes (send
         // fails) or the daemon stops. We don't read client frames — a localhost
@@ -913,17 +991,29 @@ const Conn = struct {
             // Drain any pending client command frames (e.g. create_torrent)
             // before the push, without stalling the cadence: poll with a 0ms
             // timeout and handle only what's already buffered.
-            while (socketReadable(self.stream.handle)) {
-                const frame = ws_server.readFrame(a, self.stream) catch {
-                    ws_server.sendClose(a, self.stream);
+            while (socketReadable(self.stream.socket.handle)) {
+                const frame = ws_server.readFrame(
+                    self.daemon.manager.io,
+                    a,
+                    self.stream,
+                ) catch {
+                    ws_server.sendClose(
+                        self.daemon.manager.io,
+                        a,
+                        self.stream,
+                    );
                     return;
                 };
                 defer frame.deinit(a);
                 switch (frame.opcode) {
                     .text => self.handleWsCommand(frame.payload) catch {},
-                    .ping => ws_server.sendPong(a, self.stream, frame.payload) catch {},
+                    .ping => ws_server.sendPong(self.daemon.manager.io, a, self.stream, frame.payload) catch {},
                     .close => {
-                        ws_server.sendClose(a, self.stream);
+                        ws_server.sendClose(
+                            self.daemon.manager.io,
+                            a,
+                            self.stream,
+                        );
                         return;
                     },
                     else => {},
@@ -939,7 +1029,12 @@ const Conn = struct {
                 arena.deinit();
                 break;
             };
-            ws_server.sendText(a, self.stream, json) catch {
+            ws_server.sendText(
+                self.daemon.manager.io,
+                a,
+                self.stream,
+                json,
+            ) catch {
                 arena.deinit();
                 break;
             };
@@ -952,10 +1047,17 @@ const Conn = struct {
                 self.daemon.running.load(.acquire) and
                 !session_mod.shutdown_requested.load(.acquire)) : (slept += 100 * std.time.ns_per_ms)
             {
-                std.Thread.sleep(100 * std.time.ns_per_ms);
+                self.daemon.manager.io.sleep(
+                    .fromMilliseconds(100),
+                    .awake,
+                ) catch return;
             }
         }
-        ws_server.sendClose(a, self.stream);
+        ws_server.sendClose(
+            self.daemon.manager.io,
+            a,
+            self.stream,
+        );
     }
 
     /// Handle one client text frame as a JSON command. Currently the only
@@ -992,7 +1094,12 @@ const Conn = struct {
         try j.keyNumber("size", built.size);
         try j.keyNumber("files", built.files);
         try j.endObject();
-        ws_server.sendText(a, self.stream, j.buf.items) catch {};
+        ws_server.sendText(
+            self.daemon.manager.io,
+            a,
+            self.stream,
+            j.buf.items,
+        ) catch {};
     }
 
     /// Send a `torrent_created` failure frame for a WebSocket create command.
@@ -1004,7 +1111,12 @@ const Conn = struct {
         j.keyBool("ok", false) catch return;
         j.keyString("error", msg) catch return;
         j.endObject() catch return;
-        ws_server.sendText(self.daemon.allocator, self.stream, j.buf.items) catch {};
+        ws_server.sendText(
+            self.daemon.manager.io,
+            self.daemon.allocator,
+            self.stream,
+            j.buf.items,
+        ) catch {};
     }
 
     // ----- response writers -----
@@ -1033,19 +1145,28 @@ const Conn = struct {
     }
 
     fn sendAll(self: *Conn, buf: []const u8) !void {
-        self.write_mutex.lock();
-        defer self.write_mutex.unlock();
-        try self.sendAllLocked(buf);
+        self.write_mutex.lockUncancelable(self.daemon.manager.io);
+        defer self.write_mutex.unlock(self.daemon.manager.io);
+        try self.sendAllLocked(self.daemon.manager.io, buf);
     }
 
     /// Caller must hold `write_mutex` (see `keepaliveLoop`).
-    fn sendAllLocked(self: *Conn, buf: []const u8) !void {
-        var off: usize = 0;
-        while (off < buf.len) {
-            const n = posix.send(self.stream.handle, buf[off..], 0) catch return error.SendFailed;
-            if (n == 0) return error.Closed;
-            off += n;
-        }
+    fn sendAllLocked(
+        self: *Conn,
+        io: std.Io,
+        buf: []const u8,
+    ) !void {
+        var writer_buf: [4096]u8 = undefined;
+        var stream_writer = self.stream.writer(
+            io,
+            &writer_buf,
+        );
+
+        stream_writer.interface.writeAll(buf) catch
+            return error.SendFailed;
+
+        stream_writer.interface.flush() catch
+            return error.SendFailed;
     }
 
     /// Interval between interim `102 Processing` keep-alives on slow POST
@@ -1071,7 +1192,11 @@ const Conn = struct {
         body: []const u8,
     ) !void {
         var done = std.atomic.Value(bool).init(false);
-        const ticker = std.Thread.spawn(.{}, keepaliveLoop, .{ self, &done, keepalive_interval_ns }) catch {
+        const ticker = std.Thread.spawn(
+            .{},
+            keepaliveLoop,
+            .{ self, self.daemon.manager.io, &done, keepalive_interval_ns },
+        ) catch {
             return handler(self, req, body); // no ticker — behave as before
         };
         defer {
@@ -1085,10 +1210,18 @@ const Conn = struct {
     /// flips. A tick racing the handler's final response is harmless: both
     /// writes are serialized by `write_mutex`, and the connection closes right
     /// after the response, so a trailing 1xx is never parsed as anything.
-    fn keepaliveLoop(self: *Conn, done: *std.atomic.Value(bool), interval_ns: u64) void {
+    fn keepaliveLoop(
+        self: *Conn,
+        io: std.Io,
+        done: *std.atomic.Value(bool),
+        interval_ns: u64,
+    ) void {
         var waited: u64 = 0;
         while (!done.load(.acquire)) {
-            std.Thread.sleep(100 * std.time.ns_per_ms);
+            io.sleep(
+                .fromMilliseconds(100),
+                .awake,
+            ) catch return;
             waited += 100 * std.time.ns_per_ms;
             if (waited < interval_ns) continue;
             waited = 0;
@@ -1099,10 +1232,13 @@ const Conn = struct {
             // done store); it is harmless because the connection closes right
             // after a complete, Content-Length-delimited response, and clients
             // discard trailing bytes on a closing connection.
-            self.write_mutex.lock();
-            defer self.write_mutex.unlock();
+            self.write_mutex.lockUncancelable(io);
+            defer self.write_mutex.unlock(io);
             if (done.load(.acquire)) return;
-            self.sendAllLocked("HTTP/1.1 102 Processing\r\n\r\n") catch return;
+            self.sendAllLocked(
+                io,
+                "HTTP/1.1 102 Processing\r\n\r\n",
+            ) catch return;
         }
     }
 
@@ -1180,8 +1316,14 @@ fn relayNet(url: []const u8) []const u8 {
 }
 
 /// The local npub, or "" when no key is configured. The nsec is never exposed.
-fn readNpub(arena: Allocator) ![]const u8 {
-    const sk = nostr_config.readSecretKey(arena) catch return "";
+fn readNpub(
+    ctx: nostr_config.Context,
+    arena: Allocator,
+) ![]const u8 {
+    const sk = nostr_config.readSecretKey(
+        ctx,
+        arena,
+    ) catch return "";
     const pk = secp.publicKeyFromSecret(sk) catch return "";
     return nip19.encode32(arena, .npub, pk) catch "";
 }
@@ -1203,9 +1345,15 @@ fn socketReadable(fd: posix.socket_t) bool {
 
 /// Set a recv timeout on an accepted socket so a stalled client can't wedge its
 /// thread forever. Best-effort (a failed setsockopt just leaves the default).
-fn setRecvTimeout(stream: std.net.Stream, secs: u32) void {
+fn setRecvTimeout(stream: std.Io.net.Stream, secs: u32) void {
     const tv = posix.timeval{ .sec = @intCast(secs), .usec = 0 };
-    posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+
+    posix.setsockopt(
+        stream.socket.handle,
+        posix.SOL.SOCKET,
+        posix.SO.RCVTIMEO,
+        std.mem.asBytes(&tv),
+    ) catch {};
 }
 
 /// Length-checked, content-constant-time slice equality for the auth token.
@@ -1274,7 +1422,9 @@ fn runSearch(arena: Allocator, daemon: *Daemon, query: []const u8) ![]u8 {
 
     var results: std.ArrayList(api.DiscoverResult) = .empty;
     var seen: std.ArrayList([40]u8) = .empty;
-    const now = std.time.timestamp();
+    const now = std.Io.Clock.real
+        .now(daemon.manager.io)
+        .toSeconds();
 
     // One-shot user search over the prober-known relays: honor the shared
     // health gate unless skipping would silence every relay (review on #88).
@@ -1283,13 +1433,23 @@ fn runSearch(arena: Allocator, daemon: *Daemon, query: []const u8) ![]u8 {
         if (std.mem.eql(u8, relay.state, "unreachable")) continue;
         search_urls.append(arena, relay.url) catch break;
     }
-    const gate = relay_mod.oneShotGate(search_urls.items, proxy);
+    const gate = relay_mod.oneShotGate(
+        daemon.manager.io,
+        search_urls.items,
+        proxy,
+    );
 
     for (health) |relay| {
         if (results.items.len >= 50) break;
         if (std.mem.eql(u8, relay.state, "unreachable")) continue;
         const url = relay.url;
-        var r = relay_mod.dial(arena, url, proxy, gate) catch continue;
+        var r = relay_mod.dial(
+            daemon.manager.io,
+            arena,
+            url,
+            proxy,
+            gate,
+        ) catch continue;
         defer r.deinit();
         const events = relay_mod.subscribeAndCollect(arena, &r, filter, .{
             .timeout_ms = 7_000,
@@ -1402,7 +1562,18 @@ test "formatAge: buckets" {
 
 test "buildStateJson: produces the five top-level keys" {
     const a = testing.allocator;
-    var mgr = try manager_mod.Manager.init(a, .{ .persist = false });
+    const ctx: nostr_config.Context = .{
+        .io = std.testing.io,
+        .home = null,
+        .xdg_config_home = null,
+    };
+
+    var mgr = try manager_mod.Manager.init(
+        std.testing.io,
+        ctx,
+        a,
+        .{ .persist = false },
+    );
     defer mgr.deinit();
     var d = Daemon{ .allocator = a, .manager = &mgr, .token = "tok" };
 
@@ -1459,32 +1630,58 @@ test "keepaliveLoop: emits interim 102 until done, serialized through sendAll" {
         const rc = std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
         try testing.expect(rc == 0);
     }
-    defer posix.close(fds[1]);
+    var peer_stream: std.Io.net.Stream = .{
+        .socket = .{
+            .handle = fds[1],
+            .address = undefined,
+        },
+    };
+    defer peer_stream.close(std.testing.io);
 
     // The loop only touches the stream + write mutex, never the daemon.
-    var conn = Conn{ .daemon = undefined, .stream = .{ .handle = fds[0] } };
+    var conn = Conn{
+        .daemon = undefined,
+        .stream = .{
+            .socket = .{
+                .handle = fds[0],
+                .address = undefined,
+            },
+        },
+    };
     var done = std.atomic.Value(bool).init(false);
-    const ticker = try std.Thread.spawn(.{}, Conn.keepaliveLoop, .{ &conn, &done, 60 * std.time.ns_per_ms });
+    const ticker = try std.Thread.spawn(
+        .{},
+        Conn.keepaliveLoop,
+        .{
+            &conn,
+            std.testing.io,
+            &done,
+            60 * std.time.ns_per_ms,
+        },
+    );
 
     // Let a few ticks fire, then stop and join before reading (the bytes wait
     // in the socket buffer).
-    std.Thread.sleep(250 * std.time.ns_per_ms);
+    try std.Io.sleep(
+        std.testing.io,
+        .fromMilliseconds(250),
+        .awake,
+    );
     done.store(true, .release);
     ticker.join();
-    posix.close(fds[0]);
+    conn.stream.close(std.testing.io);
 
     // Drain what the ticker sent; expect at least two interim responses and
     // no interleaved garbage (writes go through the mutex'd sendAll).
     var buf: [4096]u8 = undefined;
+    var read_buffer: [0]u8 = .{};
+    var reader = peer_stream.reader(std.testing.io, &read_buffer);
+
     var total: usize = 0;
-    while (true) {
-        const n = posix.read(fds[1], buf[total..]) catch |err| switch (err) {
-            error.WouldBlock => break,
-            else => return err,
-        };
+    while (total < buf.len) {
+        const n = reader.interface.readSliceShort(buf[total..]) catch break;
         if (n == 0) break;
         total += n;
-        if (total == buf.len) break;
     }
     const got = buf[0..total];
     const needle = "HTTP/1.1 102 Processing\r\n\r\n";

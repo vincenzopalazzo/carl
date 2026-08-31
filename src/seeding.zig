@@ -43,6 +43,7 @@ pub const Announce = union(enum) {
 /// doesn't leak. Propagates `readSecretKey`'s error (e.g. `error.NoKey` when no
 /// identity is configured) so callers can report the real reason.
 pub fn publish(
+    ctx: nostr_config.Context,
     allocator: Allocator,
     mi: metainfo.Metainfo,
     info_hash: [20]u8,
@@ -50,28 +51,62 @@ pub fn publish(
     description: []const u8,
     proxy: ?proxy_mod.Proxy,
 ) !void {
-    const sk = try nostr_config.readSecretKey(allocator);
+    const sk = try nostr_config.readSecretKey(ctx, allocator);
     const pk = try secp.publicKeyFromSecret(sk);
 
-    var torrent_ev = try nip35.buildFromMetainfo(allocator, sk, pk, mi, info_hash, description);
+    var torrent_ev = try nip35.buildFromMetainfo(ctx.io, allocator, sk, pk, mi, info_hash, description);
     defer torrent_ev.deinit(allocator);
 
     const announce_ev: ?nostr.Event = switch (ann) {
         .none => null,
-        .onion => |o| try peer_announce.buildOnion(allocator, sk, pk, info_hash, o.host, o.port),
-        .i2p => |i| try peer_announce.buildI2p(allocator, sk, pk, info_hash, i.host, i.port),
-        .ipv4 => |v| try peer_announce.build(allocator, sk, pk, info_hash, v.ip, v.port),
+        .onion => |o| try peer_announce.buildOnion(
+            ctx.io,
+            allocator,
+            sk,
+            pk,
+            info_hash,
+            o.host,
+            o.port,
+        ),
+        .i2p => |i| try peer_announce.buildI2p(
+            ctx.io,
+            allocator,
+            sk,
+            pk,
+            info_hash,
+            i.host,
+            i.port,
+        ),
+        .ipv4 => |v| try peer_announce.build(
+            ctx.io,
+            allocator,
+            sk,
+            pk,
+            info_hash,
+            v.ip,
+            v.port,
+        ),
     };
     defer if (announce_ev) |ev| ev.deinit(allocator);
 
-    const relay_urls = try nostr_config.readRelays(allocator);
+    const relay_urls = try nostr_config.readRelays(ctx, allocator);
     defer nostr_config.freeRelays(allocator, relay_urls);
 
     var torrent_acks: usize = 0;
     var announce_acks: usize = 0;
-    const gate = relay.oneShotGate(relay_urls, proxy);
+    const gate = relay.oneShotGate(
+        ctx.io,
+        relay_urls,
+        proxy,
+    );
     for (relay_urls) |url| {
-        var r = relay.dial(allocator, url, proxy, gate) catch |err| {
+        var r = relay.dial(
+            ctx.io,
+            allocator,
+            url,
+            proxy,
+            gate,
+        ) catch |err| {
             log.warn("nostr publish: {s}: {}", .{ url, err });
             continue;
         };

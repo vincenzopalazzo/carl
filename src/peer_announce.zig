@@ -65,6 +65,7 @@ pub const PeerAnnounce = struct {
 
 /// Build and sign a kind-30078 event for a public IPv4 endpoint.
 pub fn build(
+    io: std.Io,
     allocator: Allocator,
     sk: secp.SecretKey,
     pk: secp.PublicKey,
@@ -85,13 +86,14 @@ pub fn build(
     const port_tag = [_][]const u8{ "port", port_str };
     const client_tag = [_][]const u8{ "client", "carl/0.1" };
     const tag_sets = [_][]const []const u8{ d_tag[0..], ip_tag[0..], port_tag[0..], client_tag[0..] };
-    return buildTagged(allocator, sk, pk, &tag_sets);
+    return buildTagged(io, allocator, sk, pk, &tag_sets);
 }
 
 /// Shared builder for a host-based endpoint (Tor onion or I2P): identical
 /// `d`/`host`/`port`/`client` tag schema; the suffix in `host` distinguishes
 /// the network. Validation is the caller's responsibility.
 fn buildHostEndpoint(
+    io: std.Io,
     allocator: Allocator,
     sk: secp.SecretKey,
     pk: secp.PublicKey,
@@ -110,11 +112,12 @@ fn buildHostEndpoint(
     const port_tag = [_][]const u8{ "port", port_str };
     const client_tag = [_][]const u8{ "client", "carl/0.1" };
     const tag_sets = [_][]const []const u8{ d_tag[0..], host_tag[0..], port_tag[0..], client_tag[0..] };
-    return buildTagged(allocator, sk, pk, &tag_sets);
+    return buildTagged(io, allocator, sk, pk, &tag_sets);
 }
 
 /// Build and sign a kind-30078 event for a Tor v3 hidden service.
 pub fn buildOnion(
+    io: std.Io,
     allocator: Allocator,
     sk: secp.SecretKey,
     pk: secp.PublicKey,
@@ -123,12 +126,21 @@ pub fn buildOnion(
     port: u16,
 ) !nostr.Event {
     if (!isValidV3OnionHost(onion_host)) return error.BadHost;
-    return buildHostEndpoint(allocator, sk, pk, info_hash, onion_host, port);
+    return buildHostEndpoint(
+        io,
+        allocator,
+        sk,
+        pk,
+        info_hash,
+        onion_host,
+        port,
+    );
 }
 
 /// Build and sign a kind-30078 event for an I2P `*.b32.i2p` destination. Same
 /// `host`-tag schema as the onion path; the suffix distinguishes the two.
 pub fn buildI2p(
+    io: std.Io,
     allocator: Allocator,
     sk: secp.SecretKey,
     pk: secp.PublicKey,
@@ -137,7 +149,15 @@ pub fn buildI2p(
     port: u16,
 ) !nostr.Event {
     if (!isValidI2pB32Host(i2p_host)) return error.BadHost;
-    return buildHostEndpoint(allocator, sk, pk, info_hash, i2p_host, port);
+    return buildHostEndpoint(
+        io,
+        allocator,
+        sk,
+        pk,
+        info_hash,
+        i2p_host,
+        port,
+    );
 }
 
 /// Parse and validate a kind-30078 event. Supports legacy `ip` tags and `host`
@@ -234,6 +254,7 @@ pub fn isRoutable(ip: [4]u8) bool {
 }
 
 fn buildTagged(
+    io: std.Io,
     allocator: Allocator,
     sk: secp.SecretKey,
     pk: secp.PublicKey,
@@ -256,7 +277,7 @@ fn buildTagged(
     var ev: nostr.Event = .{
         .id = undefined,
         .pubkey = pk,
-        .created_at = std.time.timestamp(),
+        .created_at = std.Io.Clock.real.now(io).toSeconds(),
         .kind = kind_peer_announce,
         .tags = tags_owned,
         .content = empty_content,
@@ -329,7 +350,7 @@ test "build + parse ipv4 round trip" {
     var info_hash: [20]u8 = undefined;
     @memset(&info_hash, 0xEF);
 
-    var ev = try build(allocator, sk, pk, info_hash, .{ 203, 0, 113, 7 }, 6881);
+    var ev = try build(std.testing.io, allocator, sk, pk, info_hash, .{ 203, 0, 113, 7 }, 6881);
     defer ev.deinit(allocator);
 
     try std.testing.expect(nostr.verify(ev, allocator));
@@ -353,7 +374,7 @@ test "build + parse onion round trip" {
     const pk = try secp.publicKeyFromSecret(sk);
 
     const info_hash: [20]u8 = .{0xAB} ** 20;
-    var ev = try buildOnion(allocator, sk, pk, info_hash, onion, 80);
+    var ev = try buildOnion(std.testing.io, allocator, sk, pk, info_hash, onion, 80);
     defer ev.deinit(allocator);
 
     const ann = try parse(ev);
@@ -374,7 +395,7 @@ test "build + parse i2p round trip" {
     const pk = try secp.publicKeyFromSecret(sk);
 
     const info_hash: [20]u8 = .{0xCD} ** 20;
-    var ev = try buildI2p(allocator, sk, pk, info_hash, dest, 6881);
+    var ev = try buildI2p(std.testing.io, allocator, sk, pk, info_hash, dest, 6881);
     defer ev.deinit(allocator);
 
     const ann = try parse(ev);
@@ -400,7 +421,7 @@ test "i2p announce with port 0 (default I2CP port) parses" {
     const pk = try secp.publicKeyFromSecret(sk);
 
     const info_hash: [20]u8 = .{0xCD} ** 20;
-    var ev = try buildI2p(allocator, sk, pk, info_hash, dest, 0);
+    var ev = try buildI2p(std.testing.io, allocator, sk, pk, info_hash, dest, 0);
     defer ev.deinit(allocator);
 
     const ann = try parse(ev);
@@ -420,12 +441,12 @@ test "port 0 still rejected for onion and ipv4" {
     @memset(&olabel, 'a');
     var ohost: [v3_onion_host_len]u8 = undefined;
     const onion = std.fmt.bufPrint(&ohost, "{s}.onion", .{&olabel}) catch unreachable;
-    var oev = try buildOnion(allocator, sk, pk, info_hash, onion, 0);
+    var oev = try buildOnion(std.testing.io, allocator, sk, pk, info_hash, onion, 0);
     defer oev.deinit(allocator);
     try std.testing.expectError(error.BadPort, parse(oev));
 
     // ipv4 with port 0 -> BadPort
-    var iev = try build(allocator, sk, pk, info_hash, .{ 8, 8, 8, 8 }, 0);
+    var iev = try build(std.testing.io, allocator, sk, pk, info_hash, .{ 8, 8, 8, 8 }, 0);
     defer iev.deinit(allocator);
     try std.testing.expectError(error.BadPort, parse(iev));
 }
@@ -448,7 +469,7 @@ test "buildI2p rejects non-i2p host" {
     try secp.fromHex("0000000000000000000000000000000000000000000000000000000000000003", &sk);
     const pk = try secp.publicKeyFromSecret(sk);
     const info_hash: [20]u8 = .{0} ** 20;
-    try std.testing.expectError(error.BadHost, buildI2p(allocator, sk, pk, info_hash, "nope.i2p", 80));
+    try std.testing.expectError(error.BadHost, buildI2p(std.testing.io, allocator, sk, pk, info_hash, "nope.i2p", 80));
 }
 
 test "parse rejects private IP" {
@@ -461,7 +482,7 @@ test "parse rejects private IP" {
     var info_hash: [20]u8 = undefined;
     @memset(&info_hash, 0xEF);
 
-    var ev = try build(allocator, sk, pk, info_hash, .{ 192, 168, 1, 1 }, 6881);
+    var ev = try build(std.testing.io, allocator, sk, pk, info_hash, .{ 192, 168, 1, 1 }, 6881);
     defer ev.deinit(allocator);
     try std.testing.expectError(error.UnsafeIp, parse(ev));
 }
@@ -472,7 +493,7 @@ test "parse rejects bad onion host" {
     try secp.fromHex("0000000000000000000000000000000000000000000000000000000000000003", &sk);
     const pk = try secp.publicKeyFromSecret(sk);
     const info_hash: [20]u8 = .{0} ** 20;
-    try std.testing.expectError(error.BadHost, buildOnion(allocator, sk, pk, info_hash, "not-an-onion", 80));
+    try std.testing.expectError(error.BadHost, buildOnion(std.testing.io, allocator, sk, pk, info_hash, "not-an-onion", 80));
 }
 
 test "parse rejects wrong kind" {

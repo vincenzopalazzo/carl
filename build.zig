@@ -109,9 +109,9 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    exe.linkLibrary(secp);
+    exe.root_module.linkLibrary(secp);
     exe.root_module.addIncludePath(secp_dep.path("include"));
-    exe.linkLibrary(sqlite);
+    exe.root_module.linkLibrary(sqlite);
 
     b.installArtifact(exe);
 

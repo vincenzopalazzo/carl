@@ -139,10 +139,12 @@ pub fn hashFromSavedName(name: []const u8) ?[20]u8 {
 
 pub const Mirror = struct {
     allocator: Allocator,
+    io: std.Io,
+    ctx: nostr_config.Context,
     /// Owned copies of the caller's option strings (`dir`, `i2p_sam`), so an
     /// embedded mirror survives the caller mutating its config.
     opts: Options,
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
     transfers: std.ArrayList(*Transfer) = .empty,
     /// Per-mirror stop request (the daemon stops one mirror without stopping
     /// the process). The global `session_mod.shutdown_requested` still stops
@@ -152,7 +154,11 @@ pub const Mirror = struct {
     pk_hex: [64]u8 = undefined,
 
     /// Heap-allocate a mirror with owned copies of the option strings.
-    pub fn create(allocator: Allocator, opts: Options) Error!*Mirror {
+    pub fn create(
+        ctx: nostr_config.Context,
+        allocator: Allocator,
+        opts: Options,
+    ) Error!*Mirror {
         const dir = allocator.dupe(u8, opts.dir) catch return error.OutOfMemory;
         errdefer allocator.free(dir);
         const sam = allocator.dupe(u8, opts.i2p_sam) catch return error.OutOfMemory;
@@ -163,7 +169,12 @@ pub const Mirror = struct {
             null;
         errdefer if (subdir) |s| allocator.free(s);
         const self = allocator.create(Mirror) catch return error.OutOfMemory;
-        self.* = .{ .allocator = allocator, .opts = opts };
+        self.* = .{
+            .allocator = allocator,
+            .io = ctx.io,
+            .ctx = ctx,
+            .opts = opts,
+        };
         self.opts.dir = dir;
         self.opts.i2p_sam = sam;
         self.opts.checkpoint_subdir = subdir;
@@ -174,7 +185,10 @@ pub const Mirror = struct {
     /// Start the poll loop on its own thread. Resumes checkpointed torrents
     /// first, then polls relays every `poll_interval_s`.
     pub fn start(self: *Mirror) Error!void {
-        std.fs.cwd().makePath(self.opts.dir) catch {};
+        std.Io.Dir.cwd().createDirPath(
+            self.io,
+            self.opts.dir,
+        ) catch {};
         {
             const npub = nip19.encode32(self.allocator, .npub, self.opts.pubkey) catch null;
             defer if (npub) |n| self.allocator.free(n);
@@ -184,7 +198,7 @@ pub const Mirror = struct {
         }
         // The mirror publishes its own peer-announces; without a local identity
         // it still seeds, but nobody can discover it. Say so once, up front.
-        if (nostr_config.readSecretKey(self.allocator)) |_| {} else |_| {
+        if (nostr_config.readSecretKey(self.ctx, self.allocator)) |_| {} else |_| {
             log.warn("no nostr identity found; mirrored seeds won't be announced. Run `carl nostr-keygen` first.", .{});
         }
         self.poll_thread = std.Thread.spawn(.{}, pollLoop, .{self}) catch return error.ThreadSpawnFailed;
@@ -197,11 +211,11 @@ pub const Mirror = struct {
         self.stop_flag.store(true, .release);
         // Kick live sessions out of their run loops (same cross-thread `running`
         // signal the manager uses on its sessions).
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         for (self.transfers.items) |t| {
             if (t.live_session) |s| s.running = false;
         }
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
         if (self.poll_thread) |p| {
             p.join();
             self.poll_thread = null;
@@ -236,8 +250,8 @@ pub const Mirror = struct {
     /// Snapshot every mirrored torrent into `arena` (names duped; progress
     /// read from the live session when one is running).
     pub fn torrentsSnapshot(self: *Mirror, arena: Allocator) Allocator.Error![]TorrentInfo {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         const out = try arena.alloc(TorrentInfo, self.transfers.items.len);
         for (self.transfers.items, 0..) |t, i| {
             var info: TorrentInfo = .{
@@ -266,15 +280,15 @@ pub const Mirror = struct {
 
     /// Number of registered transfers (running or not).
     pub fn count(self: *Mirror) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.transfers.items.len;
     }
 
     /// True when `hash` is already registered (dedupe for `startTransfer`).
     pub fn hasInfoHash(self: *Mirror, hash: [20]u8) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         for (self.transfers.items) |t| {
             if (std.mem.eql(u8, &t.info_hash, &hash)) return true;
         }
@@ -291,7 +305,7 @@ pub const Mirror = struct {
     /// eviction against mirror shutdown by joining its own loop thread before
     /// stopping the mirror.
     pub fn evictTransfer(self: *Mirror, info_hash: [20]u8) void {
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         var idx: ?usize = null;
         for (self.transfers.items, 0..) |t, i| {
             if (std.mem.eql(u8, &t.info_hash, &info_hash)) {
@@ -300,7 +314,7 @@ pub const Mirror = struct {
             }
         }
         const i = idx orelse {
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
             return;
         };
         const t = self.transfers.items[i];
@@ -311,7 +325,7 @@ pub const Mirror = struct {
         // `stop` can never double-join it.
         const th = t.thread;
         t.thread = null;
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
         if (th) |h| h.join();
         t.destroy();
     }
@@ -362,17 +376,17 @@ const Transfer = struct {
     /// sees the published session and sets `running = false`.
     /// Returns false when stopping (session NOT published).
     fn publishSessionUnlessStopping(self: *Transfer, session: *session_mod.Session) bool {
-        self.mirror.mutex.lock();
-        defer self.mirror.mutex.unlock();
+        self.mirror.mutex.lockUncancelable(self.mirror.io);
+        defer self.mirror.mutex.unlock(self.mirror.io);
         if (transferStopping(self)) return false;
         self.live_session = session;
         return true;
     }
 
     fn clearSession(self: *Transfer) void {
-        self.mirror.mutex.lock();
+        self.mirror.mutex.lockUncancelable(self.mirror.io);
         self.live_session = null;
-        self.mirror.mutex.unlock();
+        self.mirror.mutex.unlock(self.mirror.io);
     }
 
     fn destroy(self: *Transfer) void {
@@ -385,13 +399,19 @@ const Transfer = struct {
     }
 };
 
-fn sigintHandler(_: i32) callconv(.c) void {
+fn sigintHandler(
+    _: @TypeOf(std.posix.SIG.INT),
+) callconv(.c) void {
     session_mod.shutdown_requested.store(true, .release);
 }
 
 /// Run the follow loop until SIGINT. Blocks. (CLI entry; the daemon embeds
 /// `Mirror` directly.)
-pub fn run(allocator: Allocator, opts: Options) !void {
+pub fn run(
+    ctx: nostr_config.Context,
+    allocator: Allocator,
+    opts: Options,
+) !void {
     const act = std.posix.Sigaction{
         .handler = .{ .handler = sigintHandler },
         .mask = std.posix.sigemptyset(),
@@ -399,12 +419,12 @@ pub fn run(allocator: Allocator, opts: Options) !void {
     };
     std.posix.sigaction(std.posix.SIG.INT, &act, null);
 
-    const mirror = try Mirror.create(allocator, opts);
+    const mirror = try Mirror.create(ctx, allocator, opts);
     defer mirror.destroy();
     try mirror.start();
 
     while (!mirror.stopping()) {
-        std.Thread.sleep(200 * std.time.ns_per_ms);
+        try ctx.io.sleep(.fromMilliseconds(200), .awake);
     }
     log.info("shutting down; stopping {d} mirror(s)...", .{mirror.count()});
 }
@@ -416,7 +436,7 @@ fn pollLoop(mirror: *Mirror) void {
         // Sleep the poll interval in small slices so stop lands promptly.
         var slept_ms: u64 = 0;
         while (!mirror.stopping() and slept_ms < mirror.opts.poll_interval_s * 1000) {
-            std.Thread.sleep(200 * std.time.ns_per_ms);
+            mirror.io.sleep(.fromMilliseconds(200), .awake) catch return;
             slept_ms += 200;
         }
     }
@@ -430,10 +450,16 @@ fn resumeSaved(mirror: *Mirror) void {
         std.fmt.bufPrint(&buf, "{s}/{s}", .{ mirror.opts.dir, sub }) catch return
     else
         mirror.opts.dir;
-    var dir = std.fs.cwd().openDir(scan_dir, .{ .iterate = true }) catch return;
-    defer dir.close();
+    var dir = std.Io.Dir.cwd().openDir(
+        mirror.io,
+        scan_dir,
+        .{ .iterate = true },
+    ) catch return;
+    defer dir.close(mirror.io);
+
     var it = dir.iterate();
-    while (it.next() catch null) |entry| {
+
+    while (it.next(mirror.io) catch null) |entry| {
         if (entry.kind != .file) continue;
         const hash = hashFromSavedName(entry.name) orelse continue;
         if (mirror.hasInfoHash(hash)) continue;
@@ -449,7 +475,7 @@ fn resumeSaved(mirror: *Mirror) void {
 fn pollOnce(mirror: *Mirror) void {
     const a = mirror.allocator;
 
-    const relay_urls = nostr_config.readRelays(a) catch return;
+    const relay_urls = nostr_config.readRelays(mirror.ctx, a) catch return;
     defer nostr_config.freeRelays(a, relay_urls);
 
     var authors_arr = [_][]const u8{&mirror.pk_hex};
@@ -463,7 +489,13 @@ fn pollOnce(mirror: *Mirror) void {
     for (relay_urls) |url| {
         if (mirror.stopping()) return;
         // Periodic mirror poll: honor the health gate.
-        var r = relay_mod.dial(a, url, null, .honor) catch |err| {
+        var r = relay_mod.dial(
+            mirror.io,
+            a,
+            url,
+            null,
+            .honor,
+        ) catch |err| {
             log.debug("relay {s}: {}", .{ url, err });
             continue;
         };
@@ -562,15 +594,15 @@ pub fn startTransfer(
         .torrent_path = torrent_path,
     };
 
-    mirror.mutex.lock();
+    mirror.mutex.lockUncancelable(mirror.io);
     mirror.transfers.append(a, t) catch {
-        mirror.mutex.unlock();
+        mirror.mutex.unlock(mirror.io);
         // Raw destroy: the owned pieces are still freed by the errdefers above
         // (t.destroy() here would double-free them).
         a.destroy(t);
         return error.OutOfMemory;
     };
-    mirror.mutex.unlock();
+    mirror.mutex.unlock(mirror.io);
 
     t.thread = std.Thread.spawn(.{}, mirrorThread, .{t}) catch {
         // Leave the (threadless) entry registered: removing it would require
@@ -611,7 +643,12 @@ fn mirrorTorrent(t: *Transfer) Error!void {
 fn ensureDownloaded(t: *Transfer) Error!metainfo_mod.Metainfo {
     const a = t.allocator;
 
-    if (std.fs.cwd().readFileAlloc(a, t.torrent_path, 10 * 1024 * 1024) catch null) |data| {
+    if (std.Io.Dir.cwd().readFileAlloc(
+        t.mirror.io,
+        t.torrent_path,
+        a,
+        .limited(10 * 1024 * 1024),
+    ) catch null) |data| {
         defer a.free(data);
         const mi = metainfo_mod.parse(a, data) catch return error.InvalidTorrent;
         errdefer mi.deinit(a);
@@ -619,10 +656,10 @@ fn ensureDownloaded(t: *Transfer) Error!metainfo_mod.Metainfo {
         // status displays — resumed transfers start with an empty title.
         if (t.title.len == 0 and mi.name.len > 0) {
             if (a.dupe(u8, mi.name)) |dup| {
-                t.mirror.mutex.lock();
+                t.mirror.mutex.lockUncancelable(t.mirror.io);
                 a.free(t.title);
                 t.title = dup;
-                t.mirror.mutex.unlock();
+                t.mirror.mutex.unlock(t.mirror.io);
             } else |_| {}
         }
         try runDownload(t, mi, false);
@@ -635,7 +672,12 @@ fn ensureDownloaded(t: *Transfer) Error!metainfo_mod.Metainfo {
         defer mi.deinit(a);
         try runDownload(t, mi, true);
     }
-    const data = std.fs.cwd().readFileAlloc(a, t.torrent_path, 10 * 1024 * 1024) catch
+    const data = std.Io.Dir.cwd().readFileAlloc(
+        t.mirror.io,
+        t.torrent_path,
+        a,
+        .limited(10 * 1024 * 1024),
+    ) catch
         return error.InvalidTorrent;
     defer a.free(data);
     return metainfo_mod.parse(a, data) catch error.InvalidTorrent;
@@ -710,7 +752,12 @@ fn runDownload(t: *Transfer, mi: metainfo_mod.Metainfo, magnet: bool) Error!void
     defer if (i2p_session) |*s| s.deinit();
     if (opts.route == .i2p) {
         const bridge = i2p_sam.parseUrl(opts.i2p_sam) catch return error.BadSamBridge;
-        i2p_session = i2p_sam.Session.create(a, bridge, "carl-follow") catch |err| {
+        i2p_session = i2p_sam.Session.create(
+            t.mirror.io,
+            a,
+            bridge,
+            "carl-follow",
+        ) catch |err| {
             log.warn("i2p SAM session failed: {} (is the router running with SAM enabled?)", .{err});
             return error.SamFailed;
         };
@@ -721,8 +768,8 @@ fn runDownload(t: *Transfer, mi: metainfo_mod.Metainfo, magnet: bool) Error!void
     // must unwind here, not after the storage verify + full download run.
     if (transferStopping(t)) return;
 
-    const port = pickFreePort(false) orelse 6881;
-    var session = session_mod.Session.init(a, mi, opts.dir, .download, port, null, .any, false, i2p_ptr, false) catch
+    const port = pickFreePort(t.mirror.io, false) orelse 6881;
+    var session = session_mod.Session.init(t.mirror.io, t.mirror.ctx, a, mi, opts.dir, .download, port, null, .any, false, i2p_ptr, false) catch
         return error.SessionInitFailed;
     defer session.deinit();
     if (magnet) {
@@ -747,7 +794,7 @@ fn runDownload(t: *Transfer, mi: metainfo_mod.Metainfo, magnet: bool) Error!void
     if (magnet) {
         if (session.copyTorrent(a)) |blob| {
             defer a.free(blob);
-            writeFileAtomic(t.torrent_path, blob) catch |err| {
+            writeFileAtomic(t.mirror.io, t.torrent_path, blob) catch |err| {
                 log.warn("could not checkpoint {s}: {}", .{ t.torrent_path, err });
             };
         }
@@ -765,19 +812,31 @@ fn seedForever(t: *Transfer, mi: metainfo_mod.Metainfo) Error!void {
     switch (opts.route) {
         .i2p => {
             const bridge = i2p_sam.parseUrl(opts.i2p_sam) catch return error.BadSamBridge;
-            const port = pickFreePort(true) orelse return error.NoListener;
+            const port = pickFreePort(t.mirror.io, true) orelse
+                return error.NoListener;
 
             // Persisted destination keyed by infohash → stable `.b32.i2p`, so
             // the announce survives restarts (same scheme as `carl seed`).
-            const persisted = i2p_seed.load(a, &t.hash_hex) catch null;
+            const persisted = i2p_seed.load(
+                t.mirror.ctx,
+                a,
+                &t.hash_hex,
+            ) catch null;
             defer if (persisted) |p| a.free(p);
             const dest: i2p_sam.Session.Dest = if (persisted) |p| .{ .priv = p } else .transient;
-            var sam = i2p_sam.Session.createWithDest(a, bridge, "carl-follow-seed", dest) catch |err| {
+            var sam = i2p_sam.Session.createWithDest(
+                t.mirror.io,
+                a,
+                bridge,
+                "carl-follow-seed",
+                dest,
+            ) catch |err| {
                 log.warn("i2p SAM seed session failed: {}", .{err});
                 return error.SamFailed;
             };
             defer sam.deinit();
-            if (persisted == null) i2p_seed.save(a, &t.hash_hex, sam.destination);
+            if (persisted == null)
+                i2p_seed.save(t.mirror.ctx, a, &t.hash_hex, sam.destination);
 
             // SAM session create can take seconds; an eviction landing in
             // that window must unwind here, not slip into seed mode with no
@@ -787,7 +846,7 @@ fn seedForever(t: *Transfer, mi: metainfo_mod.Metainfo) Error!void {
             const host = i2p_sam.b32Address(a, sam.destination) catch return error.SamFailed;
             defer a.free(host);
 
-            var session = session_mod.Session.init(a, mi, opts.dir, .seed, port, null, .loopback, false, &sam, true) catch
+            var session = session_mod.Session.init(t.mirror.io, t.mirror.ctx, a, mi, opts.dir, .seed, port, null, .loopback, false, &sam, true) catch
                 return error.SessionInitFailed;
             defer session.deinit();
             if (session.listener == null) return error.NoListener;
@@ -805,13 +864,14 @@ fn seedForever(t: *Transfer, mi: metainfo_mod.Metainfo) Error!void {
             defer t.clearSession();
             t.setPhase(.seeding);
 
-            publishAnnounce(a, t.info_hash, .{ .i2p_host = host });
+            publishAnnounce(t.mirror.ctx, a, t.info_hash, .{ .i2p_host = host });
             log.info("mirror seeding {s} at {s}", .{ t.title, host });
             session.run() catch return error.SessionFailed;
         },
         .direct => {
-            const port = pickFreePort(false) orelse return error.NoListener;
-            var session = session_mod.Session.init(a, mi, opts.dir, .seed, port, null, .any, false, null, false) catch
+            const port = pickFreePort(t.mirror.io, false) orelse
+                return error.NoListener;
+            var session = session_mod.Session.init(t.mirror.io, t.mirror.ctx, a, mi, opts.dir, .seed, port, null, .any, false, null, false) catch
                 return error.SessionInitFailed;
             defer session.deinit();
             if (session.listener == null) return error.NoListener;
@@ -824,7 +884,7 @@ fn seedForever(t: *Transfer, mi: metainfo_mod.Metainfo) Error!void {
             t.setPhase(.seeding);
 
             if (opts.external_ip) |ip| {
-                publishAnnounce(a, t.info_hash, .{ .ipv4 = .{ .ip = ip, .port = port } });
+                publishAnnounce(t.mirror.ctx, a, t.info_hash, .{ .ipv4 = .{ .ip = ip, .port = port } });
             } else {
                 log.warn("no --external-ip; reseeding {s} without a dialable announce", .{t.title});
             }
@@ -843,26 +903,57 @@ const AnnounceEndpoint = union(enum) {
 /// Publish our kind-30078 peer-announce for a mirrored torrent under the local
 /// identity. Best-effort: without a key (or with all relays down) the mirror
 /// still seeds; it's just not discoverable, which was warned about at startup.
-fn publishAnnounce(a: Allocator, info_hash: [20]u8, endpoint: AnnounceEndpoint) void {
-    const sk = nostr_config.readSecretKey(a) catch return;
+fn publishAnnounce(
+    ctx: nostr_config.Context,
+    a: Allocator,
+    info_hash: [20]u8,
+    endpoint: AnnounceEndpoint,
+) void {
+    const sk = nostr_config.readSecretKey(ctx, a) catch return;
     const pk = secp.publicKeyFromSecret(sk) catch return;
 
     const ev = switch (endpoint) {
-        .i2p_host => |host| peer_announce.buildI2p(a, sk, pk, info_hash, host, 0),
-        .ipv4 => |v| peer_announce.build(a, sk, pk, info_hash, v.ip, v.port),
+        .i2p_host => |host| peer_announce.buildI2p(
+            ctx.io,
+            a,
+            sk,
+            pk,
+            info_hash,
+            host,
+            0,
+        ),
+        .ipv4 => |v| peer_announce.build(
+            ctx.io,
+            a,
+            sk,
+            pk,
+            info_hash,
+            v.ip,
+            v.port,
+        ),
     } catch |err| {
         log.warn("could not build peer-announce: {}", .{err});
         return;
     };
     defer ev.deinit(a);
 
-    const relay_urls = nostr_config.readRelays(a) catch return;
+    const relay_urls = nostr_config.readRelays(ctx, a) catch return;
     defer nostr_config.freeRelays(a, relay_urls);
 
     var acks: usize = 0;
-    const gate = relay_mod.oneShotGate(relay_urls, null);
+    const gate = relay_mod.oneShotGate(
+        ctx.io,
+        relay_urls,
+        null,
+    );
     for (relay_urls) |url| {
-        var r = relay_mod.dial(a, url, null, gate) catch continue;
+        var r = relay_mod.dial(
+            ctx.io,
+            a,
+            url,
+            null,
+            gate,
+        ) catch continue;
         defer r.deinit();
         if (relay_mod.publishAndWait(a, &r, ev, 5_000)) acks += 1;
     }
@@ -884,7 +975,7 @@ fn discoverPeers(a: Allocator, info_hash: [20]u8, session: *session_mod.Session)
     var ih_hex: [40]u8 = undefined;
     secp.toHex(&info_hash, &ih_hex);
 
-    const relay_urls = nostr_config.readRelays(a) catch return;
+    const relay_urls = nostr_config.readRelays(session.nostr_ctx, a) catch return;
     defer nostr_config.freeRelays(a, relay_urls);
 
     var values_arr = [_][]const u8{&ih_hex};
@@ -899,7 +990,13 @@ fn discoverPeers(a: Allocator, info_hash: [20]u8, session: *session_mod.Session)
     for (relay_urls) |url| {
         if (!session.running or session_mod.shutdown_requested.load(.acquire)) return;
         // Peer re-discovery on a schedule: honor the health gate.
-        var r = relay_mod.dial(a, url, null, .honor) catch continue;
+        var r = relay_mod.dial(
+            session.io,
+            a,
+            url,
+            null,
+            .honor,
+        ) catch continue;
         defer r.deinit();
         const events = relay_mod.subscribeAndCollect(a, &r, filter, .{
             .timeout_ms = 10_000,
@@ -917,7 +1014,12 @@ fn discoverPeers(a: Allocator, info_hash: [20]u8, session: *session_mod.Session)
             switch (ann.endpoint) {
                 .ipv4 => |ep| {
                     if (session.i2p != null) continue; // no clearnet on i2p
-                    const addr = std.net.Address.initIp4(ep.ip, ep.port);
+                    const addr: std.Io.net.IpAddress = .{
+                        .ip4 = .{
+                            .bytes = ep.ip,
+                            .port = ep.port,
+                        },
+                    };
                     session.connectDirectPeer(addr) catch continue;
                     added += 1;
                 },
@@ -936,24 +1038,58 @@ fn discoverPeers(a: Allocator, info_hash: [20]u8, session: *session_mod.Session)
 /// Discover a free port by binding port 0 (loopback for forwarded i2p seeds,
 /// 0.0.0.0 for public listeners). Tiny TOCTOU window before the session
 /// re-binds; callers treat a later bind failure as fatal for the mirror.
-fn pickFreePort(loopback: bool) ?u16 {
-    const ip: [4]u8 = if (loopback) .{ 127, 0, 0, 1 } else .{ 0, 0, 0, 0 };
-    var server = std.net.Address.initIp4(ip, 0).listen(.{ .reuse_address = true }) catch return null;
-    defer server.deinit();
-    return server.listen_address.getPort();
+fn pickFreePort(io: std.Io, loopback: bool) ?u16 {
+    const ip: [4]u8 = if (loopback)
+        .{ 127, 0, 0, 1 }
+    else
+        .{ 0, 0, 0, 0 };
+
+    const address: std.Io.net.IpAddress = .{
+        .ip4 = .{
+            .bytes = ip,
+            .port = 0,
+        },
+    };
+
+    var server = address.listen(
+        io,
+        .{ .reuse_address = true },
+    ) catch return null;
+    defer server.deinit(io);
+
+    return server.socket.address.getPort();
 }
 
 /// Write via a temp file + rename so a crash mid-write never leaves a torn
 /// checkpoint (a torn `.torrent` would wedge the restart path).
-fn writeFileAtomic(path: []const u8, data: []const u8) !void {
+fn writeFileAtomic(
+    io: std.Io,
+    path: []const u8,
+    data: []const u8,
+) !void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const tmp = try std.fmt.bufPrint(&buf, "{s}.tmp", .{path});
+
+    const cwd = std.Io.Dir.cwd();
+
     {
-        var f = try std.fs.cwd().createFile(tmp, .{ .truncate = true });
-        defer f.close();
-        try f.writeAll(data);
+        const f = try cwd.createFile(
+            io,
+            tmp,
+            .{ .truncate = true },
+        );
+        defer f.close(io);
+
+        try f.writeStreamingAll(io, data);
     }
-    try std.fs.cwd().rename(tmp, path);
+
+    try std.Io.Dir.rename(
+        cwd,
+        tmp,
+        cwd,
+        path,
+        io,
+    );
 }
 
 // ===========================================================================
@@ -1002,7 +1138,19 @@ test "hashFromSavedName round-trips and rejects other files" {
 
 test "placeholderMetainfo carries title and NIP-35 trackers" {
     const a = std.testing.allocator;
-    var mirror = Mirror{ .allocator = a, .opts = .{ .pubkey = .{0} ** 32, .dir = "." } };
+
+    const ctx: nostr_config.Context = .{
+        .io = std.testing.io,
+        .home = null,
+        .xdg_config_home = null,
+    };
+
+    var mirror = Mirror{
+        .allocator = a,
+        .io = std.testing.io,
+        .ctx = ctx,
+        .opts = .{ .pubkey = .{0} ** 32, .dir = "." },
+    };
     var trackers_arr = [_][]u8{ @constCast("http://t1/announce"), @constCast("udp://t2:1337") };
     var t = Transfer{
         .allocator = a,
@@ -1022,18 +1170,26 @@ test "placeholderMetainfo carries title and NIP-35 trackers" {
 }
 
 test "pickFreePort returns a usable port" {
-    const port = pickFreePort(true) orelse return error.TestUnexpectedResult;
+    const port = pickFreePort(
+        std.testing.io,
+        true,
+    ) orelse return error.TestUnexpectedResult;
     try std.testing.expect(port > 0);
 }
 
 test "Mirror create/start/stop lifecycle with no relays reachable" {
     const a = std.testing.allocator;
+    const ctx: nostr_config.Context = .{
+        .io = std.testing.io,
+        .home = null,
+        .xdg_config_home = null,
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
     defer a.free(dir);
 
-    const mirror = try Mirror.create(a, .{
+    const mirror = try Mirror.create(ctx, a, .{
         .pubkey = .{7} ** 32,
         .dir = dir,
         .poll_interval_s = 1,
@@ -1049,7 +1205,17 @@ test "Mirror create/start/stop lifecycle with no relays reachable" {
 
 test "Transfer.publishSessionUnlessStopping honors the stop flag at the seed-entry boundary" {
     const a = std.testing.allocator;
-    var mirror = Mirror{ .allocator = a, .opts = .{ .pubkey = .{0} ** 32, .dir = "." } };
+    const ctx: nostr_config.Context = .{
+        .io = std.testing.io,
+        .home = null,
+        .xdg_config_home = null,
+    };
+    var mirror = Mirror{
+        .allocator = a,
+        .io = std.testing.io,
+        .ctx = ctx,
+        .opts = .{ .pubkey = .{0} ** 32, .dir = "." },
+    };
     var t = Transfer{
         .allocator = a,
         .mirror = &mirror,

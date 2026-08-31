@@ -15,6 +15,11 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+
+const Net = std.Io.net;
+const Stream = Net.Stream;
+const HostName = Net.HostName;
+
 const posix = std.posix;
 const tls = std.crypto.tls;
 const proxy_mod = @import("proxy.zig");
@@ -106,7 +111,8 @@ pub fn parseUrl(input: []const u8) Error!Url {
 pub const Conn = struct {
     allocator: Allocator,
     /// Socket handle for `setsockopt` (recv timeout). Closed via `deinit`.
-    stream: std.net.Stream,
+    io: std.Io,
+    stream: Stream,
     /// Non-null for `wss://`; owns the TLS session used for reads/writes.
     http: ?HttpIo = null,
     /// Non-null for `wss://` over a proxy tunnel (TLS on top of SOCKS).
@@ -129,11 +135,13 @@ pub const Conn = struct {
     const tls_proxy_handshake_secs: u32 = 20;
 
     const TlsProxyIo = struct {
-        stream: std.net.Stream,
-        socket_reader: std.net.Stream.Reader,
-        socket_writer: std.net.Stream.Writer,
+        io: std.Io,
+        stream: Stream,
+        socket_reader: Stream.Reader,
+        socket_writer: Stream.Writer,
         tls: tls.Client,
         ca_bundle: std.crypto.Certificate.Bundle,
+        ca_lock: std.Io.RwLock,
         socket_read_buf: [tls_io_buf_len]u8,
         socket_write_buf: [tls_io_buf_len]u8,
         tls_read_buf: [tls_io_buf_len]u8,
@@ -141,12 +149,17 @@ pub const Conn = struct {
 
         fn deinit(self: *TlsProxyIo, allocator: Allocator) void {
             self.ca_bundle.deinit(allocator);
-            self.stream.close();
+            self.stream.close(self.io);
             allocator.destroy(self);
         }
     };
 
-    pub fn connect(allocator: Allocator, url_input: []const u8, options: ConnectOptions) Error!Conn {
+    pub fn connect(
+        io: std.Io,
+        allocator: Allocator,
+        url_input: []const u8,
+        options: ConnectOptions,
+    ) Error!Conn {
         const url = try parseUrl(url_input);
 
         // For direct connections, probe reachability with a bounded timeout
@@ -154,7 +167,7 @@ pub const Conn = struct {
         // OS default (~75 s) inside std's timeout-free connect. Proxied
         // connections dial the proxy, not the relay, so skip the probe there.
         if (options.proxy == null and
-            !preflightReachable(allocator, url.host, url.port, preflight_connect_ms))
+            !preflightReachable(io, url.host, url.port, preflight_connect_ms))
         {
             log.warn("relay {s}:{d} unreachable within {d}ms, skipping", .{ url.host, url.port, preflight_connect_ms });
             return error.ConnectFailed;
@@ -165,17 +178,23 @@ pub const Conn = struct {
             // of the proxied stream so the proxy only sees ciphertext. The relay
             // never learns our IP -- the whole connection rides the proxy/Tor.
             if (options.proxy) |px| {
-                const stream = proxy_mod.connectThroughProxyHost(allocator, px, url.host, url.port) catch |err| {
+                const stream = proxy_mod.connectThroughProxyHost(io, allocator, px, url.host, url.port) catch |err| {
                     log.debug("wss proxy tunnel to {s}:{d} failed: {}", .{ url.host, url.port, err });
                     return error.ConnectFailed;
                 };
                 var conn = Conn{
+                    .io = io,
                     .allocator = allocator,
                     .stream = stream,
                     .fragment_buf = .empty,
                     .fragment_opcode = null,
                 };
-                conn.tls_proxy = connectTlsOverProxy(allocator, stream, url.host) catch |err| {
+                conn.tls_proxy = connectTlsOverProxy(
+                    io,
+                    allocator,
+                    stream,
+                    url.host,
+                ) catch |err| {
                     // connectTlsOverProxy already closed `stream` on failure.
                     conn.fragment_buf.deinit(allocator);
                     log.warn("tls over proxy to {s}:{d} failed: {}", .{ url.host, url.port, err });
@@ -187,19 +206,32 @@ pub const Conn = struct {
                 return conn;
             }
             const client = try allocator.create(std.http.Client);
-            client.* = .{ .allocator = allocator };
+            client.* = .{
+                .allocator = allocator,
+                .io = io,
+            };
 
-            {
-                client.ca_bundle_mutex.lock();
-                defer client.ca_bundle_mutex.unlock();
-                client.ca_bundle.rescan(allocator) catch {
-                    client.deinit();
-                    allocator.destroy(client);
-                    return error.TlsInitFailed;
-                };
-            }
+            const now = std.Io.Clock.real.now(io);
 
-            const connection = client.connectTcp(url.host, url.port, .tls) catch |err| {
+            client.ca_bundle.rescan(
+                allocator,
+                io,
+                now,
+            ) catch {
+                client.deinit();
+                allocator.destroy(client);
+                return error.TlsInitFailed;
+            };
+
+            client.now = now;
+
+            const remote_host: HostName = .{ .bytes = url.host };
+
+            const connection = client.connectTcp(
+                remote_host,
+                url.port,
+                .tls,
+            ) catch |err| {
                 log.warn("tls connect to {s}:{d} failed: {}", .{ url.host, url.port, err });
                 client.deinit();
                 allocator.destroy(client);
@@ -207,8 +239,9 @@ pub const Conn = struct {
             };
 
             var conn = Conn{
+                .io = io,
                 .allocator = allocator,
-                .stream = connection.stream_reader.getStream(),
+                .stream = connection.stream_reader.stream,
                 .http = .{
                     .client = client,
                     .connection = connection,
@@ -228,17 +261,18 @@ pub const Conn = struct {
         // authenticates the address, so the plaintext WebSocket rides safely on
         // top -- no redundant TLS layer needed.
         const stream = if (options.proxy) |px|
-            proxy_mod.connectThroughProxyHost(allocator, px, url.host, url.port) catch |err| {
+            proxy_mod.connectThroughProxyHost(io, allocator, px, url.host, url.port) catch |err| {
                 log.debug("ws proxy tunnel to {s}:{d} failed: {}", .{ url.host, url.port, err });
                 return error.ConnectFailed;
             }
         else
-            tcpConnect(allocator, url.host, url.port) catch |err| {
+            tcpConnect(io, url.host, url.port) catch |err| {
                 log.warn("tcp connect to {s}:{d} failed: {}", .{ url.host, url.port, err });
                 return error.ConnectFailed;
             };
 
         var conn = Conn{
+            .io = io,
             .allocator = allocator,
             .stream = stream,
             .http = null,
@@ -259,42 +293,75 @@ pub const Conn = struct {
     /// mechanism as proxy.httpsExchange; the buffers + reader/writer live inside
     /// the returned struct, which is heap-stable so TLS's pointers stay valid).
     /// On any error the stream is closed and nothing leaks.
-    fn connectTlsOverProxy(allocator: Allocator, stream: std.net.Stream, host: []const u8) Error!*TlsProxyIo {
+    fn connectTlsOverProxy(
+        io: std.Io,
+        allocator: Allocator,
+        stream: Stream,
+        host: []const u8,
+    ) Error!*TlsProxyIo {
         var owned = false;
-        defer if (!owned) stream.close();
+        defer if (!owned) stream.close(io);
 
         const tp = allocator.create(TlsProxyIo) catch return error.OutOfMemory;
         errdefer allocator.destroy(tp);
 
+        tp.io = io;
         tp.stream = stream;
-        // Disable Nagle: the WS upgrade + REQ are tiny, and Nagle/delayed-ACK
-        // can otherwise hold a small response (the 101) for a long stall.
-        setTcpNoDelay(stream);
-        tp.socket_reader = stream.reader(&tp.socket_read_buf);
-        tp.socket_writer = stream.writer(&tp.socket_write_buf);
+        tp.ca_bundle = .empty;
+        tp.ca_lock = .init;
 
-        // A `.onion` host is cryptographically authenticated by Tor itself and
-        // cannot hold a CA-issued certificate, so skip CA verification there
-        // (the TLS is only for the channel). A clearnet wss relay is verified
-        // against the system CA bundle as usual.
+        setTcpNoDelay(stream);
+
+        tp.socket_reader =
+            stream.reader(io, &tp.socket_read_buf);
+        tp.socket_writer =
+            stream.writer(io, &tp.socket_write_buf);
+
         const onion = std.mem.endsWith(u8, host, ".onion");
-        tp.ca_bundle = .{};
-        if (!onion) tp.ca_bundle.rescan(allocator) catch return error.TlsInitFailed;
+        const now = std.Io.Clock.real.now(io);
+
+        if (!onion) {
+            tp.ca_bundle.rescan(
+                allocator,
+                io,
+                now,
+            ) catch return error.TlsInitFailed;
+        }
+
         errdefer tp.ca_bundle.deinit(allocator);
 
-        // SO_RCVTIMEO bounds the handshake and every later read so an
-        // unresponsive relay fails instead of hanging. std's File.Reader turns a
-        // read timeout into an error, which for our request/response +
-        // subscribe-until-timeout relay usage simply ends the op -- the intent.
         setRecvTimeout(stream, tls_proxy_handshake_secs);
-        tp.tls = tls.Client.init(tp.socket_reader.interface(), &tp.socket_writer.interface, .{
-            .host = if (onion) .no_verification else .{ .explicit = host },
-            .ca = if (onion) .no_verification else .{ .bundle = tp.ca_bundle },
-            .write_buffer = &tp.tls_write_buf,
-            .read_buffer = &tp.tls_read_buf,
-        }) catch return error.TlsInitFailed;
 
-        owned = true; // tp now owns `stream`; TlsProxyIo.deinit closes it
+        var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
+        io.random(&entropy);
+
+        tp.tls = tls.Client.init(
+            &tp.socket_reader.interface,
+            &tp.socket_writer.interface,
+            .{
+                .host = if (onion)
+                    .no_verification
+                else
+                    .{ .explicit = host },
+
+                .ca = if (onion)
+                    .no_verification
+                else
+                    .{ .bundle = .{
+                        .gpa = allocator,
+                        .io = io,
+                        .lock = &tp.ca_lock,
+                        .bundle = &tp.ca_bundle,
+                    } },
+
+                .write_buffer = &tp.tls_write_buf,
+                .read_buffer = &tp.tls_read_buf,
+                .entropy = &entropy,
+                .realtime_now = now,
+            },
+        ) catch return error.TlsInitFailed;
+
+        owned = true;
         return tp;
     }
 
@@ -303,13 +370,13 @@ pub const Conn = struct {
             // `connectTcp` registers the connection in the client's pool.
             // Mark closing and release so `client.deinit()` does not panic.
             h.connection.closing = true;
-            h.client.connection_pool.release(h.connection);
+            h.client.connection_pool.release(h.connection, self.io);
             h.client.deinit();
             self.allocator.destroy(h.client);
         } else if (self.tls_proxy) |t| {
             t.deinit(self.allocator);
         } else {
-            self.stream.close();
+            self.stream.close(self.io);
         }
         self.fragment_buf.deinit(self.allocator);
     }
@@ -425,7 +492,7 @@ pub const Conn = struct {
     /// `tls.Client.reader` deadlocks on Zig 0.15 for Nostr relays.
     fn performHandshakeHttps(self: *Conn, url: Url, h: HttpIo) Error!void {
         var key_raw: [16]u8 = undefined;
-        std.crypto.random.bytes(&key_raw);
+        self.io.random(&key_raw);
         var key_b64: [24]u8 = undefined;
         _ = std.base64.standard.Encoder.encode(&key_b64, &key_raw);
 
@@ -536,7 +603,7 @@ pub const Conn = struct {
     /// `ws://` upgrade over a plain TCP socket.
     fn performHandshakePlain(self: *Conn, url: Url) Error!void {
         var key_raw: [16]u8 = undefined;
-        std.crypto.random.bytes(&key_raw);
+        self.io.random(&key_raw);
         var key_b64: [24]u8 = undefined;
         _ = std.base64.standard.Encoder.encode(&key_b64, &key_raw);
 
@@ -591,7 +658,7 @@ pub const Conn = struct {
         while (line_start < headers.len) {
             const line_end = std.mem.indexOfScalarPos(u8, headers, line_start, '\n') orelse return null;
             const line = headers[line_start..line_end];
-            const trimmed = std.mem.trimRight(u8, line, "\r");
+            const trimmed = std.mem.trimEnd(u8, line, "\r");
             if (std.mem.indexOfScalar(u8, trimmed, ':')) |colon| {
                 const hdr_name = trimmed[0..colon];
                 if (hdr_name.len == name.len and std.ascii.eqlIgnoreCase(hdr_name, name)) {
@@ -615,7 +682,8 @@ pub const Conn = struct {
 
         const fin = (header[0] & 0x80) != 0;
         const opcode_raw = header[0] & 0x0F;
-        const opcode: Opcode = std.meta.intToEnum(Opcode, opcode_raw) catch return error.ProtocolError;
+        const opcode: Opcode =
+            std.enums.fromInt(Opcode, opcode_raw) orelse return error.ProtocolError;
         const masked = (header[1] & 0x80) != 0;
         if (masked) return error.ProtocolError; // server frames must not be masked
 
@@ -659,7 +727,7 @@ pub const Conn = struct {
             hlen += 8;
         }
         var mask: [4]u8 = undefined;
-        std.crypto.random.bytes(&mask);
+        self.io.random(&mask);
         @memcpy(header[hlen..][0..4], &mask);
         hlen += 4;
 
@@ -688,12 +756,11 @@ pub const Conn = struct {
             t.tls.writer.flush() catch return error.SendFailed;
             t.socket_writer.interface.flush() catch return error.SendFailed;
         } else {
-            var off: usize = 0;
-            while (off < buf.len) {
-                const n = posix.send(self.stream.handle, buf[off..], 0) catch return error.SendFailed;
-                if (n == 0) return error.Closed;
-                off += n;
-            }
+            var buffer: [0]u8 = .{};
+            var writer = self.stream.writer(self.io, &buffer);
+
+            writer.interface.writeAll(buf) catch
+                return error.SendFailed;
         }
     }
 
@@ -719,10 +786,18 @@ pub const Conn = struct {
             t.tls.reader.toss(k);
             return k;
         }
-        const n = posix.recv(self.stream.handle, buf, 0) catch |err| switch (err) {
-            error.WouldBlock => return error.Timeout,
-            else => return error.RecvFailed,
+        var buffer: [0]u8 = .{};
+        var reader = self.stream.reader(self.io, &buffer);
+
+        const n = reader.interface.readSliceShort(buf) catch {
+            if (reader.err) |err| switch (err) {
+                error.Timeout => return error.Timeout,
+                else => return error.RecvFailed,
+            };
+
+            return error.RecvFailed;
         };
+
         return n;
     }
 
@@ -736,20 +811,34 @@ pub const Conn = struct {
     }
 };
 
-fn setTcpNoDelay(stream: std.net.Stream) void {
+fn setTcpNoDelay(stream: Stream) void {
     const one: c_int = 1;
-    posix.setsockopt(stream.handle, posix.IPPROTO.TCP, posix.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
+    posix.setsockopt(
+        stream.socket.handle,
+        posix.IPPROTO.TCP,
+        posix.TCP.NODELAY,
+        std.mem.asBytes(&one),
+    ) catch {};
 }
 
-fn setRecvTimeout(stream: std.net.Stream, sec: u32) void {
-    const tv: posix.timeval = .{ .sec = @intCast(sec), .usec = 0 };
-    posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+fn setRecvTimeout(stream: Stream, sec: u32) void {
+    const tv: posix.timeval = .{
+        .sec = @intCast(sec),
+        .usec = 0,
+    };
+
+    posix.setsockopt(
+        stream.socket.handle,
+        posix.SOL.SOCKET,
+        posix.SO.RCVTIMEO,
+        std.mem.asBytes(&tv),
+    ) catch {};
 }
 
 fn httpConnectError(err: std.http.Client.ConnectTcpError) Error {
     return switch (err) {
         error.TlsInitializationFailed => error.TlsInitFailed,
-        error.UnknownHostName, error.HostLacksNetworkAddresses => error.DnsResolveFailed,
+        error.UnknownHostName => error.DnsResolveFailed,
         else => error.ConnectFailed,
     };
 }
@@ -766,70 +855,47 @@ const preflight_connect_ms: i32 = 4000;
 /// TCP connect (IPv4 first) bounded by `timeout_ms`. Returns true as soon as any
 /// address accepts. A false return lets the caller skip a dead/slow relay
 /// quickly instead of blocking in std's timeout-free connect.
-fn preflightReachable(allocator: Allocator, host: []const u8, port: u16, timeout_ms: i32) bool {
-    const list = std.net.getAddressList(allocator, host, port) catch return false;
-    defer list.deinit();
+fn preflightReachable(
+    io: std.Io,
+    host: []const u8,
+    port: u16,
+    timeout_ms: i32,
+) bool {
+    const hostname: HostName = .{ .bytes = host };
 
-    inline for (.{ posix.AF.INET, posix.AF.INET6 }) |family| {
-        for (list.addrs) |addr| {
-            if (addr.any.family != family) continue;
-            if (probeConnect(addr, timeout_ms)) return true;
-        }
-    }
-    return false;
-}
-
-/// Non-blocking connect to a single address, bounded by `timeout_ms`. The probe
-/// socket is always closed; we only care whether the connect would succeed.
-fn probeConnect(addr: std.net.Address, timeout_ms: i32) bool {
-    const sock = posix.socket(
-        addr.any.family,
-        posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
-        posix.IPPROTO.TCP,
-    ) catch return false;
-    defer posix.close(sock);
-
-    const flags = posix.fcntl(sock, posix.F.GETFL, 0) catch return false;
-    var o: posix.O = @bitCast(@as(u32, @truncate(flags)));
-    o.NONBLOCK = true;
-    _ = posix.fcntl(sock, posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
-
-    posix.connect(sock, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
-        error.WouldBlock => {
-            var pfd = [_]posix.pollfd{.{ .fd = sock, .events = posix.POLL.OUT, .revents = 0 }};
-            const ready = posix.poll(&pfd, timeout_ms) catch return false;
-            if (ready == 0) return false;
-            posix.getsockoptError(sock) catch return false;
-            return true;
+    const stream = hostname.connect(io, port, .{
+        .mode = .stream,
+        .timeout = .{
+            .duration = .{
+                .raw = .fromMilliseconds(@intCast(timeout_ms)),
+                .clock = .awake,
+            },
         },
-        else => return false,
-    };
-    return true; // connected synchronously
+    }) catch return false;
+
+    stream.close(io);
+    return true;
 }
 
 /// Open TCP to `host`:`port`, preferring IPv4 and trying every resolved address
 /// before giving up. `std.net.tcpConnectToHost` stops on the first non-refused
 /// error, which breaks when DNS returns AAAA before A and IPv6 is unroutable.
-fn tcpConnect(allocator: Allocator, host: []const u8, port: u16) Error!std.net.Stream {
-    const list = std.net.getAddressList(allocator, host, port) catch return error.DnsResolveFailed;
-    defer list.deinit();
-    if (list.addrs.len == 0) return error.DnsResolveFailed;
+fn tcpConnect(
+    io: std.Io,
+    host: []const u8,
+    port: u16,
+) Error!Stream {
+    const hostname: HostName = .{ .bytes = host };
 
-    var last_err: ?std.net.TcpConnectToAddressError = null;
-
-    inline for (.{ posix.AF.INET, posix.AF.INET6 }) |family| {
-        for (list.addrs) |addr| {
-            if (addr.any.family != family) continue;
-            const stream = std.net.tcpConnectToAddress(addr) catch |err| {
-                last_err = err;
-                continue;
-            };
-            return stream;
-        }
-    }
-
-    if (last_err) |_| return error.ConnectFailed;
-    return error.ConnectFailed;
+    return hostname.connect(io, port, .{
+        .mode = .stream,
+        .timeout = .{
+            .duration = .{
+                .raw = .fromSeconds(4),
+                .clock = .awake,
+            },
+        },
+    }) catch return error.ConnectFailed;
 }
 
 /// Compute the expected Sec-WebSocket-Accept header value for a given
@@ -863,7 +929,7 @@ fn parseHeadStatus(head: []const u8) ?HeadStatus {
     const digits = line[9..12];
     for (digits) |d| if (!std.ascii.isDigit(d)) return null;
     const code = @as(u16, digits[0] - '0') * 100 + @as(u16, digits[1] - '0') * 10 + @as(u16, digits[2] - '0');
-    return .{ .code = code, .reason = std.mem.trimLeft(u8, line[12..], " ") };
+    return .{ .code = code, .reason = std.mem.trimStart(u8, line[12..], " ") };
 }
 
 /// Case-insensitive header lookup in a raw HTTP response head (the status
@@ -991,7 +1057,7 @@ fn decodeFrame(allocator: Allocator, bytes: []const u8) Error!struct {
     if (bytes.len < 2) return error.ProtocolError;
     const fin = (bytes[0] & 0x80) != 0;
     const opcode_raw = bytes[0] & 0x0F;
-    const opcode: Opcode = std.meta.intToEnum(Opcode, opcode_raw) catch return error.ProtocolError;
+    const opcode: Opcode = std.enums.fromInt(Opcode, opcode_raw) orelse return error.ProtocolError;
     if ((bytes[1] & 0x80) != 0) return error.ProtocolError; // masked from server
 
     var off: usize = 2;

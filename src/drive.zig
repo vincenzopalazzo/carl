@@ -137,12 +137,13 @@ pub const Drive = struct {
     allocator: Allocator,
     /// Owned copies of the caller's option strings/slices (`dir`, `drive`,
     /// `also`), so an embedded drive survives the caller mutating its config.
+    ctx: nostr_config.Context,
     opts: Options,
     /// The embedded download→seed engine. `start` is deliberately NOT called
     /// on it: the drive loop replaces follow's NIP-35 poll loop.
     mirror: *follow.Mirror,
     /// Guards `files` (the loop thread writes; `filesSnapshot` reads).
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     loop_thread: ?std.Thread = null,
     /// Publisher: the local identity the index is signed with.
@@ -166,7 +167,11 @@ pub const Drive = struct {
     /// Heap-allocate a drive with owned copies of the option strings. The
     /// publisher role reads the local Nostr identity up front (an index that
     /// can't be signed is useless), so `NoKey` surfaces before `start`.
-    pub fn create(allocator: Allocator, opts: Options) Error!*Drive {
+    pub fn create(
+        ctx: nostr_config.Context,
+        allocator: Allocator,
+        opts: Options,
+    ) Error!*Drive {
         if (opts.dir.len == 0 or opts.drive.len == 0) return error.InvalidOptions;
         if (opts.role == .subscriber and opts.author == null) return error.InvalidOptions;
         if (opts.route != .direct and opts.route != .i2p) return error.UnsupportedRoute;
@@ -175,7 +180,7 @@ pub const Drive = struct {
         var pk: [32]u8 = .{0} ** 32;
         switch (opts.role) {
             .publisher => {
-                sk = nostr_config.readSecretKey(allocator) catch return error.NoKey;
+                sk = nostr_config.readSecretKey(ctx, allocator) catch return error.NoKey;
                 pk = secp.publicKeyFromSecret(sk.?) catch return error.NoKey;
             },
             .subscriber => pk = opts.author.?,
@@ -190,14 +195,19 @@ pub const Drive = struct {
 
         const self = allocator.create(Drive) catch return error.OutOfMemory;
         errdefer allocator.destroy(self);
-        self.* = .{ .allocator = allocator, .opts = opts, .mirror = undefined };
+        self.* = .{
+            .allocator = allocator,
+            .ctx = ctx,
+            .opts = opts,
+            .mirror = undefined,
+        };
         self.opts.dir = dir;
         self.opts.drive = drive;
         self.opts.also = also;
         self.sk = sk;
         self.pk = pk;
 
-        self.mirror = follow.Mirror.create(allocator, .{
+        self.mirror = follow.Mirror.create(ctx, allocator, .{
             .pubkey = pk,
             .route = opts.route,
             .dir = dir,
@@ -211,16 +221,25 @@ pub const Drive = struct {
     /// Start the role's loop on its own thread. Loads the persisted state
     /// first; the loop itself resumes every vouched-for file before scanning.
     pub fn start(self: *Drive) Error!void {
-        std.fs.cwd().makePath(self.opts.dir) catch {};
+        std.Io.Dir.cwd().createDirPath(
+            self.ctx.io,
+            self.opts.dir,
+        ) catch {};
         const state_dir = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.opts.dir, state_dirname }) catch
             return error.OutOfMemory;
         defer self.allocator.free(state_dir);
-        std.fs.cwd().makePath(state_dir) catch {};
+        std.Io.Dir.cwd().createDirPath(
+            self.ctx.io,
+            state_dir,
+        ) catch {};
         if (self.opts.role == .subscriber) {
             const trash = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ state_dir, trash_dirname }) catch
                 return error.OutOfMemory;
             defer self.allocator.free(trash);
-            std.fs.cwd().makePath(trash) catch {};
+            std.Io.Dir.cwd().createDirPath(
+                self.ctx.io,
+                trash,
+            ) catch {};
         }
 
         log.info("drive '{s}' ({s}, route {s}) at {s}", .{
@@ -228,7 +247,7 @@ pub const Drive = struct {
         });
         // The mirror publishes its own peer-announces; without a local
         // identity seeds still work but nobody can discover them.
-        if (nostr_config.readSecretKey(self.allocator)) |_| {} else |_| {
+        if (nostr_config.readSecretKey(self.ctx, self.allocator)) |_| {} else |_| {
             log.warn("no nostr identity found; drive seeds won't be announced. Run `carl nostr-keygen` first.", .{});
         }
 
@@ -287,8 +306,8 @@ pub const Drive = struct {
     /// from the embedded mirror's transfer list when one is registered).
     pub fn filesSnapshot(self: *Drive, arena: Allocator) Allocator.Error![]FileInfo {
         const ts = try self.mirror.torrentsSnapshot(arena);
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.ctx.io);
+        defer self.mutex.unlock(self.ctx.io);
         const out = try arena.alloc(FileInfo, self.files.items.len);
         for (self.files.items, 0..) |rec, i| {
             var info: FileInfo = .{
@@ -314,8 +333,8 @@ pub const Drive = struct {
     // ------------------------------------------------------------------
 
     fn findRecord(self: *Drive, path: []const u8) ?FileRecord {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.ctx.io);
+        defer self.mutex.unlock(self.ctx.io);
         for (self.files.items) |rec| {
             if (std.mem.eql(u8, rec.path, path)) return rec; // copy; path borrowed
         }
@@ -323,14 +342,14 @@ pub const Drive = struct {
     }
 
     fn recordCount(self: *Drive) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.ctx.io);
+        defer self.mutex.unlock(self.ctx.io);
         return self.files.items.len;
     }
 
     fn upsertRecord(self: *Drive, path: []const u8, info_hash: [20]u8, size: u64, mtime: i64) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.ctx.io);
+        defer self.mutex.unlock(self.ctx.io);
         for (self.files.items) |*rec| {
             if (std.mem.eql(u8, rec.path, path)) {
                 rec.info_hash = info_hash;
@@ -407,20 +426,24 @@ pub const Drive = struct {
     fn checkpointExists(self: *Drive, hash: [20]u8) bool {
         const path = self.checkpointPath(self.allocator, hash) catch return false;
         defer self.allocator.free(path);
-        _ = std.fs.cwd().statFile(path) catch return false;
+        _ = std.Io.Dir.cwd().statFile(
+            self.ctx.io,
+            path,
+            .{},
+        ) catch return false;
         return true;
     }
 
     fn writeCheckpoint(self: *Drive, hash: [20]u8, data: []const u8) !void {
         const path = try self.checkpointPath(self.allocator, hash);
         defer self.allocator.free(path);
-        try writeFileAtomic(path, data);
+        try writeFileAtomic(self.ctx.io, path, data);
     }
 
     fn deleteCheckpoint(self: *Drive, hash: [20]u8) void {
         const path = self.checkpointPath(self.allocator, hash) catch return;
         defer self.allocator.free(path);
-        std.fs.cwd().deleteFile(path) catch {};
+        std.Io.Dir.cwd().deleteFile(self.ctx.io, path) catch {};
     }
 
     // ------------------------------------------------------------------
@@ -440,7 +463,7 @@ pub const Drive = struct {
     /// re-detects it as new/changed.
     fn publisherResume(self: *Drive) void {
         var dropped = false;
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.ctx.io);
         var i: usize = 0;
         while (i < self.files.items.len) {
             const rec = self.files.items[i];
@@ -450,7 +473,11 @@ pub const Drive = struct {
             };
             defer self.allocator.free(full);
             const keep = blk: {
-                const st = std.fs.cwd().statFile(full) catch break :blk false;
+                const st = std.Io.Dir.cwd().statFile(
+                    self.ctx.io,
+                    full,
+                    .{},
+                ) catch break :blk false;
                 if (st.kind != .file) break :blk false;
                 if (st.size != rec.size or mtimeSecs(st) != rec.mtime) break :blk false;
                 if (!self.checkpointExists(rec.info_hash)) break :blk false;
@@ -469,7 +496,7 @@ pub const Drive = struct {
                 dropped = true;
             }
         }
-        self.mutex.unlock();
+        self.mutex.unlock(self.ctx.io);
         if (dropped) {
             log.info("some published files changed or vanished while offline; re-detecting", .{});
             self.publishIndex();
@@ -483,13 +510,20 @@ pub const Drive = struct {
     /// names that can't be represented in a drive index.
     fn scanDir(self: *Drive, a: Allocator) ![]ScannedFile {
         var out: std.ArrayList(ScannedFile) = .empty;
-        var dir = std.fs.cwd().openDir(self.opts.dir, .{ .iterate = true }) catch |err| {
+        var dir = std.Io.Dir.cwd().openDir(
+            self.ctx.io,
+            self.opts.dir,
+            .{ .iterate = true },
+        ) catch |err| {
             log.warn("cannot scan drive dir {s}: {}", .{ self.opts.dir, err });
             return err;
         };
-        defer dir.close();
+
+        defer dir.close(self.ctx.io);
+
         var it = dir.iterate();
-        while (it.next() catch null) |entry| {
+
+        while (it.next(self.ctx.io) catch null) |entry| {
             if (entry.name.len == 0) continue;
             if (entry.name[0] == '.') continue; // .carl-drive, dotfiles
             if (entry.kind == .directory) {
@@ -504,7 +538,11 @@ pub const Drive = struct {
                 self.warnOnce(entry.name, "filename cannot be represented in a drive index");
                 continue;
             };
-            const st = dir.statFile(entry.name) catch continue;
+            const st = dir.statFile(
+                self.ctx.io,
+                entry.name,
+                .{},
+            ) catch continue;
             const dup = a.dupe(u8, entry.name) catch continue;
             out.append(a, .{ .name = dup, .size = st.size, .mtime = mtimeSecs(st) }) catch {
                 a.free(dup);
@@ -528,7 +566,7 @@ pub const Drive = struct {
         // is already gone (they deleted it) — we never delete data ourselves.
         {
             var removed: std.ArrayList(FileRecord) = .empty;
-            self.mutex.lock();
+            self.mutex.lockUncancelable(self.ctx.io);
             var i: usize = 0;
             while (i < self.files.items.len) {
                 const rec = self.files.items[i];
@@ -546,7 +584,7 @@ pub const Drive = struct {
                 removed.append(a, rec) catch {};
                 _ = self.files.orderedRemove(i);
             }
-            self.mutex.unlock();
+            self.mutex.unlock(self.ctx.io);
             for (removed.items) |rec| {
                 log.info("removed from drive: {s}", .{rec.path});
                 self.mirror.evictTransfer(rec.info_hash);
@@ -607,17 +645,25 @@ pub const Drive = struct {
         const full = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.opts.dir, s.name }) catch return .unchanged;
         defer self.allocator.free(full);
 
-        const st0 = std.fs.cwd().statFile(full) catch return .unchanged;
-        const res = metainfo_mod.buildTorrent(self.allocator, full, .{
+        const st0 = std.Io.Dir.cwd().statFile(
+            self.ctx.io,
+            full,
+            .{},
+        ) catch return .unchanged;
+        const res = metainfo_mod.buildTorrent(self.ctx.io, self.allocator, full, .{
             .created_by = "carl",
-            .creation_date = std.time.timestamp(),
+            .creation_date = std.Io.Clock.real.now(self.ctx.io).toSeconds(),
         }) catch |err| {
             log.warn("could not build torrent for {s}: {}", .{ s.name, err });
             self.pendingClear(s.name);
             return .unchanged;
         };
         defer self.allocator.free(res.data);
-        const st1 = std.fs.cwd().statFile(full) catch return .unchanged;
+        const st1 = std.Io.Dir.cwd().statFile(
+            self.ctx.io,
+            full,
+            .{},
+        ) catch return .unchanged;
         if (st0.size != st1.size or mtimeSecs(st0) != mtimeSecs(st1)) {
             log.info("{s} changed while hashing; retrying next pass", .{s.name});
             self.pendingSet(s.name, st1.size, mtimeSecs(st1));
@@ -663,8 +709,8 @@ pub const Drive = struct {
 
     /// Arena-owned copy of the record table (null on OOM).
     fn snapshotRecords(self: *Drive, a: Allocator) ?[]FileRecord {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.ctx.io);
+        defer self.mutex.unlock(self.ctx.io);
         const recs = a.alloc(FileRecord, self.files.items.len) catch return null;
         for (self.files.items, 0..) |rec, i| {
             recs[i] = .{
@@ -684,7 +730,7 @@ pub const Drive = struct {
         const a = arena_inst.allocator();
         const recs = self.snapshotRecords(a) orelse return;
         const state_path = std.fmt.allocPrint(a, "{s}/{s}/state.json", .{ self.opts.dir, state_dirname }) catch return;
-        writePublisherStateFile(a, state_path, self.last_created_at, recs) catch |err| {
+        writePublisherStateFile(self.ctx.io, a, state_path, self.last_created_at, recs) catch |err| {
             log.warn("could not save drive state: {}", .{err});
         };
     }
@@ -702,15 +748,18 @@ pub const Drive = struct {
         // which on crash would let a later publish go non-monotonic vs the
         // state file actually written.
         const recs = self.snapshotRecords(a) orelse return;
-        self.mutex.lock();
-        const created_at = @max(std.time.timestamp(), self.last_created_at + 1);
+        self.mutex.lockUncancelable(self.ctx.io);
+        const created_at = @max(
+            std.Io.Clock.real.now(self.ctx.io).toSeconds(),
+            self.last_created_at + 1,
+        );
         self.last_created_at = created_at;
-        self.mutex.unlock();
+        self.mutex.unlock(self.ctx.io);
 
         // State first: even if every relay is down, the bumped created_at is
         // persisted so the next publish is still strictly newer.
         const state_path = std.fmt.allocPrint(a, "{s}/{s}/state.json", .{ self.opts.dir, state_dirname }) catch return;
-        writePublisherStateFile(a, state_path, created_at, recs) catch |err| {
+        writePublisherStateFile(self.ctx.io, a, state_path, created_at, recs) catch |err| {
             log.warn("could not save drive state: {}", .{err});
         };
 
@@ -724,12 +773,22 @@ pub const Drive = struct {
         };
         defer ev.deinit(a);
 
-        const relay_urls = nostr_config.readRelays(a) catch return;
+        const relay_urls = nostr_config.readRelays(self.ctx, a) catch return;
         var acks: usize = 0;
-        const gate = relay_mod.oneShotGate(relay_urls, null);
+        const gate = relay_mod.oneShotGate(
+            self.ctx.io,
+            relay_urls,
+            null,
+        );
         for (relay_urls) |url| {
             if (self.stopping()) break;
-            var r = relay_mod.dial(a, url, null, gate) catch |err| {
+            var r = relay_mod.dial(
+                self.ctx.io,
+                a,
+                url,
+                null,
+                gate,
+            ) catch |err| {
                 log.debug("relay {s}: {}", .{ url, err });
                 continue;
             };
@@ -743,7 +802,7 @@ pub const Drive = struct {
         const a = self.allocator;
         const path = std.fmt.allocPrint(a, "{s}/{s}/state.json", .{ self.opts.dir, state_dirname }) catch return;
         defer a.free(path);
-        const loaded = readPublisherStateFile(a, path) catch |err| {
+        const loaded = readPublisherStateFile(self.ctx.io, a, path) catch |err| {
             if (err != error.FileNotFound)
                 log.warn("could not read {s}: {} (starting fresh)", .{ path, err });
             return;
@@ -787,7 +846,7 @@ pub const Drive = struct {
         }
         if (merged.len > 0) log.info("resumed {d} mirrored file(s)", .{merged.len});
 
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.ctx.io);
         for (merged) |rec| {
             const dup = self.allocator.dupe(u8, rec.path) catch continue;
             self.files.append(self.allocator, .{
@@ -801,7 +860,7 @@ pub const Drive = struct {
             };
         }
         self.has_applied = true;
-        self.mutex.unlock();
+        self.mutex.unlock(self.ctx.io);
     }
 
     /// One relay sweep per writer: collect every relay's copy of the author's
@@ -812,7 +871,7 @@ pub const Drive = struct {
         defer arena_inst.deinit();
         const a = arena_inst.allocator();
 
-        const relay_urls = nostr_config.readRelays(a) catch return;
+        const relay_urls = nostr_config.readRelays(self.ctx, a) catch return;
 
         var pks: std.ArrayList([32]u8) = .empty;
         pks.append(a, self.opts.author.?) catch return;
@@ -835,7 +894,13 @@ pub const Drive = struct {
             for (relay_urls) |url| {
                 if (self.stopping()) return;
                 // Periodic subscriber poll: honor the health gate.
-                var r = relay_mod.dial(a, url, null, .honor) catch |err| {
+                var r = relay_mod.dial(
+                    self.ctx.io,
+                    a,
+                    url,
+                    null,
+                    .honor,
+                ) catch |err| {
                     log.debug("relay {s}: {}", .{ url, err });
                     continue;
                 };
@@ -926,15 +991,15 @@ pub const Drive = struct {
         }
 
         // Snapshot the currently applied table (arena-owned).
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.ctx.io);
         const old_recs = a.alloc(FileRecord, self.files.items.len) catch {
-            self.mutex.unlock();
+            self.mutex.unlock(self.ctx.io);
             return;
         };
         for (self.files.items, 0..) |rec, i| {
             old_recs[i] = .{
                 .path = a.dupe(u8, rec.path) catch {
-                    self.mutex.unlock();
+                    self.mutex.unlock(self.ctx.io);
                     return;
                 },
                 .info_hash = rec.info_hash,
@@ -943,7 +1008,7 @@ pub const Drive = struct {
             };
         }
         const first = !self.has_applied;
-        self.mutex.unlock();
+        self.mutex.unlock(self.ctx.io);
 
         const old_index: drive_index.Index = .{
             .drive = self.opts.drive,
@@ -991,7 +1056,7 @@ pub const Drive = struct {
         }
 
         // Adopt the merged table as the applied state and persist it.
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.ctx.io);
         for (self.files.items) |rec| self.allocator.free(rec.path);
         self.files.clearRetainingCapacity();
         for (merged) |rec| {
@@ -1007,7 +1072,7 @@ pub const Drive = struct {
             };
         }
         self.has_applied = true;
-        self.mutex.unlock();
+        self.mutex.unlock(self.ctx.io);
 
         self.saveAppliedState();
     }
@@ -1033,7 +1098,11 @@ pub const Drive = struct {
         const a = self.allocator;
         const src = std.fmt.allocPrint(a, "{s}/{s}", .{ self.opts.dir, path }) catch return;
         defer a.free(src);
-        if (std.fs.cwd().statFile(src) catch null) |st| {
+        if (std.Io.Dir.cwd().statFile(
+            self.ctx.io,
+            src,
+            .{},
+        ) catch null) |st| {
             const local_mtime = mtimeSecs(st);
             if (local_mtime != recorded_mtime) {
                 log.warn("local file {s} was modified (mtime {d} vs published {d}); quarantining anyway (publisher wins)", .{ path, local_mtime, recorded_mtime });
@@ -1041,15 +1110,26 @@ pub const Drive = struct {
         }
         const trash = std.fmt.allocPrint(a, "{s}/{s}/{s}", .{ self.opts.dir, state_dirname, trash_dirname }) catch return;
         defer a.free(trash);
-        std.fs.cwd().makePath(trash) catch {};
+        std.Io.Dir.cwd().createDirPath(self.ctx.io, trash) catch {};
         var dst = std.fmt.allocPrint(a, "{s}/{s}", .{ trash, path }) catch return;
         defer a.free(dst);
-        if (std.fs.cwd().statFile(dst) catch null != null) {
-            const stamped = std.fmt.allocPrint(a, "{s}.{d}", .{ dst, std.time.timestamp() }) catch return;
+        if ((std.Io.Dir.cwd().statFile(
+            self.ctx.io,
+            dst,
+            .{},
+        ) catch null) != null) {
+            const stamped = std.fmt.allocPrint(a, "{s}.{d}", .{ dst, std.Io.Clock.real.now(self.ctx.io).toSeconds() }) catch return;
             a.free(dst);
             dst = stamped;
         }
-        std.fs.cwd().rename(src, dst) catch |err| {
+        const cwd = std.Io.Dir.cwd();
+        std.Io.Dir.rename(
+            cwd,
+            src,
+            cwd,
+            dst,
+            self.ctx.io,
+        ) catch |err| {
             if (err != error.FileNotFound)
                 log.warn("could not quarantine {s}: {}", .{ path, err });
             return;
@@ -1063,8 +1143,16 @@ pub const Drive = struct {
         defer a.free(src);
         const dst = std.fmt.allocPrint(a, "{s}/{s}", .{ self.opts.dir, to }) catch return;
         defer a.free(dst);
-        if (std.fs.path.dirname(dst)) |parent| std.fs.cwd().makePath(parent) catch {};
-        std.fs.cwd().rename(src, dst) catch |err| {
+        if (std.fs.path.dirname(dst)) |parent|
+            std.Io.Dir.cwd().createDirPath(self.ctx.io, parent) catch {};
+        const cwd = std.Io.Dir.cwd();
+        std.Io.Dir.rename(
+            cwd,
+            src,
+            cwd,
+            dst,
+            self.ctx.io,
+        ) catch |err| {
             if (err != error.FileNotFound)
                 log.warn("could not rename {s} -> {s}: {}", .{ from, to, err });
             return;
@@ -1076,7 +1164,7 @@ pub const Drive = struct {
         const a = self.allocator;
         const path = std.fmt.allocPrint(a, "{s}/{s}/applied.json", .{ self.opts.dir, state_dirname }) catch return;
         defer a.free(path);
-        const authors = readAppliedStateFile(a, path) catch |err| {
+        const authors = readAppliedStateFile(self.ctx.io, a, path) catch |err| {
             if (err != error.FileNotFound)
                 log.warn("could not read {s}: {} (starting fresh)", .{ path, err });
             return;
@@ -1091,7 +1179,7 @@ pub const Drive = struct {
         const a = self.allocator;
         const path = std.fmt.allocPrint(a, "{s}/{s}/applied.json", .{ self.opts.dir, state_dirname }) catch return;
         defer a.free(path);
-        writeAppliedStateFile(a, path, self.authors.items) catch |err| {
+        writeAppliedStateFile(self.ctx.io, a, path, self.authors.items) catch |err| {
             log.warn("could not save applied state: {}", .{err});
         };
     }
@@ -1103,19 +1191,25 @@ pub const Drive = struct {
     fn sleepInterruptible(self: *Drive, secs: u64) void {
         var slept_ms: u64 = 0;
         while (!self.stopping() and slept_ms < secs * 1000) {
-            std.Thread.sleep(200 * std.time.ns_per_ms);
+            self.ctx.io.sleep(.fromMilliseconds(200), .awake) catch return;
             slept_ms += 200;
         }
     }
 };
 
-fn sigintHandler(_: i32) callconv(.c) void {
+fn sigintHandler(
+    _: @TypeOf(std.posix.SIG.INT),
+) callconv(.c) void {
     session_mod.shutdown_requested.store(true, .release);
 }
 
 /// Run the drive loop until SIGINT. Blocks. (CLI entry; the daemon embeds
 /// `Drive` directly.)
-pub fn run(allocator: Allocator, opts: Options) !void {
+pub fn run(
+    ctx: nostr_config.Context,
+    allocator: Allocator,
+    opts: Options,
+) !void {
     const act = std.posix.Sigaction{
         .handler = .{ .handler = sigintHandler },
         .mask = std.posix.sigemptyset(),
@@ -1123,12 +1217,12 @@ pub fn run(allocator: Allocator, opts: Options) !void {
     };
     std.posix.sigaction(std.posix.SIG.INT, &act, null);
 
-    const drive = try Drive.create(allocator, opts);
+    const drive = try Drive.create(ctx, allocator, opts);
     defer drive.destroy();
     try drive.start();
 
     while (!drive.stopping()) {
-        std.Thread.sleep(200 * std.time.ns_per_ms);
+        try ctx.io.sleep(.fromMilliseconds(200), .awake);
     }
     log.info("shutting down drive '{s}'...", .{drive.opts.drive});
 }
@@ -1137,8 +1231,8 @@ pub fn run(allocator: Allocator, opts: Options) !void {
 // Internals
 // ---------------------------------------------------------------------------
 
-fn mtimeSecs(st: std.fs.File.Stat) i64 {
-    return @intCast(@divTrunc(st.mtime, std.time.ns_per_s));
+fn mtimeSecs(st: std.Io.File.Stat) i64 {
+    return st.mtime.toSeconds();
 }
 
 /// Merge every writer's file table into one, last-writer-wins per path
@@ -1190,15 +1284,34 @@ fn recsToEntries(a: Allocator, recs: []const FileRecord) ![]drive_index.FileEntr
 
 /// Write via a temp file + rename so a crash mid-write never leaves a torn
 /// state file (a torn state file would wedge the restart path).
-fn writeFileAtomic(path: []const u8, data: []const u8) !void {
+fn writeFileAtomic(
+    io: std.Io,
+    path: []const u8,
+    data: []const u8,
+) !void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const tmp = try std.fmt.bufPrint(&buf, "{s}.tmp", .{path});
+
+    const cwd = std.Io.Dir.cwd();
+
     {
-        var f = try std.fs.cwd().createFile(tmp, .{ .truncate = true });
-        defer f.close();
-        try f.writeAll(data);
+        const f = try cwd.createFile(
+            io,
+            tmp,
+            .{ .truncate = true },
+        );
+        defer f.close(io);
+
+        try f.writeStreamingAll(io, data);
     }
-    try std.fs.cwd().rename(tmp, path);
+
+    try std.Io.Dir.rename(
+        cwd,
+        tmp,
+        cwd,
+        path,
+        io,
+    );
 }
 
 fn writeJsonStr(w: anytype, s: []const u8) !void {
@@ -1237,21 +1350,46 @@ const PublisherStateJson = struct {
     files: []FileJson = &.{},
 };
 
-fn writePublisherStateFile(a: Allocator, path: []const u8, last_created_at: i64, files: []const FileRecord) !void {
+fn writePublisherStateFile(
+    io: std.Io,
+    a: Allocator,
+    path: []const u8,
+    last_created_at: i64,
+    files: []const FileRecord,
+) !void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
-    const w = buf.writer(a);
-    try w.print("{{\"last_created_at\":{d},\"files\":[", .{last_created_at});
-    for (files, 0..) |rec, i| {
-        if (i > 0) try w.writeByte(',');
-        try writeFileRecordJson(w, rec);
+
+    {
+        var aw: std.Io.Writer.Allocating = .fromArrayList(a, &buf);
+        defer buf = aw.toArrayList();
+
+        const w = &aw.writer;
+
+        try w.print("{{\"last_created_at\":{d},\"files\":[", .{last_created_at});
+
+        for (files, 0..) |rec, i| {
+            if (i > 0) try w.writeByte(',');
+            try writeFileRecordJson(w, rec);
+        }
+
+        try w.writeAll("]}\n");
     }
-    try w.writeAll("]}\n");
-    try writeFileAtomic(path, buf.items);
+
+    try writeFileAtomic(io, path, buf.items);
 }
 
-fn readPublisherStateFile(a: Allocator, path: []const u8) !struct { last_created_at: i64, files: []FileRecord } {
-    const data = try std.fs.cwd().readFileAlloc(a, path, 4 * 1024 * 1024);
+fn readPublisherStateFile(
+    io: std.Io,
+    a: Allocator,
+    path: []const u8,
+) !struct { last_created_at: i64, files: []FileRecord } {
+    const data = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        path,
+        a,
+        .limited(4 * 1024 * 1024),
+    );
     defer a.free(data);
     const parsed = try std.json.parseFromSlice(PublisherStateJson, a, data, .{
         .ignore_unknown_fields = true,
@@ -1286,30 +1424,61 @@ const AppliedJson = struct {
     authors: []AuthorJson = &.{},
 };
 
-fn writeAppliedStateFile(a: Allocator, path: []const u8, authors: []const AuthorState) !void {
+fn writeAppliedStateFile(
+    io: std.Io,
+    a: Allocator,
+    path: []const u8,
+    authors: []const AuthorState,
+) !void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
-    const w = buf.writer(a);
-    try w.writeAll("{\"authors\":[");
-    for (authors, 0..) |au, i| {
-        if (i > 0) try w.writeByte(',');
-        var pk_hex: [64]u8 = undefined;
-        secp.toHex(&au.pubkey, &pk_hex);
-        try w.print("{{\"pubkey\":\"{s}\",\"created_at\":{d},\"files\":[", .{ &pk_hex, au.created_at });
-        for (au.files.items, 0..) |rec, j| {
-            if (j > 0) try w.writeByte(',');
-            try writeFileRecordJson(w, rec);
+
+    {
+        var aw: std.Io.Writer.Allocating = .fromArrayList(a, &buf);
+        defer buf = aw.toArrayList();
+
+        const w = &aw.writer;
+
+        try w.writeAll("{\"authors\":[");
+
+        for (authors, 0..) |au, i| {
+            if (i > 0) try w.writeByte(',');
+
+            var pk_hex: [64]u8 = undefined;
+            secp.toHex(&au.pubkey, &pk_hex);
+
+            try w.print(
+                "{{\"pubkey\":\"{s}\",\"created_at\":{d},\"files\":[",
+                .{ &pk_hex, au.created_at },
+            );
+
+            for (au.files.items, 0..) |rec, j| {
+                if (j > 0) try w.writeByte(',');
+                try writeFileRecordJson(w, rec);
+            }
+
+            try w.writeAll("]}");
         }
-        try w.writeAll("]}");
+
+        try w.writeAll("]}\n");
     }
-    try w.writeAll("]}\n");
-    try writeFileAtomic(path, buf.items);
+
+    try writeFileAtomic(io, path, buf.items);
 }
 
 /// Caller owns the returned slice and everything reachable from it (free each
 /// record path, each author's files list, and the outer slice with `a`).
-fn readAppliedStateFile(a: Allocator, path: []const u8) ![]AuthorState {
-    const data = try std.fs.cwd().readFileAlloc(a, path, 4 * 1024 * 1024);
+fn readAppliedStateFile(
+    io: std.Io,
+    a: Allocator,
+    path: []const u8,
+) ![]AuthorState {
+    const data = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        path,
+        a,
+        .limited(4 * 1024 * 1024),
+    );
     defer a.free(data);
     const parsed = try std.json.parseFromSlice(AppliedJson, a, data, .{
         .ignore_unknown_fields = true,
@@ -1371,7 +1540,7 @@ test "publisher state.json round-trips" {
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
     defer a.free(dir);
     const path = try std.fmt.allocPrint(a, "{s}/state.json", .{dir});
     defer a.free(path);
@@ -1384,9 +1553,9 @@ test "publisher state.json round-trips" {
     try recs.append(a, try testRecord(a, "report.pdf", 0xAB, 12345, 1_700_000_000));
     try recs.append(a, try testRecord(a, "weird \"name\".txt", 0xCD, 7, -5));
 
-    try writePublisherStateFile(a, path, 1_700_000_123, recs.items);
+    try writePublisherStateFile(std.testing.io, a, path, 1_700_000_123, recs.items);
 
-    const loaded = try readPublisherStateFile(a, path);
+    const loaded = try readPublisherStateFile(std.testing.io, a, path);
     defer freeRecords(a, loaded.files);
 
     try testing.expectEqual(@as(i64, 1_700_000_123), loaded.last_created_at);
@@ -1403,7 +1572,7 @@ test "applied.json round-trips authors with files" {
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
     defer a.free(dir);
     const path = try std.fmt.allocPrint(a, "{s}/applied.json", .{dir});
     defer a.free(path);
@@ -1421,9 +1590,9 @@ test "applied.json round-trips authors with files" {
     try authors.append(a, .{ .pubkey = .{7} ** 32, .created_at = 42, .files = recs });
     try authors.append(a, .{ .pubkey = .{8} ** 32, .created_at = 7, .files = .empty });
 
-    try writeAppliedStateFile(a, path, authors.items);
+    try writeAppliedStateFile(std.testing.io, a, path, authors.items);
 
-    const loaded = try readAppliedStateFile(a, path);
+    const loaded = try readAppliedStateFile(std.testing.io, a, path);
     defer {
         for (loaded) |*au| {
             for (au.files.items) |r| a.free(r.path);
@@ -1478,26 +1647,31 @@ test "mergeAuthorFiles: last-writer-wins per path, ties keep primary" {
 
 test "Drive create validates options and dupes strings" {
     const a = testing.allocator;
+    const ctx: nostr_config.Context = .{
+        .io = std.testing.io,
+        .home = null,
+        .xdg_config_home = null,
+    };
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
     defer a.free(dir);
 
     // Subscriber without an author is rejected.
-    try testing.expectError(error.InvalidOptions, Drive.create(a, .{
+    try testing.expectError(error.InvalidOptions, Drive.create(ctx, a, .{
         .role = .subscriber,
         .dir = dir,
         .drive = "x",
     }));
     // Empty drive name is rejected.
-    try testing.expectError(error.InvalidOptions, Drive.create(a, .{
+    try testing.expectError(error.InvalidOptions, Drive.create(ctx, a, .{
         .role = .subscriber,
         .dir = dir,
         .drive = "",
         .author = .{7} ** 32,
     }));
     // tor/proxy routes are a follow-up.
-    try testing.expectError(error.UnsupportedRoute, Drive.create(a, .{
+    try testing.expectError(error.UnsupportedRoute, Drive.create(ctx, a, .{
         .role = .subscriber,
         .dir = dir,
         .drive = "x",
@@ -1506,7 +1680,7 @@ test "Drive create validates options and dupes strings" {
     }));
 
     // A valid subscriber drive: create/destroy alone must not leak or hang.
-    const drive = try Drive.create(a, .{
+    const drive = try Drive.create(ctx, a, .{
         .role = .subscriber,
         .dir = dir,
         .drive = "x",

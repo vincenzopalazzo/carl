@@ -8,7 +8,7 @@
 //!
 //! The pure helpers (`acceptKey`, `encodeFrame`, `decodeFrame`) are unit-tested
 //! against the RFC 6455 examples; the stream helpers wrap them with blocking
-//! `posix.recv`/`posix.send` on `stream.handle`, matching `ws.zig`.
+//! Uses Zig 0.16 `std.Io.net.Stream` reader/writer APIs.
 
 const std = @import("std");
 const posix = std.posix;
@@ -145,50 +145,77 @@ pub fn decodeFrame(allocator: Allocator, data: []const u8) Error!Decoded {
 // Stream helpers (blocking posix I/O on stream.handle, mirroring ws.zig)
 // ---------------------------------------------------------------------------
 
-fn sendAll(stream: std.net.Stream, buf: []const u8) Error!void {
-    var off: usize = 0;
-    while (off < buf.len) {
-        const n = posix.send(stream.handle, buf[off..], 0) catch return error.SendFailed;
-        if (n == 0) return error.Closed;
-        off += n;
-    }
+fn sendAll(
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    buf: []const u8,
+) Error!void {
+    var buffer: [0]u8 = .{};
+    var writer = stream.writer(io, &buffer);
+
+    writer.interface.writeAll(buf) catch
+        return error.SendFailed;
 }
 
-fn recvExact(stream: std.net.Stream, buf: []u8) Error!void {
-    var off: usize = 0;
-    while (off < buf.len) {
-        const n = posix.recv(stream.handle, buf[off..], 0) catch return error.RecvFailed;
-        if (n == 0) return error.Closed;
-        off += n;
-    }
+fn recvExact(
+    io: std.Io,
+    stream: std.Io.net.Stream,
+    buf: []u8,
+) Error!void {
+    var buffer: [0]u8 = .{};
+    var reader = stream.reader(io, &buffer);
+
+    reader.interface.readSliceAll(buf) catch
+        return error.RecvFailed;
 }
 
 /// Send a text frame over `stream`.
-pub fn sendText(allocator: Allocator, stream: std.net.Stream, payload: []const u8) Error!void {
+pub fn sendText(
+    io: std.Io,
+    allocator: Allocator,
+    stream: std.Io.net.Stream,
+    payload: []const u8,
+) Error!void {
     const framed = try encodeFrame(allocator, .text, payload);
     defer allocator.free(framed);
-    try sendAll(stream, framed);
+
+    try sendAll(io, stream, framed);
 }
 
 /// Send a close frame (no status code). Best-effort.
-pub fn sendClose(allocator: Allocator, stream: std.net.Stream) void {
+pub fn sendClose(
+    io: std.Io,
+    allocator: Allocator,
+    stream: std.Io.net.Stream,
+) void {
     const framed = encodeFrame(allocator, .close, "") catch return;
     defer allocator.free(framed);
-    sendAll(stream, framed) catch {};
+
+    sendAll(io, stream, framed) catch {};
 }
 
 /// Send a pong with the given payload (echoing a ping's body, per RFC 6455).
-pub fn sendPong(allocator: Allocator, stream: std.net.Stream, payload: []const u8) Error!void {
+pub fn sendPong(
+    io: std.Io,
+    allocator: Allocator,
+    stream: std.Io.net.Stream,
+    payload: []const u8,
+) Error!void {
     const framed = try encodeFrame(allocator, .pong, payload);
     defer allocator.free(framed);
-    try sendAll(stream, framed);
+
+    try sendAll(io, stream, framed);
 }
 
 /// Read one full client frame from `stream`, unmasking the payload. Reads the
 /// 2-byte header, any extended length, the 4-byte mask, then the payload.
-pub fn readFrame(allocator: Allocator, stream: std.net.Stream) Error!Frame {
+pub fn readFrame(
+    io: std.Io,
+    allocator: Allocator,
+    stream: std.Io.net.Stream,
+) Error!Frame {
     var hdr: [2]u8 = undefined;
-    try recvExact(stream, &hdr);
+    try recvExact(io, stream, &hdr);
     const fin = (hdr[0] & 0x80) != 0;
     const opcode: Opcode = @enumFromInt(@as(u4, @truncate(hdr[0] & 0x0F)));
     const masked = (hdr[1] & 0x80) != 0;
@@ -197,23 +224,23 @@ pub fn readFrame(allocator: Allocator, stream: std.net.Stream) Error!Frame {
     var payload_len: u64 = hdr[1] & 0x7F;
     if (payload_len == 126) {
         var ext: [2]u8 = undefined;
-        try recvExact(stream, &ext);
+        try recvExact(io, stream, &ext);
         payload_len = std.mem.readInt(u16, &ext, .big);
     } else if (payload_len == 127) {
         var ext: [8]u8 = undefined;
-        try recvExact(stream, &ext);
+        try recvExact(io, stream, &ext);
         payload_len = std.mem.readInt(u64, &ext, .big);
     }
     if (payload_len > max_payload) return error.PayloadTooLarge;
 
     var mask: [4]u8 = undefined;
-    try recvExact(stream, &mask);
+    try recvExact(io, stream, &mask);
 
     const plen: usize = @intCast(payload_len);
     const payload = try allocator.alloc(u8, plen);
     errdefer allocator.free(payload);
     if (plen > 0) {
-        try recvExact(stream, payload);
+        try recvExact(io, stream, payload);
         for (payload, 0..) |*c, i| c.* ^= mask[i % 4];
     }
     return .{ .opcode = opcode, .fin = fin, .payload = payload };

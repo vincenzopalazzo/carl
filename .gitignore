@@ -4,3 +4,5 @@ zig-cache/
 
 .gitsigners
 desktop/src-tauri/binaries/
+
+zig-pkg/

@@ -113,20 +113,30 @@ test "wire-level piece exchange over loopback" {
     @memset(downloader_id[8..], 0xBB);
 
     // Create TCP loopback: listener + connect
-    const listen_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0); // port 0 = OS picks
-    var server = try listen_addr.listen(.{ .reuse_address = true });
-    defer server.deinit();
-    const actual_port = server.listen_address.in.getPort();
+    const listen_addr: std.Io.net.IpAddress = .{
+        .ip4 = .loopback(0),
+    };
 
-    // Connect from "downloader"
-    const connect_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, actual_port);
-    const downloader_sock = try std.net.tcpConnectToAddress(connect_addr);
-    defer downloader_sock.close();
+    var server = try listen_addr.listen(
+        std.testing.io,
+        .{ .reuse_address = true },
+    );
+    defer server.deinit(std.testing.io);
 
-    // Accept on "seeder"
-    const accepted = try server.accept();
-    const seeder_sock = accepted.stream;
-    defer seeder_sock.close();
+    const actual_port = server.socket.address.getPort();
+
+    const connect_addr: std.Io.net.IpAddress = .{
+        .ip4 = .loopback(actual_port),
+    };
+
+    const downloader_sock = try connect_addr.connect(
+        std.testing.io,
+        .{ .mode = .stream },
+    );
+    defer downloader_sock.close(std.testing.io);
+
+    const seeder_sock = try server.accept(std.testing.io);
+    defer seeder_sock.close(std.testing.io);
 
     // --- Handshake exchange ---
     const seeder_hs = wire.Handshake{
@@ -134,14 +144,14 @@ test "wire-level piece exchange over loopback" {
         .info_hash = info_hash,
         .peer_id = seeder_id,
     };
-    _ = try seeder_sock.write(&seeder_hs.serialize());
+    try writeAll(seeder_sock, &seeder_hs.serialize());
 
     var recv_buf: [68]u8 = undefined;
     try readExact(&downloader_sock, &recv_buf);
     const parsed_hs = try wire.Handshake.parse(&recv_buf);
     try std.testing.expectEqual(info_hash, parsed_hs.info_hash);
 
-    _ = try downloader_sock.write(&(wire.Handshake{
+    try writeAll(downloader_sock, &(wire.Handshake{
         .reserved = [_]u8{0} ** 8,
         .info_hash = info_hash,
         .peer_id = downloader_id,
@@ -154,7 +164,7 @@ test "wire-level piece exchange over loopback" {
     bf.setPiece(1);
     const bf_msg = try wire.serializeMessage(allocator, .{ .bitfield = bf.rawBytes() });
     defer allocator.free(bf_msg);
-    _ = try seeder_sock.write(bf_msg);
+    try writeAll(seeder_sock, bf_msg);
 
     // --- Downloader receives bitfield ---
     const bf_recv = try allocator.alloc(u8, bf_msg.len);
@@ -167,11 +177,11 @@ test "wire-level piece exchange over loopback" {
     // --- Downloader sends interested, seeder sends unchoke ---
     const int_msg = try wire.serializeMessage(allocator, .interested);
     defer allocator.free(int_msg);
-    _ = try downloader_sock.write(int_msg);
+    try writeAll(downloader_sock, int_msg);
 
     const unchoke_msg = try wire.serializeMessage(allocator, .unchoke);
     defer allocator.free(unchoke_msg);
-    _ = try seeder_sock.write(unchoke_msg);
+    try writeAll(seeder_sock, unchoke_msg);
 
     // Consume interested on seeder side
     var int_recv: [5]u8 = undefined;
@@ -188,7 +198,7 @@ test "wire-level piece exchange over loopback" {
         .length = 16384,
     } });
     defer allocator.free(req_msg);
-    _ = try downloader_sock.write(req_msg);
+    try writeAll(downloader_sock, req_msg);
 
     // --- Seeder receives request, sends piece ---
     var req_recv: [17]u8 = undefined;
@@ -201,7 +211,7 @@ test "wire-level piece exchange over loopback" {
         .block = piece_data,
     } });
     defer allocator.free(piece_msg);
-    _ = try seeder_sock.write(piece_msg);
+    try writeAll(seeder_sock, piece_msg);
 
     // --- Downloader receives piece, verifies SHA-1 ---
     const piece_recv = try allocator.alloc(u8, piece_msg.len);
@@ -217,14 +227,20 @@ test "wire-level piece exchange over loopback" {
     try std.testing.expect(piece_mod.verifyPiece(piece_parsed.msg.piece.block, expected_hash));
 }
 
+fn writeAll(sock: std.Io.net.Stream, bytes: []const u8) !void {
+    var write_buffer: [0]u8 = .{};
+    var writer = sock.writer(std.testing.io, &write_buffer);
+    try writer.interface.writeAll(bytes);
+}
 /// Read exactly `buf.len` bytes from a stream.
-fn readExact(sock: *const std.net.Stream, buf: []u8) !void {
-    var total: usize = 0;
-    while (total < buf.len) {
-        const n = try sock.read(buf[total..]);
-        if (n == 0) return error.EndOfStream;
-        total += n;
-    }
+fn readExact(sock: *const std.Io.net.Stream, buf: []u8) !void {
+    var read_buffer: [0]u8 = .{};
+    var reader = std.Io.net.Stream.reader(
+        sock.*,
+        std.testing.io,
+        &read_buffer,
+    );
+    try reader.interface.readSliceAll(buf);
 }
 
 // =============================================================================
@@ -285,14 +301,14 @@ test "full session seed and download over loopback" {
     var downloader_dir = std.testing.tmpDir(.{});
     defer downloader_dir.cleanup();
 
-    const seeder_path = try seeder_dir.dir.realpathAlloc(allocator, ".");
+    const seeder_path = try seeder_dir.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(seeder_path);
-    const downloader_path = try downloader_dir.dir.realpathAlloc(allocator, ".");
+    const downloader_path = try downloader_dir.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(downloader_path);
 
     // Write test data to seeder's directory
     {
-        var store = storage_mod.Storage.init(allocator, tm.meta, seeder_path, true) catch return;
+        var store = storage_mod.Storage.init(std.testing.io, allocator, tm.meta, seeder_path, true) catch return;
         defer store.deinit();
         const num_pieces = piece_mod.numPieces(test_data.len, piece_length);
         for (0..num_pieces) |i| {
@@ -342,7 +358,9 @@ test "full session seed and download over loopback" {
     defer dl_sess.deinit();
 
     // Connect directly to seeder
-    dl_sess.connectDirectPeer(std.net.Address.initIp4(.{ 127, 0, 0, 1 }, test_port)) catch {
+    dl_sess.connectDirectPeer(.{
+        .ip4 = .loopback(test_port),
+    }) catch {
         session_mod.shutdown_requested.store(true, .release);
         seeder_handle.join();
         return;
@@ -404,13 +422,13 @@ test "magnet metadata exchange then download over loopback" {
     var downloader_dir = std.testing.tmpDir(.{});
     defer downloader_dir.cleanup();
 
-    const seeder_path = try seeder_dir.dir.realpathAlloc(allocator, ".");
+    const seeder_path = try seeder_dir.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(seeder_path);
-    const downloader_path = try downloader_dir.dir.realpathAlloc(allocator, ".");
+    const downloader_path = try downloader_dir.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(downloader_path);
 
     {
-        var store = storage_mod.Storage.init(allocator, tm.meta, seeder_path, true) catch return;
+        var store = storage_mod.Storage.init(std.testing.io, allocator, tm.meta, seeder_path, true) catch return;
         defer store.deinit();
         const num_pieces = piece_mod.numPieces(test_data.len, piece_length);
         for (0..num_pieces) |i| {
@@ -423,6 +441,12 @@ test "magnet metadata exchange then download over loopback" {
 
     // Seeder session bound to an ephemeral port (0 -> OS picks a free one).
     var seeder = session_mod.Session.init(
+        std.testing.io,
+        .{
+            .io = std.testing.io,
+            .home = null,
+            .xdg_config_home = null,
+        },
         allocator,
         tm.meta,
         seeder_path,
@@ -437,7 +461,7 @@ test "magnet metadata exchange then download over loopback" {
     defer seeder.deinit();
     // init opens the inbound listener for seed mode; read back the real port.
     const seeder_port = (seeder.listener orelse return error.SeederNotListening)
-        .listen_address.getPort();
+        .socket.address.getPort();
 
     // Downloader in metadata-only mode. Arena-backed so the metadata-only ->
     // full-metadata handoff (which reassigns Session.meta) doesn't trip the
@@ -465,6 +489,12 @@ test "magnet metadata exchange then download over loopback" {
     };
 
     var dl = session_mod.Session.init(
+        std.testing.io,
+        .{
+            .io = std.testing.io,
+            .home = null,
+            .xdg_config_home = null,
+        },
         da,
         empty_meta,
         downloader_path,
@@ -481,7 +511,9 @@ test "magnet metadata exchange then download over loopback" {
     dl.metadata_download = extension.MetadataDownload.init(da, info_hash);
     dl.metadata_only = true;
 
-    try dl.connectDirectPeer(std.net.Address.initIp4(.{ 127, 0, 0, 1 }, seeder_port));
+    try dl.connectDirectPeer(.{
+        .ip4 = .loopback(seeder_port),
+    });
 
     // Drive both sessions in lock-step until the downloader has fetched the
     // metadata AND all pieces. Hard cap keeps a regression from hanging CI; the
@@ -529,7 +561,7 @@ test "connectOnionPeer cleans up exactly once when the dial fails" {
 
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
-    const dir_path = try dir.dir.realpathAlloc(allocator, ".");
+    const dir_path = try dir.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir_path);
 
     // SOCKS proxy at a port that refuses immediately, so the dial fails fast
@@ -537,6 +569,12 @@ test "connectOnionPeer cleans up exactly once when the dial fails" {
     const proxy = try proxy_mod.parseUrl("socks5://127.0.0.1:1");
 
     var sess = try session_mod.Session.init(
+        std.testing.io,
+        .{
+            .io = std.testing.io,
+            .home = null,
+            .xdg_config_home = null,
+        },
         allocator,
         tm.meta,
         dir_path,
@@ -573,7 +611,7 @@ test "connectI2pPeer cleans up exactly once when the SAM dial fails" {
 
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
-    const dir_path = try dir.dir.realpathAlloc(allocator, ".");
+    const dir_path = try dir.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(dir_path);
 
     // SAM session whose bridge refuses immediately, so the dial fails fast
@@ -581,6 +619,7 @@ test "connectI2pPeer cleans up exactly once when the SAM dial fails" {
     // control/destination are never touched, so dummies are fine (no deinit —
     // this Session owns nothing).
     var sam = i2p_sam.Session{
+        .io = std.testing.io,
         .allocator = allocator,
         .bridge = .{ .host = "127.0.0.1", .port = 1 },
         .id = @constCast("carltest-0"),
@@ -589,6 +628,12 @@ test "connectI2pPeer cleans up exactly once when the SAM dial fails" {
     };
 
     var sess = try session_mod.Session.init(
+        std.testing.io,
+        .{
+            .io = std.testing.io,
+            .home = null,
+            .xdg_config_home = null,
+        },
         allocator,
         tm.meta,
         dir_path,

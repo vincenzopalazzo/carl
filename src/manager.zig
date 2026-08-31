@@ -111,6 +111,8 @@ pub const Config = struct {
 /// the manager owns for the session's lifetime.
 const ManagedTransfer = struct {
     allocator: Allocator,
+    nostr_ctx: nostr_config.Context,
+
     id: []u8,
     name: []u8,
     magnet: []u8,
@@ -237,7 +239,9 @@ const DriveHandle = struct {
 
 pub const Manager = struct {
     allocator: Allocator,
-    mutex: std.Thread.Mutex = .{},
+    io: std.Io,
+    nostr_ctx: nostr_config.Context,
+    mutex: std.Io.Mutex = .init,
     transfers: std.ArrayList(*ManagedTransfer) = .empty,
     next_id: usize = 1,
     /// Followed publishers (mirror workers). Guarded by `mutex` like
@@ -270,8 +274,15 @@ pub const Manager = struct {
     /// `allocator`.
     retained_specs: std.ArrayList(state_mod.TransferSpec) = .empty,
 
-    pub fn init(allocator: Allocator, cfg: Config) Allocator.Error!Manager {
+    pub fn init(
+        io: std.Io,
+        nostr_ctx: nostr_config.Context,
+        allocator: Allocator,
+        cfg: Config,
+    ) Allocator.Error!Manager {
         return .{
+            .io = io,
+            .nostr_ctx = nostr_ctx,
             .allocator = allocator,
             .cfg = .{
                 .route = cfg.route,
@@ -323,7 +334,7 @@ pub const Manager = struct {
         const bridge = i2p_sam.parseUrl(self.cfg.i2p_sam) catch return error.BadProxy;
         const sam = self.allocator.create(i2p_sam.Session) catch return error.OutOfMemory;
         errdefer self.allocator.destroy(sam);
-        sam.* = i2p_sam.Session.create(self.allocator, bridge, "carl") catch return error.SessionInitFailed;
+        sam.* = i2p_sam.Session.create(self.io, self.allocator, bridge, "carl") catch return error.SessionInitFailed;
         return sam;
     }
 
@@ -361,7 +372,10 @@ pub const Manager = struct {
     pub fn addTransfer(self: *Manager, source: []const u8, route: api.Route, want_nostr: bool) Error![]u8 {
         const t = try self.resolveTransport(route);
 
-        std.fs.cwd().makePath(self.cfg.download_dir) catch {};
+        std.Io.Dir.cwd().createDirPath(
+            self.io,
+            self.cfg.download_dir,
+        ) catch {};
 
         const built = self.buildSession(source, t.proxy, t.i2p) catch |err| {
             self.freeTransport(t);
@@ -388,7 +402,10 @@ pub const Manager = struct {
     /// null when it can't be created. Caller owns the slice.
     fn ensureSeedsDir(self: *Manager, dir: []const u8) ?[]u8 {
         const sdir = workdir.seedsDir(self.allocator, dir) catch return null;
-        std.fs.cwd().makePath(sdir) catch {
+        std.Io.Dir.cwd().createDirPath(
+            self.io,
+            sdir,
+        ) catch {
             self.allocator.free(sdir);
             return null;
         };
@@ -408,17 +425,27 @@ pub const Manager = struct {
         const dest = std.fmt.allocPrint(self.allocator, "{s}/{s}.torrent", .{ sdir, &hex }) catch return null;
         if (std.mem.eql(u8, dest, source)) return dest;
 
-        const data = std.fs.cwd().readFileAlloc(self.allocator, source, 10 * 1024 * 1024) catch {
+        const data = std.Io.Dir.cwd().readFileAlloc(
+            self.io,
+            source,
+            self.allocator,
+            .limited(10 * 1024 * 1024),
+        ) catch {
             self.allocator.free(dest);
             return null;
         };
         defer self.allocator.free(data);
-        var f = std.fs.cwd().createFile(dest, .{ .truncate = true }) catch {
+        const f = std.Io.Dir.cwd().createFile(
+            self.io,
+            dest,
+            .{ .truncate = true },
+        ) catch {
             self.allocator.free(dest);
             return null;
         };
-        defer f.close();
-        f.writeAll(data) catch {
+        defer f.close(self.io);
+
+        f.writeStreamingAll(self.io, data) catch {
             self.allocator.free(dest);
             return null;
         };
@@ -433,10 +460,20 @@ pub const Manager = struct {
     /// re-binds; on the rare loss the Session's listener is null and `addSeed`
     /// warns. Returns null if even the probe bind fails (caller falls back).
     fn pickLoopbackPort(self: *Manager) ?u16 {
-        _ = self;
-        var server = (std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0).listen(.{ .reuse_address = true })) catch return null;
-        defer server.deinit();
-        return server.listen_address.getPort();
+        const address: std.Io.net.IpAddress = .{
+            .ip4 = .{
+                .bytes = .{ 127, 0, 0, 1 },
+                .port = 0,
+            },
+        };
+
+        var server = address.listen(
+            self.io,
+            .{ .reuse_address = true },
+        ) catch return null;
+        defer server.deinit(self.io);
+
+        return server.socket.address.getPort();
     }
 
     /// Create a torrent from a local file (or archive) and start seeding it. The
@@ -452,15 +489,30 @@ pub const Manager = struct {
         const sam = self.allocator.create(i2p_sam.Session) catch return error.OutOfMemory;
         errdefer self.allocator.destroy(sam);
 
-        const persisted = i2p_seed.load(self.allocator, info_hash_hex) catch null;
+        const persisted = i2p_seed.load(
+            self.nostr_ctx,
+            self.allocator,
+            info_hash_hex,
+        ) catch null;
         defer if (persisted) |p| self.allocator.free(p);
         const dest: i2p_sam.Session.Dest = if (persisted) |p| .{ .priv = p } else .transient;
 
-        sam.* = i2p_sam.Session.createWithDest(self.allocator, bridge, "carl-seed", dest) catch
-            return error.SessionInitFailed;
+        sam.* = i2p_sam.Session.createWithDest(
+            self.io,
+            self.allocator,
+            bridge,
+            "carl-seed",
+            dest,
+        ) catch return error.SessionInitFailed;
         // First run (no persisted key): the SESSION CREATE reply carries the full
         // private key — save it so the address is stable next time.
-        if (persisted == null) i2p_seed.save(self.allocator, info_hash_hex, sam.destination);
+        if (persisted == null)
+            i2p_seed.save(
+                self.nostr_ctx,
+                self.allocator,
+                info_hash_hex,
+                sam.destination,
+            );
         return sam;
     }
 
@@ -492,7 +544,12 @@ pub const Manager = struct {
             self.freeTransport(t);
         };
 
-        const mi = metainfo.createSingleFile(self.allocator, path, metainfo.default_piece_length) catch |e| {
+        const mi = metainfo.createSingleFile(
+            self.io,
+            self.allocator,
+            path,
+            metainfo.default_piece_length,
+        ) catch |e| {
             return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,
                 else => error.InvalidTorrent,
@@ -527,7 +584,8 @@ pub const Manager = struct {
                 // Give each tor seed its own loopback port so concurrent tor
                 // seeds don't collide on cfg.listen_port. The onion forwards here.
                 seed_port = self.pickLoopbackPort() orelse self.cfg.listen_port;
-                hidden = tor_control.addOnion(self.allocator, .{
+                hidden = tor_control.addOnion(self.io, self.allocator, .{
+                    .home = self.nostr_ctx.home,
                     .control_addr = self.cfg.tor_control,
                     .cookie_path = if (self.cfg.tor_cookie.len > 0) self.cfg.tor_cookie else null,
                     .local_port = seed_port,
@@ -551,7 +609,20 @@ pub const Manager = struct {
         }
 
         const session = self.allocator.create(session_mod.Session) catch return error.OutOfMemory;
-        session.* = session_mod.Session.init(self.allocator, mi, data_dir, .seed, seed_port, session_proxy, listen_bind, tor_hidden, t.i2p, i2p_hidden) catch {
+        session.* = session_mod.Session.init(
+            self.io,
+            self.nostr_ctx,
+            self.allocator,
+            mi,
+            data_dir,
+            .seed,
+            seed_port,
+            session_proxy,
+            listen_bind,
+            tor_hidden,
+            t.i2p,
+            i2p_hidden,
+        ) catch {
             self.allocator.destroy(session);
             return error.SessionInitFailed;
         };
@@ -619,10 +690,10 @@ pub const Manager = struct {
         const mt = try self.allocator.create(ManagedTransfer);
         errdefer if (!mt_owned) self.allocator.destroy(mt);
 
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         const id_num = self.next_id;
         self.next_id += 1;
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
 
         const id = try std.fmt.allocPrint(self.allocator, "t{d}", .{id_num});
         errdefer if (!mt_owned) self.allocator.free(id);
@@ -635,6 +706,7 @@ pub const Manager = struct {
 
         mt.* = .{
             .allocator = self.allocator,
+            .nostr_ctx = self.nostr_ctx,
             .id = id,
             .name = name,
             .magnet = magnet,
@@ -653,14 +725,14 @@ pub const Manager = struct {
             .session = built.session,
             .meta = built.meta,
             .thread = null,
-            .added_ms = std.time.milliTimestamp(),
+            .added_ms = std.Io.Clock.real.now(self.io).toMilliseconds(),
         };
         secp.toHex(&built.info_hash, &mt.hash_hex);
         mt_owned = true; // mt now owns session, meta, socks, id, name, magnet
 
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         self.transfers.append(self.allocator, mt) catch |err| {
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
             mt.destroy();
             return err;
         };
@@ -670,7 +742,7 @@ pub const Manager = struct {
         mt.thread = std.Thread.spawn(.{}, runThread, .{mt}) catch {
             // Roll back: remove from the list and destroy (frees `id` too, so we
             // must not touch it afterward on this path).
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
             _ = self.removeTransfer(id) catch {};
             return error.SessionInitFailed;
         };
@@ -681,7 +753,7 @@ pub const Manager = struct {
         // same files). Only after the spawn: dropping earlier would let the
         // failed-spawn rollback persist state with the saved spec already gone.
         self.dropRetained(source_src);
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
 
         self.persist();
         return self.allocator.dupe(u8, id);
@@ -689,7 +761,7 @@ pub const Manager = struct {
 
     /// Stop and remove the transfer with `id`. Returns true if found.
     pub fn removeTransfer(self: *Manager, id: []const u8) Error!bool {
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         var found: ?*ManagedTransfer = null;
         var idx: usize = 0;
         for (self.transfers.items, 0..) |mt, i| {
@@ -700,7 +772,7 @@ pub const Manager = struct {
             }
         }
         if (found) |_| _ = self.transfers.orderedRemove(idx);
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
 
         if (found) |mt| {
             mt.destroy(); // joins the thread outside the lock
@@ -725,10 +797,10 @@ pub const Manager = struct {
         var pk_hex: [64]u8 = undefined;
         secp.toHex(&pubkey, &pk_hex);
 
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         for (self.follows.items) |f| {
             if (std.mem.eql(u8, &f.pubkey, &pubkey)) {
-                self.mutex.unlock();
+                self.mutex.unlock(self.io);
                 return error.InvalidFollow; // already following
             }
         }
@@ -736,15 +808,15 @@ pub const Manager = struct {
         self.next_follow_id += 1;
         // Mirror data lives beside regular downloads, namespaced by publisher.
         const dir = std.fmt.allocPrint(self.allocator, "{s}/follow-{s}", .{ self.cfg.download_dir, pk_hex[0..12] }) catch {
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
             return error.OutOfMemory;
         };
         const sam = self.allocator.dupe(u8, self.cfg.i2p_sam) catch {
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
             self.allocator.free(dir);
             return error.OutOfMemory;
         };
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
         defer self.allocator.free(sam);
 
         // Once the handle owns these, its `destroy` frees them; the errdefers
@@ -757,7 +829,7 @@ pub const Manager = struct {
         const npub = nip19.encode32(self.allocator, .npub, pubkey) catch return error.OutOfMemory;
         errdefer if (!handle_owned) self.allocator.free(npub);
 
-        const mirror = follow_mod.Mirror.create(self.allocator, .{
+        const mirror = follow_mod.Mirror.create(self.nostr_ctx, self.allocator, .{
             .pubkey = pubkey,
             .route = route,
             .dir = dir,
@@ -779,13 +851,13 @@ pub const Manager = struct {
         };
         handle_owned = true;
 
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         self.follows.append(self.allocator, handle) catch {
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
             handle.destroy(); // frees id/npub/dir + stops the mirror
             return error.OutOfMemory;
         };
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
 
         self.persist();
         return self.allocator.dupe(u8, id);
@@ -794,7 +866,7 @@ pub const Manager = struct {
     /// Stop and remove the follow with `id`. Returns true if found. Joins the
     /// mirror's threads, so this can block on an in-flight relay query.
     pub fn removeFollow(self: *Manager, id: []const u8) Error!bool {
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         var found: ?*FollowHandle = null;
         var idx: usize = 0;
         for (self.follows.items, 0..) |f, i| {
@@ -805,7 +877,7 @@ pub const Manager = struct {
             }
         }
         if (found) |_| _ = self.follows.orderedRemove(idx);
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
 
         if (found) |f| {
             f.destroy(); // joins threads outside the lock
@@ -817,8 +889,8 @@ pub const Manager = struct {
 
     /// Snapshot all follows (with their mirrored torrents) into `arena`.
     pub fn followsSnapshot(self: *Manager, arena: Allocator) Allocator.Error![]api.Follow {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         const out = try arena.alloc(api.Follow, self.follows.items.len);
         for (self.follows.items, 0..) |f, i| {
@@ -892,18 +964,18 @@ pub const Manager = struct {
             also_list.append(self.allocator, pk) catch return error.OutOfMemory;
         }
 
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         for (self.drives.items) |d| {
             if (d.role == role and std.meta.eql(d.author, author) and
                 std.mem.eql(u8, d.name, name) and std.mem.eql(u8, d.dir, dir_arg))
             {
-                self.mutex.unlock();
+                self.mutex.unlock(self.io);
                 return error.InvalidDrive; // already added
             }
         }
         const id_num = self.next_drive_id;
         self.next_drive_id += 1;
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
 
         // Once the handle owns these, its `destroy` frees them; the errdefers
         // below are disarmed so a later failure can't double-free.
@@ -917,7 +989,7 @@ pub const Manager = struct {
         const also = also_list.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
         errdefer if (!handle_owned) self.allocator.free(also);
 
-        const drv = drive_mod.Drive.create(self.allocator, .{
+        const drv = drive_mod.Drive.create(self.nostr_ctx, self.allocator, .{
             .role = role,
             .dir = dir_arg,
             .drive = name,
@@ -947,13 +1019,13 @@ pub const Manager = struct {
         };
         handle_owned = true;
 
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         self.drives.append(self.allocator, handle) catch {
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
             handle.destroy(); // frees id/dir/name/also + stops the drive
             return error.OutOfMemory;
         };
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
 
         self.persist();
         return self.allocator.dupe(u8, id);
@@ -962,7 +1034,7 @@ pub const Manager = struct {
     /// Stop and remove the drive with `id`. Returns true if found. Joins the
     /// drive loop thread, so this can block on an in-flight relay query.
     pub fn removeDrive(self: *Manager, id: []const u8) Error!bool {
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         var found: ?*DriveHandle = null;
         var idx: usize = 0;
         for (self.drives.items, 0..) |d, i| {
@@ -973,7 +1045,7 @@ pub const Manager = struct {
             }
         }
         if (found) |_| _ = self.drives.orderedRemove(idx);
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
 
         if (found) |d| {
             d.destroy(); // joins threads outside the lock
@@ -985,8 +1057,8 @@ pub const Manager = struct {
 
     /// Snapshot all drives (with their file tables) into `arena`.
     pub fn drivesSnapshot(self: *Manager, arena: Allocator) Allocator.Error![]api.Drive {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         const out = try arena.alloc(api.Drive, self.drives.items.len);
         for (self.drives.items, 0..) |d, i| {
@@ -1028,10 +1100,10 @@ pub const Manager = struct {
     /// Build a snapshot of all transfers into `arena`. Caller owns nothing
     /// individually — freeing the arena frees everything.
     pub fn snapshot(self: *Manager, arena: Allocator) Allocator.Error![]api.Transfer {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
-        const now = std.time.milliTimestamp();
+        const now = std.Io.Clock.real.now(self.io).toMilliseconds();
         var out = try arena.alloc(api.Transfer, self.transfers.items.len);
         for (self.transfers.items, 0..) |mt, i| {
             out[i] = try snapshotTransfer(mt, arena, now);
@@ -1041,8 +1113,8 @@ pub const Manager = struct {
 
     /// Seeds = transfers currently in the seeding state.
     pub fn seeds(self: *Manager, arena: Allocator) Allocator.Error![]api.Seed {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         var list: std.ArrayList(api.Seed) = .empty;
         for (self.transfers.items) |mt| {
@@ -1080,8 +1152,8 @@ pub const Manager = struct {
     }
 
     pub fn settings(self: *Manager, relays: []const []const u8) api.Settings {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return .{
             .route = self.cfg.route,
             .socks = self.cfg.socks,
@@ -1095,17 +1167,17 @@ pub const Manager = struct {
     }
 
     pub fn setRoute(self: *Manager, route: api.Route) void {
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         self.cfg.route = route;
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
         self.persist();
     }
 
     /// A locked copy of the current download dir (for callers that need to build
     /// a path without racing `setDownloadDir`).
     pub fn downloadDirDup(self: *Manager, a: Allocator) Allocator.Error![]u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return a.dupe(u8, self.cfg.download_dir);
     }
 
@@ -1113,7 +1185,7 @@ pub const Manager = struct {
     /// their original directory; this affects subsequently added ones.
     pub fn setDownloadDir(self: *Manager, dir: []const u8) Allocator.Error!void {
         const dup = try self.allocator.dupe(u8, dir);
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         self.allocator.free(self.cfg.download_dir);
         self.cfg.download_dir = dup;
         // An explicit user choice replaces any kept-aside persisted value:
@@ -1122,8 +1194,8 @@ pub const Manager = struct {
             self.allocator.free(old);
             self.saved_download_dir = null;
         }
-        self.mutex.unlock();
-        std.fs.cwd().makePath(dup) catch {};
+        self.mutex.unlock(self.io);
+        std.Io.Dir.cwd().createDirPath(self.io, dup) catch {};
         self.persist();
     }
 
@@ -1142,10 +1214,10 @@ pub const Manager = struct {
         defer arena.deinit();
         const aa = arena.allocator();
 
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         const route = self.cfg.route;
         const dir = aa.dupe(u8, self.saved_download_dir orelse self.cfg.download_dir) catch {
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
             return;
         };
         var specs: std.ArrayList(state_mod.TransferSpec) = .empty;
@@ -1206,9 +1278,17 @@ pub const Manager = struct {
                 .route = d.route,
             }) catch break;
         }
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
 
-        state_mod.save(self.allocator, route, dir, specs.items, follow_specs.items, drive_specs.items) catch |e| {
+        state_mod.save(
+            self.nostr_ctx,
+            self.allocator,
+            route,
+            dir,
+            specs.items,
+            follow_specs.items,
+            drive_specs.items,
+        ) catch |e| {
             log.warn("failed to persist daemon state: {}", .{e});
         };
     }
@@ -1217,13 +1297,13 @@ pub const Manager = struct {
     /// non-blocking, so the daemon's first snapshot already reflects them. Call
     /// before serving; the slow transfer replay (`restoreTransfers`) runs after.
     pub fn restoreSettings(self: *Manager) void {
-        const st = (state_mod.load(self.allocator) catch |e| {
+        const st = (state_mod.load(self.nostr_ctx, self.allocator) catch |e| {
             log.warn("failed to load daemon state: {}", .{e});
             return;
         }) orelse return;
         defer st.deinit(self.allocator);
 
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         // An explicit --route wins over the persisted (GUI-set) route; the
         // persisted one only fills in when the user didn't ask for anything.
         if (!self.cfg.route_explicit) self.cfg.route = st.route;
@@ -1234,7 +1314,11 @@ pub const Manager = struct {
         // ~/Downloads/carl-download) are stale pre-unification state, not a
         // user choice. When pinned, keep the DB value aside so `persist`
         // re-saves it — the override is ephemeral and must not clobber it.
-        if (!workdir.isPlaceholder(self.allocator, st.download_dir)) {
+        if (!workdir.isPlaceholder(
+            self.allocator,
+            self.nostr_ctx.home,
+            st.download_dir,
+        )) {
             if (self.allocator.dupe(u8, st.download_dir)) |d| {
                 if (self.cfg.download_dir_pinned) {
                     if (self.saved_download_dir) |old| self.allocator.free(old);
@@ -1245,8 +1329,8 @@ pub const Manager = struct {
                 }
             } else |_| {}
         }
-        self.mutex.unlock();
-        std.fs.cwd().makePath(self.cfg.download_dir) catch {};
+        self.mutex.unlock(self.io);
+        std.Io.Dir.cwd().createDirPath(self.io, self.cfg.download_dir) catch {};
     }
 
     /// Re-add every persisted transfer/seed. Downloads resume from on-disk
@@ -1256,7 +1340,7 @@ pub const Manager = struct {
     /// serving handlers, and `persist` no-ops (atomic `restoring`) until the end
     /// so a partial replay can never rewrite the DB with fewer transfers.
     pub fn restoreTransfers(self: *Manager) void {
-        const st = (state_mod.load(self.allocator) catch |e| {
+        const st = (state_mod.load(self.nostr_ctx, self.allocator) catch |e| {
             log.warn("failed to load daemon state: {}", .{e});
             return;
         }) orelse return;
@@ -1350,9 +1434,14 @@ pub const Manager = struct {
         defer self.allocator.free(sdir);
         const path = std.fmt.allocPrint(self.allocator, "{s}/{s}.torrent", .{ sdir, hex }) catch return;
         defer self.allocator.free(path);
-        var f = std.fs.cwd().createFile(path, .{ .truncate = true }) catch return;
-        defer f.close();
-        f.writeAll(blob) catch {};
+        const f = std.Io.Dir.cwd().createFile(
+            self.io,
+            path,
+            .{ .truncate = true },
+        ) catch return;
+        defer f.close(self.io);
+
+        f.writeStreamingAll(self.io, blob) catch {};
     }
 
     /// Retry every retained spec — a persisted transfer whose re-add failed at
@@ -1371,13 +1460,13 @@ pub const Manager = struct {
         defer arena.deinit();
         const aa = arena.allocator();
 
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         var specs: std.ArrayList(state_mod.TransferSpec) = .empty;
         for (self.retained_specs.items) |s| {
             const src = aa.dupe(u8, s.source) catch break;
             specs.append(aa, .{ .kind = s.kind, .source = src, .route = s.route, .nostr = s.nostr }) catch break;
         }
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
 
         for (specs.items) |t| {
             const res = switch (t.kind) {
@@ -1417,8 +1506,8 @@ pub const Manager = struct {
         // serves, so this can race a concurrent add's `dropRetained` (and
         // `persist`'s read) — all of which touch `retained_specs` under the
         // mutex. Take the lock here too.
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         self.retained_specs.append(self.allocator, .{
             .kind = t.kind,
             .source = src,
@@ -1438,7 +1527,7 @@ pub const Manager = struct {
     /// periodically by the daemon; idempotent (the `resolved` flag).
     pub fn checkpoint(self: *Manager) void {
         var changed = false;
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         for (self.transfers.items) |mt| {
             if (mt.is_seed or mt.resolved) continue;
             const blob = mt.session.copyTorrent(self.allocator) orelse continue;
@@ -1450,12 +1539,17 @@ pub const Manager = struct {
             const path = std.fmt.allocPrint(self.allocator, "{s}/{s}.torrent", .{ sdir, &mt.hash_hex }) catch continue;
             var wrote = true;
             {
-                var f = std.fs.cwd().createFile(path, .{ .truncate = true }) catch {
+                const f = std.Io.Dir.cwd().createFile(
+                    self.io,
+                    path,
+                    .{ .truncate = true },
+                ) catch {
                     self.allocator.free(path);
                     continue;
                 };
-                defer f.close();
-                f.writeAll(blob) catch {
+                defer f.close(self.io);
+
+                f.writeStreamingAll(self.io, blob) catch {
                     wrote = false;
                 };
             }
@@ -1470,7 +1564,7 @@ pub const Manager = struct {
             mt.resolved = true;
             changed = true;
         }
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
         if (changed) self.persist();
     }
 
@@ -1493,7 +1587,12 @@ pub const Manager = struct {
     }
 
     fn buildFile(self: *Manager, path: []const u8, proxy: ?proxy_mod.Proxy, i2p: ?*i2p_sam.Session) Error!Built {
-        const data = std.fs.cwd().readFileAlloc(self.allocator, path, 10 * 1024 * 1024) catch return error.InvalidTorrent;
+        const data = std.Io.Dir.cwd().readFileAlloc(
+            self.io,
+            path,
+            self.allocator,
+            .limited(10 * 1024 * 1024),
+        ) catch return error.InvalidTorrent;
         defer self.allocator.free(data);
         const mi = metainfo.parse(self.allocator, data) catch return error.InvalidTorrent;
         return self.fromMetainfo(mi, proxy, i2p);
@@ -1505,7 +1604,12 @@ pub const Manager = struct {
         // leaking the real IP despite the route being documented as fail-closed.
         // HTTP-over-SAM is P3 follow-up work (#35); until then, reject.
         if (i2p != null) return error.UnsupportedOnI2p;
-        const data = fetchUrl(self.allocator, url, proxy) catch return error.HttpFailed;
+        const data = fetchUrl(
+            self.io,
+            self.allocator,
+            url,
+            proxy,
+        ) catch return error.HttpFailed;
         defer self.allocator.free(data);
         const mi = metainfo.parse(self.allocator, data) catch return error.InvalidTorrent;
         return self.fromMetainfo(mi, proxy, i2p);
@@ -1517,7 +1621,7 @@ pub const Manager = struct {
         errdefer mi.deinit(self.allocator);
         const session = self.allocator.create(session_mod.Session) catch return error.OutOfMemory;
         errdefer self.allocator.destroy(session);
-        session.* = session_mod.Session.init(self.allocator, mi, self.cfg.download_dir, .download, self.cfg.listen_port, proxy, .any, false, i2p, false) catch {
+        session.* = session_mod.Session.init(self.io, self.nostr_ctx, self.allocator, mi, self.cfg.download_dir, .download, self.cfg.listen_port, proxy, .any, false, i2p, false) catch {
             return error.SessionInitFailed;
         };
         // Daemon downloads keep seeding once complete — the GUI lists them
@@ -1539,7 +1643,7 @@ pub const Manager = struct {
 
         const session = a.create(session_mod.Session) catch return error.OutOfMemory;
         errdefer a.destroy(session);
-        session.* = session_mod.Session.init(a, mi, self.cfg.download_dir, .download, self.cfg.listen_port, proxy, .any, false, i2p, false) catch {
+        session.* = session_mod.Session.init(self.io, self.nostr_ctx, a, mi, self.cfg.download_dir, .download, self.cfg.listen_port, proxy, .any, false, i2p, false) catch {
             return error.SessionInitFailed;
         };
         session.info_hash = ml.info_hash; // use the magnet's hash, not SHA1("")
@@ -1918,7 +2022,10 @@ fn onDownloadCompleteCb(ctx: *anyopaque) void {
 /// organically as users complete downloads.
 fn broadcastIfNew(mt: *ManagedTransfer) void {
     const a = mt.allocator;
-    const relay_urls = nostr_config.readRelays(a) catch return;
+    const relay_urls = nostr_config.readRelays(
+        mt.nostr_ctx,
+        a,
+    ) catch return;
     defer nostr_config.freeRelays(a, relay_urls);
 
     var ih_hex: [40]u8 = undefined;
@@ -1932,9 +2039,19 @@ fn broadcastIfNew(mt: *ManagedTransfer) void {
 
     // One-shot publish gate: honor the skip list as long as it leaves at
     // least one relay to ask, otherwise dial anyway.
-    const gate = relay_mod.oneShotGate(relay_urls, mt.proxy);
+    const gate = relay_mod.oneShotGate(
+        mt.nostr_ctx.io,
+        relay_urls,
+        mt.proxy,
+    );
     for (relay_urls) |url| {
-        var r = relay_mod.dial(a, url, mt.proxy, gate) catch continue;
+        var r = relay_mod.dial(
+            mt.nostr_ctx.io,
+            a,
+            url,
+            mt.proxy,
+            gate,
+        ) catch continue;
         defer r.deinit();
         const events = relay_mod.subscribeAndCollect(a, &r, filter, .{
             .timeout_ms = 8_000,
@@ -1957,7 +2074,15 @@ fn broadcastIfNew(mt: *ManagedTransfer) void {
         .{ .i2p = .{ .host = host, .port = 0 } }
     else
         .none;
-    seeding.publish(a, mt.meta, mt.info_hash, ann, "", mt.proxy) catch |err| {
+    seeding.publish(
+        mt.nostr_ctx,
+        a,
+        mt.meta,
+        mt.info_hash,
+        ann,
+        "",
+        mt.proxy,
+    ) catch |err| {
         log.warn("transfer {s}: nostr broadcast failed: {}", .{ mt.id, err });
     };
 }
@@ -1984,7 +2109,7 @@ fn publishSeedNostr(mt: *ManagedTransfer) void {
         .{ .i2p = .{ .host = host, .port = 0 } }
     else
         .none;
-    seeding.publish(mt.allocator, mt.meta, mt.info_hash, ann, "", mt.proxy) catch |err| {
+    seeding.publish(mt.nostr_ctx, mt.allocator, mt.meta, mt.info_hash, ann, "", mt.proxy) catch |err| {
         log.warn("seed {s}: nostr publish failed: {}", .{ mt.id, err });
     };
 }
@@ -1997,7 +2122,10 @@ fn collectNostrPeers(mt: *ManagedTransfer) void {
     var ih_hex: [40]u8 = undefined;
     secp.toHex(&mt.info_hash, &ih_hex);
 
-    const relay_urls = nostr_config.readRelays(a) catch return;
+    const relay_urls = nostr_config.readRelays(
+        mt.nostr_ctx,
+        a,
+    ) catch return;
     defer nostr_config.freeRelays(a, relay_urls);
 
     var values = [_][]const u8{&ih_hex};
@@ -2013,7 +2141,13 @@ fn collectNostrPeers(mt: *ManagedTransfer) void {
         if (!mt.session.running) return;
         // Periodic re-discovery: honor the health gate so a down relay isn't
         // re-dialed on every round.
-        var r = relay_mod.dial(a, url, mt.proxy, .honor) catch continue;
+        var r = relay_mod.dial(
+            mt.nostr_ctx.io,
+            a,
+            url,
+            mt.proxy,
+            .honor,
+        ) catch continue;
         defer r.deinit();
         const events = relay_mod.subscribeAndCollect(a, &r, filter, .{
             .timeout_ms = 10_000,
@@ -2042,7 +2176,12 @@ fn collectNostrPeers(mt: *ManagedTransfer) void {
                     // announces. (proxy/Tor dial IPv4 through the proxy, so they
                     // still count.)
                     if (mt.session.i2p != null) continue;
-                    const addr = std.net.Address.initIp4(ep.ip, ep.port);
+                    const addr: std.Io.net.IpAddress = .{
+                        .ip4 = .{
+                            .bytes = ep.ip,
+                            .port = ep.port,
+                        },
+                    };
                     mt.session.connectDirectPeer(addr) catch continue;
                     added += 1;
                 },
@@ -2064,23 +2203,35 @@ fn collectNostrPeers(mt: *ManagedTransfer) void {
 
 // fetchUrl: download a .torrent over HTTP(S), optionally via proxy. Ported from
 // the CLI so the manager doesn't depend on main.zig.
-fn fetchUrl(allocator: Allocator, url: []const u8, proxy: ?proxy_mod.Proxy) ![]u8 {
+fn fetchUrl(
+    io: std.Io,
+    allocator: Allocator,
+    url: []const u8,
+    proxy: ?proxy_mod.Proxy,
+) ![]u8 {
     if (proxy) |px| {
-        return proxy_mod.httpGet(allocator, px, url, null) catch return error.HttpFailed;
+        return proxy_mod.httpGet(io, allocator, px, url, null) catch return error.HttpFailed;
     }
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client: std.http.Client = .{
+        .allocator = allocator,
+        .io = io,
+    };
     defer client.deinit();
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(allocator);
-    var adapt_buf: [4096]u8 = undefined;
-    const dw = body.writer(allocator);
-    var adapter = dw.adaptToNewApi(&adapt_buf);
-    const result = client.fetch(.{
-        .location = .{ .url = url },
-        .response_writer = &adapter.new_interface,
-    }) catch return error.HttpFailed;
-    const buffered = adapter.new_interface.buffered();
-    if (buffered.len > 0) body.appendSlice(allocator, buffered) catch return error.HttpFailed;
+
+    const result = blk: {
+        var aw: std.Io.Writer.Allocating = .fromArrayList(
+            allocator,
+            &body,
+        );
+        defer body = aw.toArrayList();
+
+        break :blk client.fetch(.{
+            .location = .{ .url = url },
+            .response_writer = &aw.writer,
+        }) catch return error.HttpFailed;
+    };
     if (result.status != .ok or body.items.len == 0) return error.HttpFailed;
     return body.toOwnedSlice(allocator);
 }
@@ -2177,7 +2328,18 @@ test "formatEta" {
 
 test "Manager: dropRetained removes a re-added source so persist can't duplicate it" {
     const allocator = testing.allocator;
-    var m = try Manager.init(allocator, .{ .persist = false });
+    const ctx: nostr_config.Context = .{
+        .io = std.testing.io,
+        .home = null,
+        .xdg_config_home = null,
+    };
+
+    var m = try Manager.init(
+        std.testing.io,
+        ctx,
+        allocator,
+        .{ .persist = false },
+    );
     defer m.deinit();
 
     try testing.expect(m.retainSpec(.{ .kind = .download, .source = "magnet:?xt=urn:btih:aa", .route = .i2p, .nostr = true }));
@@ -2199,7 +2361,18 @@ test "Manager: dropRetained removes a re-added source so persist can't duplicate
 test "Manager: init/deinit with config defaults" {
     const allocator = testing.allocator;
     // persist=false: setRoute below must not rewrite the real carl.db.
-    var m = try Manager.init(allocator, .{ .persist = false });
+    const ctx: nostr_config.Context = .{
+        .io = std.testing.io,
+        .home = null,
+        .xdg_config_home = null,
+    };
+
+    var m = try Manager.init(
+        std.testing.io,
+        ctx,
+        allocator,
+        .{ .persist = false },
+    );
     defer m.deinit();
     try testing.expectEqualStrings("socks5h://127.0.0.1:9050", m.cfg.socks);
     try testing.expectEqualStrings(".", m.cfg.download_dir);

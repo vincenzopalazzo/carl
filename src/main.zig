@@ -8,18 +8,27 @@ pub const std_options: std.Options = .{
     .log_level = .debug,
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    try carl.secp.init(init.io);
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
-    const stdout = std.fs.File.stdout().deprecatedWriter();
+    const nostr_ctx: carl.nostr_config.Context = .{
+        .io = init.io,
+        .home = init.environ_map.get("HOME"),
+        .xdg_config_home = init.environ_map.get("XDG_CONFIG_HOME"),
+    };
+
+    const carl_dir = init.environ_map.get("CARL_DIR");
+
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    const stdout = &stdout_writer.interface;
+    defer stdout.flush() catch {};
 
     if (args.len < 2) {
-        printUsage();
+        printUsage(init.io);
         std.process.exit(1);
     }
 
@@ -30,13 +39,13 @@ pub fn main() !void {
             log.err("usage: carl info <file.torrent>", .{});
             std.process.exit(1);
         }
-        try cmdInfo(allocator, stdout, args[2]);
+        try cmdInfo(init.io, allocator, stdout, args[2]);
     } else if (std.mem.eql(u8, command, "announce")) {
         if (args.len < 3) {
             log.err("usage: carl announce <file.torrent>", .{});
             std.process.exit(1);
         }
-        try cmdAnnounce(allocator, stdout, args[2], parseProxy(args[3..]));
+        try cmdAnnounce(init.io, allocator, stdout, args[2], parseProxy(args[3..]));
     } else if (std.mem.eql(u8, command, "download")) {
         if (args.len < 3) {
             log.err("usage: carl download <source> [--output-dir <dir>] [--port <port>]", .{});
@@ -69,13 +78,17 @@ pub fn main() !void {
         var output_dir_owned: ?[]u8 = null;
         defer if (output_dir_owned) |d| allocator.free(d);
         const output_dir = parseFlag(args[3..], "--output-dir") orelse blk: {
-            output_dir_owned = try carl.workdir.ensure(allocator);
+            output_dir_owned = try carl.workdir.ensure(
+                nostr_ctx,
+                allocator,
+                carl_dir,
+            );
             break :blk @as([]const u8, output_dir_owned.?);
         };
         const port = parsePort(args[3..]);
         const want_nostr = parseFlagPresent(args[3..], "--nostr");
         const want_seed = parseFlagPresent(args[3..], "--seed");
-        try cmdDownload(allocator, source, output_dir, port, parseProxy(args[3..]), want_nostr, want_seed);
+        try cmdDownload(nostr_ctx, init.io, allocator, source, output_dir, port, parseProxy(args[3..]), want_nostr, want_seed);
     } else if (std.mem.eql(u8, command, "seed")) {
         if (args.len < 3) {
             log.err("usage: carl seed <file.torrent> [data-dir] [--port p] [--nostr] [--external-ip ip] [--tor-seed] [--tor-control addr] [--tor-cookie path] [--tor-onion-port p] [--tor-socks url] [--i2p-seed] [--i2p-sam host:port] [--description \"...\"]", .{});
@@ -89,7 +102,11 @@ pub fn main() !void {
         var data_dir_owned: ?[]u8 = null;
         defer if (data_dir_owned) |d| allocator.free(d);
         const data_dir: []const u8 = if (has_data_dir) args[3] else blk: {
-            data_dir_owned = try carl.workdir.ensure(allocator);
+            data_dir_owned = try carl.workdir.ensure(
+                nostr_ctx,
+                allocator,
+                carl_dir,
+            );
             break :blk data_dir_owned.?;
         };
         const port = parsePort(flag_args);
@@ -103,7 +120,7 @@ pub fn main() !void {
         const tor_socks_url = parseFlag(flag_args, "--tor-socks") orelse "socks5h://127.0.0.1:9050";
         const i2p_seed = parseFlagPresent(flag_args, "--i2p-seed");
         const i2p_sam_addr = parseFlag(flag_args, "--i2p-sam") orelse "127.0.0.1:7656";
-        try cmdSeed(allocator, args[2], data_dir, port, parseProxy(flag_args), want_nostr, tor_seed, i2p_seed, i2p_sam_addr, external_ip, description, .{
+        try cmdSeed(nostr_ctx, init.io, allocator, args[2], data_dir, port, parseProxy(flag_args), want_nostr, tor_seed, i2p_seed, i2p_sam_addr, external_ip, description, .{
             .control_addr = tor_control,
             .cookie_path = tor_cookie,
             .onion_port = tor_onion_port,
@@ -114,7 +131,13 @@ pub fn main() !void {
             log.err("usage: carl create <file-or-dir> [-o out.torrent] [-t tracker]... [--comment \"...\"] [--piece-length bytes]", .{});
             std.process.exit(1);
         }
-        try cmdCreate(allocator, stdout, args[2], args[3..]);
+        try cmdCreate(
+            init.io,
+            allocator,
+            stdout,
+            args[2],
+            args[3..],
+        );
     } else if (std.mem.eql(u8, command, "search")) {
         if (args.len < 3) {
             log.err("usage: carl search <query> [--limit <n>] [--relay <url>]", .{});
@@ -122,30 +145,37 @@ pub fn main() !void {
         }
         const limit = parseUnsignedFlag(args[3..], "--limit", 50);
         const single_relay = parseFlag(args[3..], "--relay");
-        try cmdSearch(allocator, stdout, args[2], limit, single_relay, parseProxy(args[3..]));
+        try cmdSearch(
+            nostr_ctx,
+            allocator,
+            stdout,
+            args[2],
+            limit,
+            single_relay,
+            parseProxy(args[3..]),
+        );
     } else if (std.mem.eql(u8, command, "follow")) {
         if (args.len < 3) {
             log.err("usage: carl follow <npub|pubkey-hex> [--route direct|i2p] [--dir d] [--i2p-sam host:port] [--external-ip ip] [--interval secs]", .{});
             std.process.exit(1);
         }
-        try cmdFollow(allocator, args[2], args[3..]);
+        try cmdFollow(nostr_ctx, allocator, args[2], args[3..]);
     } else if (std.mem.eql(u8, command, "drive")) {
-        try cmdDrive(allocator, args[2..]);
+        try cmdDrive(nostr_ctx, allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "nostr-keygen")) {
-        try cmdNostrKeygen(allocator, stdout);
+        try cmdNostrKeygen(nostr_ctx, allocator, stdout);
     } else if (std.mem.eql(u8, command, "whoami")) {
-        try cmdWhoami(allocator, stdout);
+        try cmdWhoami(nostr_ctx, allocator, stdout);
     } else if (std.mem.eql(u8, command, "daemon")) {
-        try cmdDaemon(allocator, stdout, args[2..]);
+        try cmdDaemon(init.io, nostr_ctx, allocator, stdout, args[2..]);
     } else {
         log.err("unknown command: {s}", .{command});
         std.process.exit(1);
     }
 }
 
-fn printUsage() void {
-    const stderr = std.fs.File.stderr().deprecatedWriter();
-    stderr.print(
+fn printUsage(io: std.Io) void {
+    std.Io.File.stderr().writeStreamingAll(io,
         \\usage: carl <command> [args]
         \\
         \\commands:
@@ -220,11 +250,16 @@ fn printUsage() void {
         \\                setting, else ~/Downloads/carl. Drop a file there and
         \\                `carl seed <file.torrent>` (or the app) can reseed it.
         \\
-    , .{}) catch {};
+    ) catch {};
 }
 
-fn readTorrent(allocator: std.mem.Allocator, path: []const u8) carl.metainfo.Metainfo {
-    const data = std.fs.cwd().readFileAlloc(allocator, path, 10 * 1024 * 1024) catch |err| {
+fn readTorrent(io: std.Io, allocator: std.mem.Allocator, path: []const u8) carl.metainfo.Metainfo {
+    const data = std.Io.Dir.cwd().readFileAlloc(
+        io,
+        path,
+        allocator,
+        .limited(10 * 1024 * 1024),
+    ) catch |err| {
         log.err("cannot read '{s}': {}", .{ path, err });
         std.process.exit(1);
     };
@@ -236,8 +271,8 @@ fn readTorrent(allocator: std.mem.Allocator, path: []const u8) carl.metainfo.Met
     };
 }
 
-fn cmdInfo(allocator: std.mem.Allocator, stdout: anytype, path: []const u8) !void {
-    const mi = readTorrent(allocator, path);
+fn cmdInfo(io: std.Io, allocator: std.mem.Allocator, stdout: anytype, path: []const u8) !void {
+    const mi = readTorrent(io, allocator, path);
     defer mi.deinit(allocator);
 
     try stdout.print("name:         {s}\n", .{mi.name});
@@ -267,19 +302,19 @@ fn cmdInfo(allocator: std.mem.Allocator, stdout: anytype, path: []const u8) !voi
     }
 }
 
-fn cmdAnnounce(allocator: std.mem.Allocator, stdout: anytype, path: []const u8, proxy: ?carl.proxy.Proxy) !void {
-    const mi = readTorrent(allocator, path);
+fn cmdAnnounce(io: std.Io, allocator: std.mem.Allocator, stdout: anytype, path: []const u8, proxy: ?carl.proxy.Proxy) !void {
+    const mi = readTorrent(io, allocator, path);
     defer mi.deinit(allocator);
 
     const info_hash = carl.metainfo.infoHash(mi.raw_info);
 
     var peer_id: [20]u8 = undefined;
     @memcpy(peer_id[0..8], "-CA0010-");
-    std.crypto.random.bytes(peer_id[8..]);
+    io.random(peer_id[8..]);
 
     log.info("announcing to {s}...", .{mi.announce});
 
-    const resp = carl.tracker.announce(allocator, mi.announce, .{
+    const resp = carl.tracker.announce(io, allocator, mi.announce, .{
         .info_hash = info_hash,
         .peer_id = peer_id,
         .port = 6881,
@@ -311,7 +346,7 @@ fn cmdAnnounce(allocator: std.mem.Allocator, stdout: anytype, path: []const u8, 
     }
 }
 
-fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []const u8, port: u16, proxy: ?carl.proxy.Proxy, want_nostr: bool, want_seed: bool) !void {
+fn cmdDownload(ctx: carl.nostr_config.Context, io: std.Io, allocator: std.mem.Allocator, source: []const u8, output_dir: []const u8, port: u16, proxy: ?carl.proxy.Proxy, want_nostr: bool, want_seed: bool) !void {
     if (std.mem.startsWith(u8, source, "magnet:")) {
         // Magnet link
         const ml = carl.magnet.parse(allocator, source) catch |err| {
@@ -337,7 +372,7 @@ fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []c
         var nip35_entry: ?carl.nip35.TorrentEntry = null;
         defer if (nip35_entry) |e| e.deinit(allocator);
         if (want_nostr) {
-            nip35_entry = fetchNip35Entry(allocator, ml.info_hash, proxy);
+            nip35_entry = fetchNip35Entry(ctx, allocator, ml.info_hash, proxy);
         }
 
         if (nip35_entry) |entry| {
@@ -431,8 +466,21 @@ fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []c
         };
         defer mi.deinit(allocator);
 
-        std.fs.cwd().makePath(output_dir) catch {};
-        var session = carl.session.Session.init(allocator, mi, output_dir, .download, port, proxy, .any, false, null, false) catch |err| {
+        std.Io.Dir.cwd().createDirPath(io, output_dir) catch {};
+        var session = carl.session.Session.init(
+            io,
+            ctx,
+            allocator,
+            mi,
+            output_dir,
+            .download,
+            port,
+            proxy,
+            .any,
+            false,
+            null,
+            false,
+        ) catch |err| {
             log.err("failed to initialize session: {}", .{err});
             std.process.exit(1);
         };
@@ -441,9 +489,24 @@ fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []c
         session.metadata_download = carl.extension.MetadataDownload.init(allocator, ml.info_hash);
         session.metadata_only = true;
         session.seed_after_complete = want_seed;
+
+        var discovery_ctx: CliPeerDiscoveryCtx = .{
+            .session = &session,
+            .nostr_ctx = ctx,
+        };
+
         if (want_nostr) {
-            session.setPeerDiscovery(&session, cliRediscoverPeersCb);
-            collectNostrPeers(allocator, ml.info_hash, &session);
+            session.setPeerDiscovery(
+                &discovery_ctx,
+                cliRediscoverPeersCb,
+            );
+
+            collectNostrPeers(
+                ctx,
+                allocator,
+                ml.info_hash,
+                &session,
+            );
         }
         session.run() catch |err| {
             log.err("session failed: {}", .{err});
@@ -452,7 +515,7 @@ fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []c
     } else if (std.mem.startsWith(u8, source, "http://") or std.mem.startsWith(u8, source, "https://")) {
         // HTTP URL
         log.info("downloading torrent from {s}...", .{source});
-        const torrent_data = fetchUrl(allocator, source, proxy) catch |err| {
+        const torrent_data = fetchUrl(io, allocator, source, proxy) catch |err| {
             log.err("failed to download torrent: {}", .{err});
             std.process.exit(1);
         };
@@ -463,18 +526,28 @@ fn cmdDownload(allocator: std.mem.Allocator, source: []const u8, output_dir: []c
             std.process.exit(1);
         };
         defer mi.deinit(allocator);
-        startDownload(allocator, mi, output_dir, port, proxy, want_nostr, want_seed);
+        startDownload(io, ctx, allocator, mi, output_dir, port, proxy, want_nostr, want_seed);
     } else {
         // File path
-        const mi = readTorrent(allocator, source);
+        const mi = readTorrent(io, allocator, source);
         defer mi.deinit(allocator);
-        startDownload(allocator, mi, output_dir, port, proxy, want_nostr, want_seed);
+        startDownload(io, ctx, allocator, mi, output_dir, port, proxy, want_nostr, want_seed);
     }
 }
 
-fn startDownload(allocator: std.mem.Allocator, mi: carl.metainfo.Metainfo, output_dir: []const u8, port: u16, proxy: ?carl.proxy.Proxy, want_nostr: bool, want_seed: bool) void {
-    std.fs.cwd().makePath(output_dir) catch {};
-    var session = carl.session.Session.init(allocator, mi, output_dir, .download, port, proxy, .any, false, null, false) catch |err| {
+fn startDownload(
+    io: std.Io,
+    ctx: carl.nostr_config.Context,
+    allocator: std.mem.Allocator,
+    mi: carl.metainfo.Metainfo,
+    output_dir: []const u8,
+    port: u16,
+    proxy: ?carl.proxy.Proxy,
+    want_nostr: bool,
+    want_seed: bool,
+) void {
+    std.Io.Dir.cwd().createDirPath(io, output_dir) catch {};
+    var session = carl.session.Session.init(io, ctx, allocator, mi, output_dir, .download, port, proxy, .any, false, null, false) catch |err| {
         log.err("failed to initialize session: {}", .{err});
         std.process.exit(1);
     };
@@ -483,7 +556,7 @@ fn startDownload(allocator: std.mem.Allocator, mi: carl.metainfo.Metainfo, outpu
     if (want_nostr) {
         const info_hash = carl.metainfo.infoHash(mi.raw_info);
         session.setPeerDiscovery(&session, cliRediscoverPeersCb);
-        collectNostrPeers(allocator, info_hash, &session);
+        collectNostrPeers(ctx, allocator, info_hash, &session);
     }
     session.run() catch |err| {
         log.err("session failed: {}", .{err});
@@ -491,40 +564,44 @@ fn startDownload(allocator: std.mem.Allocator, mi: carl.metainfo.Metainfo, outpu
     };
 }
 
-fn fetchUrl(allocator: std.mem.Allocator, url: []const u8, proxy: ?carl.proxy.Proxy) ![]u8 {
+fn fetchUrl(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    proxy: ?carl.proxy.Proxy,
+) ![]u8 {
     // Route the initial .torrent fetch through the proxy too, so it doesn't
     // leak the real IP. HTTPS torrent URLs are not yet supported over a proxy.
     if (proxy) |px| {
-        return carl.proxy.httpGet(allocator, px, url, null) catch |err| {
+        return carl.proxy.httpGet(io, allocator, px, url, null) catch |err| {
             log.err("HTTP fetch via proxy error: {}", .{err});
             return error.HttpFailed;
         };
     }
 
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client: std.http.Client = .{
+        .allocator = allocator,
+        .io = io,
+    };
     defer client.deinit();
-    var response_body: std.ArrayList(u8) = .empty;
-    defer response_body.deinit(allocator);
-    var adapt_buf: [4096]u8 = undefined;
-    const deprecated_writer = response_body.writer(allocator);
-    var adapter = deprecated_writer.adaptToNewApi(&adapt_buf);
+
+    var response_body: std.Io.Writer.Allocating = .init(allocator);
+    defer response_body.deinit();
+
     const result = client.fetch(.{
         .location = .{ .url = url },
-        .response_writer = &adapter.new_interface,
+        .response_writer = &response_body.writer,
     }) catch |err| {
         log.err("HTTP fetch error: {}", .{err});
         return error.HttpFailed;
     };
 
-    // Flush any remaining buffered data from the adapter
-    const buffered = adapter.new_interface.buffered();
-    if (buffered.len > 0) {
-        response_body.appendSlice(allocator, buffered) catch return error.HttpFailed;
-    }
-
     if (result.status != .ok) return error.HttpFailed;
-    if (response_body.items.len == 0) return error.HttpFailed;
-    return response_body.toOwnedSlice(allocator);
+
+    const data = response_body.written();
+    if (data.len == 0) return error.HttpFailed;
+
+    return allocator.dupe(u8, data) catch error.HttpFailed;
 }
 
 const TorSeedOptions = struct {
@@ -535,6 +612,8 @@ const TorSeedOptions = struct {
 };
 
 fn cmdSeed(
+    ctx: carl.nostr_config.Context,
+    io: std.Io,
     allocator: std.mem.Allocator,
     torrent_path: []const u8,
     data_dir: []const u8,
@@ -570,7 +649,7 @@ fn cmdSeed(
         std.process.exit(1);
     }
 
-    const mi = readTorrent(allocator, torrent_path);
+    const mi = readTorrent(io, allocator, torrent_path);
     defer mi.deinit(allocator);
 
     var hidden: ?carl.tor_control.HiddenService = null;
@@ -589,11 +668,11 @@ fn cmdSeed(
         };
         var hex: [40]u8 = undefined;
         carl.secp.toHex(&carl.metainfo.infoHash(mi.raw_info), &hex);
-        const persisted = carl.i2p_seed.load(allocator, &hex) catch null;
+        const persisted = carl.i2p_seed.load(ctx, allocator, &hex) catch null;
         defer if (persisted) |p| allocator.free(p);
         var used_persisted = persisted != null;
         const dest: carl.i2p_sam.Session.Dest = if (persisted) |p| .{ .priv = p } else .transient;
-        i2p_session = carl.i2p_sam.Session.createWithDest(allocator, bridge, "carl-seed", dest) catch |err| blk: {
+        i2p_session = carl.i2p_sam.Session.createWithDest(io, allocator, bridge, "carl-seed", dest) catch |err| blk: {
             // Fall back only on a protocol-level rejection (SAM answered
             // RESULT != OK for our key). Network failures (ConnectFailed,
             // HandshakeFailed) say nothing about the key — retrying transient
@@ -608,16 +687,16 @@ fn cmdSeed(
             // new address beats no seed.
             log.warn("SAM rejected the persisted i2p destination ({}) — generating a fresh one", .{err});
             used_persisted = false;
-            const fresh = carl.i2p_sam.Session.createWithDest(allocator, bridge, "carl-seed", .transient) catch |err2| {
+            const fresh = carl.i2p_sam.Session.createWithDest(io, allocator, bridge, "carl-seed", .transient) catch |err2| {
                 log.err("i2p SAM session setup failed: {} (is the router running with SAM?)", .{err2});
                 std.process.exit(1);
             };
             // Only quarantine once the retry succeeded — the first failure
             // was the key, not SAM, so the persisted blob is proven bad.
-            carl.i2p_seed.remove(allocator, &hex);
+            carl.i2p_seed.remove(ctx, allocator, &hex);
             break :blk fresh;
         };
-        if (!used_persisted) carl.i2p_seed.save(allocator, &hex, i2p_session.?.destination);
+        if (!used_persisted) carl.i2p_seed.save(ctx, allocator, &hex, i2p_session.?.destination);
         const host = carl.i2p_sam.b32Address(allocator, i2p_session.?.destination) catch {
             log.err("could not derive the .b32.i2p address", .{});
             std.process.exit(1);
@@ -634,7 +713,8 @@ fn cmdSeed(
 
     if (want_nostr) {
         if (tor_seed) {
-            hidden = carl.tor_control.addOnion(allocator, .{
+            hidden = carl.tor_control.addOnion(io, allocator, .{
+                .home = ctx.home,
                 .control_addr = tor_opts.control_addr,
                 .cookie_path = tor_opts.cookie_path,
                 .local_port = port,
@@ -643,7 +723,7 @@ fn cmdSeed(
                 log.err("tor hidden service setup failed: {}", .{err});
                 std.process.exit(1);
             };
-            carl.seeding.publish(allocator, mi, carl.metainfo.infoHash(mi.raw_info), .{
+            carl.seeding.publish(ctx, allocator, mi, carl.metainfo.infoHash(mi.raw_info), .{
                 .onion = .{ .host = hidden.?.onion_host, .port = hidden.?.onion_port },
             }, description, nostr_proxy) catch |err| {
                 log.warn("nostr publish failed: {} (continuing seed)", .{err});
@@ -651,7 +731,7 @@ fn cmdSeed(
         } else if (i2p_seed) {
             // Port 0 = the destination's default I2CP port; the STREAM FORWARD
             // delivers every inbound stream for the session regardless.
-            carl.seeding.publish(allocator, mi, carl.metainfo.infoHash(mi.raw_info), .{
+            carl.seeding.publish(ctx, allocator, mi, carl.metainfo.infoHash(mi.raw_info), .{
                 .i2p = .{ .host = &i2p_host_buf, .port = 0 },
             }, description, null) catch |err| {
                 log.warn("nostr publish failed: {} (continuing seed)", .{err});
@@ -668,7 +748,7 @@ fn cmdSeed(
                 );
                 std.process.exit(1);
             }
-            carl.seeding.publish(allocator, mi, carl.metainfo.infoHash(mi.raw_info), .{
+            carl.seeding.publish(ctx, allocator, mi, carl.metainfo.infoHash(mi.raw_info), .{
                 .ipv4 = .{ .ip = ip, .port = port },
             }, description, null) catch |err| {
                 log.warn("nostr publish failed: {} (continuing seed)", .{err});
@@ -678,7 +758,20 @@ fn cmdSeed(
 
     const listen_bind: carl.session.ListenBind = if (hidden_seed) .loopback else .any;
     const i2p_ptr: ?*carl.i2p_sam.Session = if (i2p_session) |*s| s else null;
-    var session = carl.session.Session.init(allocator, mi, data_dir, .seed, port, null, listen_bind, tor_seed, i2p_ptr, i2p_seed) catch |err| {
+    var session = carl.session.Session.init(
+        ctx.io,
+        ctx,
+        allocator,
+        mi,
+        data_dir,
+        .seed,
+        port,
+        null,
+        listen_bind,
+        tor_seed,
+        i2p_ptr,
+        i2p_seed,
+    ) catch |err| {
         log.err("failed to initialize session: {}", .{err});
         std.process.exit(1);
     };
@@ -715,10 +808,11 @@ fn parseTorSocksProxy(url: []const u8) carl.proxy.Proxy {
 // -------------------------------------------------------------------------
 
 fn cmdCreate(
+    io: std.Io,
     allocator: std.mem.Allocator,
     stdout: anytype,
     path: []const u8,
-    extra: []const [:0]u8,
+    extra: []const [:0]const u8,
 ) !void {
     // Collect repeated -t / --tracker flags (parseFlag only returns the first).
     var trackers: std.ArrayList([]const u8) = .empty;
@@ -734,12 +828,12 @@ fn cmdCreate(
     const comment = parseFlag(extra, "--comment");
     const piece_length: u32 = parseUnsignedFlag(extra, "--piece-length", carl.metainfo.default_piece_length);
 
-    const res = carl.metainfo.buildTorrent(allocator, path, .{
+    const res = carl.metainfo.buildTorrent(io, allocator, path, .{
         .piece_length = piece_length,
         .trackers = trackers.items,
         .comment = comment,
         .created_by = "carl",
-        .creation_date = std.time.timestamp(),
+        .creation_date = std.Io.Clock.real.now(io).toSeconds(),
     }) catch |err| {
         log.err("could not create torrent from '{s}': {}", .{ path, err });
         std.process.exit(1);
@@ -753,12 +847,18 @@ fn cmdCreate(
     const out_path = parseFlag(extra, "-o") orelse parseFlag(extra, "--output") orelse default_out;
 
     {
-        var f = std.fs.cwd().createFile(out_path, .{ .truncate = true }) catch |err| {
+        const f = std.Io.Dir.cwd().createFile(
+            io,
+            out_path,
+            .{ .truncate = true },
+        ) catch |err| {
             log.err("could not write '{s}': {}", .{ out_path, err });
             std.process.exit(1);
         };
-        defer f.close();
-        f.writeAll(res.data) catch |err| {
+
+        defer f.close(io);
+
+        f.writeStreamingAll(io, res.data) catch |err| {
             log.err("could not write '{s}': {}", .{ out_path, err });
             std.process.exit(1);
         };
@@ -784,6 +884,7 @@ fn cmdCreate(
 // -------------------------------------------------------------------------
 
 fn cmdSearch(
+    ctx: carl.nostr_config.Context,
     allocator: std.mem.Allocator,
     stdout: anytype,
     query: []const u8,
@@ -798,7 +899,7 @@ fn cmdSearch(
         arr[0] = r;
         relay_urls = arr;
     } else {
-        relay_urls = carl.nostr_config.readRelays(allocator) catch |err| {
+        relay_urls = carl.nostr_config.readRelays(ctx, allocator) catch |err| {
             log.err("could not read relay config: {}", .{err});
             std.process.exit(1);
         };
@@ -836,11 +937,21 @@ fn cmdSearch(
     var found_any = false;
     // One-shot user search: honor the skip list unless it would silence every
     // relay (same gate as the daemon-side one-shots).
-    const gate = carl.relay.oneShotGate(relay_urls, proxy);
+    const gate = carl.relay.oneShotGate(
+        ctx.io,
+        relay_urls,
+        proxy,
+    );
     relay_loop: for (relay_urls) |url| {
         if (printed >= limit) break;
 
-        var r = carl.relay.dial(allocator, url, proxy, gate) catch |err| {
+        var r = carl.relay.dial(
+            ctx.io,
+            allocator,
+            url,
+            proxy,
+            gate,
+        ) catch |err| {
             log.warn("relay {s}: {}", .{ url, err });
             continue;
         };
@@ -933,7 +1044,12 @@ fn printSearchResult(stdout: anytype, entry: carl.nip35.TorrentEntry) !void {
 // `carl follow` — mirror everything a Nostr pubkey publishes
 // -------------------------------------------------------------------------
 
-fn cmdFollow(allocator: std.mem.Allocator, pubkey_arg: []const u8, extra: []const [:0]u8) !void {
+fn cmdFollow(
+    ctx: carl.nostr_config.Context,
+    allocator: std.mem.Allocator,
+    pubkey_arg: []const u8,
+    extra: []const [:0]const u8,
+) !void {
     const pubkey = carl.follow.parsePubkeyArg(pubkey_arg) catch {
         log.err("invalid pubkey '{s}' (expected npub1... or 64-char hex)", .{pubkey_arg});
         std.process.exit(1);
@@ -968,13 +1084,13 @@ fn cmdFollow(allocator: std.mem.Allocator, pubkey_arg: []const u8, extra: []cons
     const dir = parseFlag(extra, "--dir") orelse blk: {
         var pk_hex: [64]u8 = undefined;
         carl.secp.toHex(&pubkey, &pk_hex);
-        const base = try carl.workdir.ensure(allocator);
+        const base = try carl.workdir.ensure(ctx, allocator, null);
         defer allocator.free(base);
         dir_owned = try std.fmt.allocPrint(allocator, "{s}/follow-{s}", .{ base, pk_hex[0..12] });
         break :blk @as([]const u8, dir_owned.?);
     };
 
-    try carl.follow.run(allocator, .{
+    try carl.follow.run(ctx, allocator, .{
         .pubkey = pubkey,
         .route = route,
         .dir = dir,
@@ -988,7 +1104,7 @@ fn cmdFollow(allocator: std.mem.Allocator, pubkey_arg: []const u8, extra: []cons
 // `carl drive` — shared folders over Nostr (kind-30035 drive index)
 // -------------------------------------------------------------------------
 
-fn parseDriveRoute(extra: []const [:0]u8) carl.api.Route {
+fn parseDriveRoute(extra: []const [:0]const u8) carl.api.Route {
     const route_str = parseFlag(extra, "--route") orelse "direct";
     const route = carl.api.Route.parse(route_str) orelse {
         log.err("invalid --route '{s}' (expected direct|i2p)", .{route_str});
@@ -1001,7 +1117,11 @@ fn parseDriveRoute(extra: []const [:0]u8) carl.api.Route {
     return route;
 }
 
-fn cmdDrive(allocator: std.mem.Allocator, rest: []const [:0]u8) !void {
+fn cmdDrive(
+    ctx: carl.nostr_config.Context,
+    allocator: std.mem.Allocator,
+    rest: []const [:0]const u8,
+) !void {
     if (rest.len < 1) {
         log.err("usage: carl drive <create|subscribe> ...", .{});
         std.process.exit(1);
@@ -1032,12 +1152,16 @@ fn cmdDrive(allocator: std.mem.Allocator, rest: []const [:0]u8) !void {
             }
         }
         // The publisher watches a real folder; a typo must fail loudly.
-        var d = std.fs.cwd().openDir(dir, .{}) catch {
+        var d = std.Io.Dir.cwd().openDir(
+            ctx.io,
+            dir,
+            .{},
+        ) catch {
             log.err("cannot open drive dir '{s}'", .{dir});
             std.process.exit(1);
         };
-        d.close();
-        carl.drive.run(allocator, .{
+        d.close(ctx.io);
+        carl.drive.run(ctx, allocator, .{
             .role = .publisher,
             .dir = dir,
             .drive = name,
@@ -1088,13 +1212,13 @@ fn cmdDrive(allocator: std.mem.Allocator, rest: []const [:0]u8) !void {
         const dir = parseFlag(extra, "--dir") orelse blk: {
             var pk_hex: [64]u8 = undefined;
             carl.secp.toHex(&author, &pk_hex);
-            const base = try carl.workdir.ensure(allocator);
+            const base = try carl.workdir.ensure(ctx, allocator, null);
             defer allocator.free(base);
             dir_owned = try std.fmt.allocPrint(allocator, "{s}/drive-{s}-{s}", .{ base, pk_hex[0..12], name });
             break :blk @as([]const u8, dir_owned.?);
         };
 
-        carl.drive.run(allocator, .{
+        carl.drive.run(ctx, allocator, .{
             .role = .subscriber,
             .dir = dir,
             .drive = name,
@@ -1116,7 +1240,11 @@ fn cmdDrive(allocator: std.mem.Allocator, rest: []const [:0]u8) !void {
 // `carl nostr-keygen`
 // -------------------------------------------------------------------------
 
-fn cmdNostrKeygen(allocator: std.mem.Allocator, stdout: anytype) !void {
+fn cmdNostrKeygen(
+    ctx: carl.nostr_config.Context,
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+) !void {
     const sk = carl.secp.generateSecretKey() catch {
         log.err("failed to generate secret key", .{});
         std.process.exit(1);
@@ -1126,7 +1254,7 @@ fn cmdNostrKeygen(allocator: std.mem.Allocator, stdout: anytype) !void {
         std.process.exit(1);
     };
 
-    const nsec = carl.nostr_config.writeSecretKey(allocator, sk) catch |err| {
+    const nsec = carl.nostr_config.writeSecretKey(ctx, allocator, sk) catch |err| {
         log.err("failed to save key: {}", .{err});
         std.process.exit(1);
     };
@@ -1144,8 +1272,12 @@ fn cmdNostrKeygen(allocator: std.mem.Allocator, stdout: anytype) !void {
 // `carl whoami` — print the configured identity's npub
 // -------------------------------------------------------------------------
 
-fn cmdWhoami(allocator: std.mem.Allocator, stdout: anytype) !void {
-    const sk = carl.nostr_config.readSecretKey(allocator) catch {
+fn cmdWhoami(
+    ctx: carl.nostr_config.Context,
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+) !void {
+    const sk = carl.nostr_config.readSecretKey(ctx, allocator) catch {
         log.err("no nostr identity configured; run `carl nostr-keygen` first", .{});
         std.process.exit(1);
     };
@@ -1167,7 +1299,9 @@ fn cmdWhoami(allocator: std.mem.Allocator, stdout: anytype) !void {
 /// SIGINT handler for the daemon. Reuses the session shutdown flag so any
 /// running transfer threads stop too; the blocking accept() returns EINTR and
 /// the serve loop then exits.
-fn daemonSigintHandler(_: i32) callconv(.c) void {
+fn daemonSigintHandler(
+    _: @TypeOf(std.posix.SIG.INT),
+) callconv(.c) void {
     carl.session.shutdown_requested.store(true, .release);
 }
 
@@ -1175,10 +1309,16 @@ fn daemonSigintHandler(_: i32) callconv(.c) void {
 /// SIGKILL/crash that bypasses the shell's own cleanup — request shutdown so we
 /// never linger as an orphan holding the port. `kill(pid, 0)` probes existence:
 /// ProcessNotFound means the parent is gone; PermissionDenied means it's alive.
-fn parentWatchdog(parent_pid: std.posix.pid_t) void {
+fn parentWatchdog(
+    io: std.Io,
+    parent_pid: std.posix.pid_t,
+) void {
     while (!carl.session.shutdown_requested.load(.acquire)) {
-        std.Thread.sleep(std.time.ns_per_s);
-        std.posix.kill(parent_pid, 0) catch |err| switch (err) {
+        io.sleep(.fromSeconds(1), .awake) catch return;
+        std.posix.kill(
+            parent_pid,
+            @as(std.posix.SIG, @enumFromInt(0)),
+        ) catch |err| switch (err) {
             error.ProcessNotFound => {
                 carl.session.shutdown_requested.store(true, .release);
                 return;
@@ -1194,7 +1334,13 @@ fn restoreInBackground(mgr: *carl.manager.Manager) void {
     mgr.restoreTransfers();
 }
 
-fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u8) !void {
+fn cmdDaemon(
+    io: std.Io,
+    ctx: carl.nostr_config.Context,
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    extra: []const [:0]const u8,
+) !void {
     const port = parsePortFlag(extra, "--port", 8088);
     const bt_port = parsePortFlag(extra, "--bt-port", 6881);
     const route_flag = parseFlag(extra, "--route");
@@ -1215,12 +1361,16 @@ fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u
     var download_dir_owned: ?[]u8 = null;
     defer if (download_dir_owned) |d| allocator.free(d);
     const download_dir = download_dir_flag orelse blk: {
-        if (try carl.workdir.envOverride(allocator)) |d| {
+        if (try carl.workdir.envOverride(allocator, null)) |d| {
             download_dir_owned = d;
             download_dir_pinned = true;
             break :blk @as([]const u8, d);
         }
-        download_dir_owned = try carl.workdir.resolve(allocator);
+        download_dir_owned = try carl.workdir.resolve(
+            ctx,
+            allocator,
+            null,
+        );
         break :blk @as([]const u8, download_dir_owned.?);
     };
     // Tor ControlPort config for reachable `.tor` seeds (hidden services). The
@@ -1235,7 +1385,7 @@ fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u
     var token_buf: [32]u8 = undefined;
     const token: []const u8 = if (parseFlag(extra, "--token")) |t| t else blk: {
         var raw: [16]u8 = undefined;
-        std.crypto.random.bytes(&raw);
+        io.random(&raw);
         const hex = "0123456789abcdef";
         for (raw, 0..) |b, i| {
             token_buf[i * 2] = hex[b >> 4];
@@ -1244,7 +1394,7 @@ fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u
         break :blk token_buf[0..];
     };
 
-    var mgr = carl.manager.Manager.init(allocator, .{
+    var mgr = carl.manager.Manager.init(io, ctx, allocator, .{
         .route = route,
         .route_explicit = route_flag != null,
         .socks = socks,
@@ -1274,7 +1424,7 @@ fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u
     // hard-killed app doesn't leave the daemon orphaned on the port.
     if (parseFlag(extra, "--parent-pid")) |pid_str| {
         if (std.fmt.parseInt(std.posix.pid_t, pid_str, 10)) |pid| {
-            if (std.Thread.spawn(.{}, parentWatchdog, .{pid})) |t| {
+            if (std.Thread.spawn(.{}, parentWatchdog, .{ io, pid })) |t| {
                 t.detach();
             } else |e| log.warn("parent watchdog failed to start: {}", .{e});
         } else |_| log.warn("invalid --parent-pid '{s}', ignoring", .{pid_str});
@@ -1315,7 +1465,7 @@ fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u
         var rbuf: [512]u8 = undefined;
         const safe_socks = carl.proxy.redactUrl(socks, &rbuf);
         if (carl.proxy.parseUrl(socks)) |px| {
-            const probe = carl.proxy.classifySocks5(allocator, px, 5);
+            const probe = carl.proxy.classifySocks5(io, allocator, px, 5);
             switch (probe.state) {
                 .ok => log.info("SOCKS proxy {s} reachable", .{safe_socks}),
                 .not_running => log.warn("SOCKS proxy {s} unreachable (connection refused) -- is Tor/your proxy running?", .{safe_socks}),
@@ -1337,7 +1487,7 @@ fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u
     // allocator before `daemon.deinit()`, `mgr.deinit()`, and the GPA teardown
     // run. (A full join of background threads is a follow-up; see
     // docs/daemon-api.md.)
-    std.Thread.sleep(400 * std.time.ns_per_ms);
+    io.sleep(.fromMilliseconds(400), .awake) catch {};
     daemon.deinit();
 }
 
@@ -1349,6 +1499,7 @@ fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u
 /// returning its parsed entry (title, trackers, files). Caller owns the result
 /// and must `deinit` it. Returns null if no matching event is found.
 fn fetchNip35Entry(
+    ctx: carl.nostr_config.Context,
     allocator: std.mem.Allocator,
     info_hash: [20]u8,
     proxy: ?carl.proxy.Proxy,
@@ -1364,16 +1515,26 @@ fn fetchNip35Entry(
         .limit = 20,
     };
 
-    const relay_urls = carl.nostr_config.readRelays(allocator) catch return null;
+    const relay_urls = carl.nostr_config.readRelays(ctx, allocator) catch return null;
     defer carl.nostr_config.freeRelays(allocator, relay_urls);
 
     var best: ?carl.nip35.TorrentEntry = null;
     var best_created: i64 = std.math.minInt(i64);
 
     // One-shot metadata enrichment during a download: oneShotGate.
-    const gate = carl.relay.oneShotGate(relay_urls, proxy);
+    const gate = carl.relay.oneShotGate(
+        ctx.io,
+        relay_urls,
+        proxy,
+    );
     for (relay_urls) |url| {
-        var r = carl.relay.dial(allocator, url, proxy, gate) catch continue;
+        var r = carl.relay.dial(
+            ctx.io,
+            allocator,
+            url,
+            proxy,
+            gate,
+        ) catch continue;
         defer r.deinit();
         const events = carl.relay.subscribeAndCollect(allocator, &r, filter, .{
             .timeout_ms = 10_000,
@@ -1405,12 +1566,24 @@ fn fetchNip35Entry(
 /// `Session.PeerDiscovery` callback: re-run Nostr discovery when the download
 /// has zero peers. The session carries everything we need (allocator +
 /// info_hash), so the loop can keep retrying without extra state.
+const CliPeerDiscoveryCtx = struct {
+    session: *carl.session.Session,
+    nostr_ctx: carl.nostr_config.Context,
+};
 fn cliRediscoverPeersCb(ctx: *anyopaque) void {
-    const session: *carl.session.Session = @ptrCast(@alignCast(ctx));
-    collectNostrPeers(session.allocator, session.info_hash, session);
+    const discovery_ctx: *CliPeerDiscoveryCtx =
+        @ptrCast(@alignCast(ctx));
+
+    collectNostrPeers(
+        discovery_ctx.nostr_ctx,
+        discovery_ctx.session.allocator,
+        discovery_ctx.session.info_hash,
+        discovery_ctx.session,
+    );
 }
 
 fn collectNostrPeers(
+    nostr_ctx: carl.nostr_config.Context,
     allocator: std.mem.Allocator,
     info_hash: [20]u8,
     session: *carl.session.Session,
@@ -1418,7 +1591,10 @@ fn collectNostrPeers(
     var ih_hex: [40]u8 = undefined;
     carl.secp.toHex(&info_hash, &ih_hex);
 
-    const relay_urls = carl.nostr_config.readRelays(allocator) catch return;
+    const relay_urls = carl.nostr_config.readRelays(
+        nostr_ctx,
+        allocator,
+    ) catch return;
     defer carl.nostr_config.freeRelays(allocator, relay_urls);
 
     var values_arr = [_][]const u8{&ih_hex};
@@ -1436,8 +1612,14 @@ fn collectNostrPeers(
         // without waiting out every relay's timeout.
         if (!session.running) return;
         // Periodic re-discovery: honor the health gate so a down or unusable
-        // relay isn't re-dialed on every round (review on PR #88).
-        var r = carl.relay.dial(allocator, url, session.proxy, .honor) catch |err| {
+        // relay isn't re-dialed on every round.
+        var r = carl.relay.dial(
+            session.io,
+            allocator,
+            url,
+            session.proxy,
+            .honor,
+        ) catch |err| {
             log.debug("nostr peer-discover: {s}: {}", .{ url, err });
             continue;
         };
@@ -1457,7 +1639,12 @@ fn collectNostrPeers(
             if (added >= 50) break;
             switch (ann.endpoint) {
                 .ipv4 => |ep| {
-                    const addr = std.net.Address.initIp4(ep.ip, ep.port);
+                    const addr: std.Io.net.IpAddress = .{
+                        .ip4 = .{
+                            .bytes = ep.ip,
+                            .port = ep.port,
+                        },
+                    };
                     session.connectDirectPeer(addr) catch continue;
                     added += 1;
                 },
@@ -1506,7 +1693,7 @@ fn parseIpv4(s: []const u8) ?[4]u8 {
     return result;
 }
 
-fn parseFlag(extra_args: []const [:0]u8, flag: []const u8) ?[]const u8 {
+fn parseFlag(extra_args: []const [:0]const u8, flag: []const u8) ?[]const u8 {
     var i: usize = 0;
     while (i + 1 < extra_args.len) : (i += 1) {
         if (std.mem.eql(u8, extra_args[i], flag)) {
@@ -1516,12 +1703,12 @@ fn parseFlag(extra_args: []const [:0]u8, flag: []const u8) ?[]const u8 {
     return null;
 }
 
-fn parsePort(extra_args: []const [:0]u8) u16 {
+fn parsePort(extra_args: []const [:0]const u8) u16 {
     const port_str = parseFlag(extra_args, "--port") orelse return 6881;
     return std.fmt.parseUnsigned(u16, port_str, 10) catch 6881;
 }
 
-fn parsePortFlag(extra_args: []const [:0]u8, flag: []const u8, default: u16) u16 {
+fn parsePortFlag(extra_args: []const [:0]const u8, flag: []const u8, default: u16) u16 {
     const port_str = parseFlag(extra_args, flag) orelse return default;
     return std.fmt.parseUnsigned(u16, port_str, 10) catch default;
 }
@@ -1529,7 +1716,7 @@ fn parsePortFlag(extra_args: []const [:0]u8, flag: []const u8, default: u16) u16
 /// Parse `--proxy <url>`. Exits with an error if the URL is malformed or the
 /// flag is given without a value, so a typo never silently falls back to a
 /// direct (de-anonymized) connection.
-fn parseProxy(extra_args: []const [:0]u8) ?carl.proxy.Proxy {
+fn parseProxy(extra_args: []const [:0]const u8) ?carl.proxy.Proxy {
     const url = parseFlag(extra_args, "--proxy") orelse {
         // `--proxy` as the last argument has no value, so parseFlag returns
         // null. Fail closed rather than running unproxied (which would leak
@@ -1548,12 +1735,12 @@ fn parseProxy(extra_args: []const [:0]u8) ?carl.proxy.Proxy {
     };
 }
 
-fn parseFlagPresent(extra_args: []const [:0]u8, flag: []const u8) bool {
+fn parseFlagPresent(extra_args: []const [:0]const u8, flag: []const u8) bool {
     for (extra_args) |a| if (std.mem.eql(u8, a, flag)) return true;
     return false;
 }
 
-fn parseUnsignedFlag(extra_args: []const [:0]u8, flag: []const u8, default: u32) u32 {
+fn parseUnsignedFlag(extra_args: []const [:0]const u8, flag: []const u8, default: u32) u32 {
     const s = parseFlag(extra_args, flag) orelse return default;
     return std.fmt.parseUnsigned(u32, s, 10) catch default;
 }

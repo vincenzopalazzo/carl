@@ -7,6 +7,10 @@ const extension = @import("extension.zig");
 const proxy_mod = @import("proxy.zig");
 const i2p_sam = @import("i2p_sam.zig");
 
+const Net = std.Io.net;
+const IpAddress = Net.IpAddress;
+const Stream = Net.Stream;
+
 pub const PeerState = enum {
     connecting,
     socks_connecting,
@@ -38,8 +42,9 @@ pub const PendingRequest = struct {
 /// Per-peer connection state.
 pub const PeerConnection = struct {
     allocator: Allocator,
-    address: std.net.Address,
-    stream: ?std.net.Stream,
+    io: std.Io,
+    address: IpAddress,
+    stream: ?Stream,
     state: PeerState,
 
     /// Outbound proxy to tunnel this connection through. When null, connect
@@ -108,7 +113,11 @@ pub const PeerConnection = struct {
     /// timeout, so a dead host can't squat a poll slot forever.
     connect_started_at: i64 = 0,
 
-    pub fn init(allocator: Allocator, address: std.net.Address) PeerConnection {
+    pub fn init(
+        io: std.Io,
+        allocator: Allocator,
+        address: IpAddress,
+    ) PeerConnection {
         return .{
             .allocator = allocator,
             .address = address,
@@ -131,17 +140,26 @@ pub const PeerConnection = struct {
             .pending_requests = .empty,
             .bytes_downloaded = 0,
             .bytes_uploaded = 0,
-            .last_recv_time = std.time.timestamp(),
-            .last_send_time = std.time.timestamp(),
+            .last_recv_time = std.Io.Clock.real.now(io).toSeconds(),
+            .last_send_time = std.Io.Clock.real.now(io).toSeconds(),
+            .io = io,
         };
     }
 
     /// Outbound connection to a Tor hidden service or other proxied hostname.
-    pub fn initOnion(allocator: Allocator, host: []const u8, port: u16) !PeerConnection {
+    pub fn initOnion(
+        io: std.Io,
+        allocator: Allocator,
+        host: []const u8,
+        port: u16,
+    ) !PeerConnection {
         const host_owned = try allocator.dupe(u8, host);
         return .{
             .allocator = allocator,
-            .address = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, port),
+            .address = .{ .ip4 = .{
+                .bytes = .{ 0, 0, 0, 0 },
+                .port = port,
+            } },
             .stream = null,
             .state = .connecting,
             .proxy = null,
@@ -161,8 +179,9 @@ pub const PeerConnection = struct {
             .pending_requests = .empty,
             .bytes_downloaded = 0,
             .bytes_uploaded = 0,
-            .last_recv_time = std.time.timestamp(),
-            .last_send_time = std.time.timestamp(),
+            .last_recv_time = std.Io.Clock.real.now(io).toSeconds(),
+            .last_send_time = std.Io.Clock.real.now(io).toSeconds(),
+            .io = io,
         };
     }
 
@@ -170,14 +189,20 @@ pub const PeerConnection = struct {
     /// (owned by the caller). The session must outlive this connection. `port`
     /// is the peer's advertised I2CP destination port (0 = default), stored in
     /// `address` and passed to SAM as `TO_PORT` at connect time.
-    pub fn initI2p(allocator: Allocator, host: []const u8, port: u16, sam: *i2p_sam.Session) !PeerConnection {
-        var p = try PeerConnection.initOnion(allocator, host, port);
+    pub fn initI2p(
+        io: std.Io,
+        allocator: Allocator,
+        host: []const u8,
+        port: u16,
+        sam: *i2p_sam.Session,
+    ) !PeerConnection {
+        var p = try PeerConnection.initOnion(io, allocator, host, port);
         p.i2p = sam;
         return p;
     }
 
     pub fn deinit(self: *PeerConnection) void {
-        if (self.stream) |s| s.close();
+        if (self.stream) |s| s.close(self.io);
         if (self.connect_host) |h| self.allocator.free(h);
         if (self.client_name) |n| self.allocator.free(n);
         if (self.peer_bitfield) |*bf| bf.deinit(self.allocator);
@@ -213,10 +238,11 @@ pub const PeerConnection = struct {
     /// and latency-sensitive; letting the kernel coalesce them behind delayed
     /// ACKs stalls the request pipeline. Also applied to proxy/SAM bridge
     /// sockets — those are local TCP connections where Nagle only adds delay.
-    pub fn setNoDelay(stream: std.net.Stream) void {
+    pub fn setNoDelay(stream: Stream) void {
         const one: c_int = 1;
+
         std.posix.setsockopt(
-            stream.handle,
+            stream.socket.handle,
             std.posix.IPPROTO.TCP,
             std.posix.TCP.NODELAY,
             std.mem.asBytes(&one),
@@ -232,6 +258,17 @@ pub const PeerConnection = struct {
         std.posix.setsockopt(sock_fd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&sz)) catch {};
     }
 
+    fn ip4ToPosix(address: IpAddress) !std.posix.sockaddr.in {
+        const ip4 = switch (address) {
+            .ip4 => |addr| addr,
+            .ip6 => return error.UnsupportedAddress,
+        };
+
+        return .{
+            .port = std.mem.nativeToBig(u16, ip4.port),
+            .addr = @bitCast(ip4.bytes),
+        };
+    }
     /// Initiate TCP connection with a timeout.
     pub fn connect(self: *PeerConnection) !void {
         // Native I2P: open a SAM stream to the destination. Synchronous, so on
@@ -255,12 +292,12 @@ pub const PeerConnection = struct {
         if (self.proxy) |px| {
             if (self.connect_host) |host| {
                 const port = self.address.getPort();
-                self.stream = proxy_mod.connectThroughProxyHost(self.allocator, px, host, port) catch {
+                self.stream = proxy_mod.connectThroughProxyHost(self.io, self.allocator, px, host, port) catch {
                     self.state = .disconnected;
                     return error.ConnectionFailed;
                 };
             } else {
-                self.stream = proxy_mod.connectThroughProxyAddr(self.allocator, px, self.address) catch {
+                self.stream = proxy_mod.connectThroughProxyAddr(self.io, self.allocator, px, self.address) catch {
                     self.state = .disconnected;
                     return error.ConnectionFailed;
                 };
@@ -270,55 +307,89 @@ pub const PeerConnection = struct {
             return;
         }
 
-        // Create socket
-        const sock = std.posix.socket(
+        // Connect with a hard timeout. Zig 0.16's threaded network backend does
+        // not yet implement connect timeouts, so use a non-blocking connect + poll.
+        const sock = std.c.socket(
             std.posix.AF.INET,
-            std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
+            std.posix.SOCK.STREAM,
             std.posix.IPPROTO.TCP,
-        ) catch {
+        );
+
+        if (sock < 0) {
             self.state = .disconnected;
             return error.ConnectionFailed;
-        };
-        errdefer std.posix.close(sock);
+        }
+        _ = std.c.fcntl(
+            sock,
+            std.c.F.SETFD,
+            @as(c_int, std.posix.FD_CLOEXEC),
+        );
+        errdefer _ = std.c.close(sock);
+
         setSocketBuffers(sock);
 
-        // Connect with a hard timeout. SO_SNDTIMEO does NOT bound connect() on
-        // macOS, so a dead or filtered peer (e.g. a stale nostr peer-announce)
-        // could block the whole session in connect() for the OS default ~75 s.
-        // Use a non-blocking connect + poll(POLLOUT) so connect_timeout_secs is
-        // a real upper bound on every platform, then restore blocking mode for
-        // the session's normal poll-driven I/O.
-        const flags = std.posix.fcntl(sock, std.posix.F.GETFL, 0) catch {
+        const flags = std.c.fcntl(
+            sock,
+            std.c.F.GETFL,
+            @as(c_int, 0),
+        );
+
+        if (flags < 0) {
             self.state = .disconnected;
             return error.ConnectionFailed;
-        };
-        var o: std.posix.O = @bitCast(@as(u32, @truncate(flags)));
-        o.NONBLOCK = true;
-        _ = std.posix.fcntl(sock, std.posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
+        }
 
-        std.posix.connect(sock, &self.address.any, @sizeOf(std.posix.sockaddr.in)) catch |err| switch (err) {
-            // EINPROGRESS: the connect is underway; wait for the socket to
-            // become writable (success) or error out, bounded by our timeout.
-            error.WouldBlock => {
+        var o: std.c.O = @bitCast(@as(u32, @intCast(flags)));
+        o.NONBLOCK = true;
+
+        _ = std.c.fcntl(
+            sock,
+            std.c.F.SETFL,
+            @as(c_int, @bitCast(o)),
+        );
+
+        const posix_addr = try ip4ToPosix(self.address);
+
+        const rc = std.c.connect(
+            sock,
+            @ptrCast(&posix_addr),
+            @sizeOf(std.posix.sockaddr.in),
+        );
+
+        if (rc != 0) switch (std.posix.errno(rc)) {
+            .AGAIN, .INPROGRESS => {
                 var pfd = [_]std.posix.pollfd{.{
                     .fd = sock,
                     .events = std.posix.POLL.OUT,
                     .revents = 0,
                 }};
-                const ready = std.posix.poll(&pfd, connect_timeout_secs * 1000) catch {
+
+                const ready = std.posix.poll(
+                    &pfd,
+                    @intCast(connect_timeout_secs * 1000),
+                ) catch {
                     self.state = .disconnected;
                     return error.ConnectionFailed;
                 };
+
                 if (ready == 0) {
                     self.state = .disconnected;
                     return error.ConnectionTimedOut;
                 }
-                // Connect finished -- surface any asynchronous error (refused,
-                // unreachable, …) via SO_ERROR rather than treating it as ok.
-                std.posix.getsockoptError(sock) catch {
+
+                var socket_error: c_int = 0;
+                var socket_error_len: std.c.socklen_t = @sizeOf(c_int);
+
+                if (std.c.getsockopt(
+                    sock,
+                    std.c.SOL.SOCKET,
+                    std.c.SO.ERROR,
+                    &socket_error,
+                    &socket_error_len,
+                ) != 0 or socket_error != 0) {
                     self.state = .disconnected;
                     return error.ConnectionFailed;
-                };
+                }
             },
             else => {
                 self.state = .disconnected;
@@ -326,13 +397,24 @@ pub const PeerConnection = struct {
             },
         };
 
-        // Back to blocking: the session multiplexes peers with poll() and then
-        // does blocking reads/writes on ready sockets.
+        // Connected. Restore blocking mode.
         o.NONBLOCK = false;
-        _ = std.posix.fcntl(sock, std.posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
 
-        self.stream = .{ .handle = sock };
-        setNoDelay(self.stream.?);
+        _ = std.c.fcntl(
+            sock,
+            std.c.F.SETFL,
+            @as(c_int, @bitCast(o)),
+        );
+
+        const stream: Stream = .{
+            .socket = .{
+                .handle = sock,
+                .address = self.address,
+            },
+        };
+
+        self.stream = stream;
+        setNoDelay(stream);
         self.state = .handshaking;
     }
 
@@ -370,31 +452,64 @@ pub const PeerConnection = struct {
         }
 
         // Clearnet: non-blocking connect, return on EINPROGRESS.
-        const sock = std.posix.socket(
+        const sock = std.c.socket(
             std.posix.AF.INET,
-            std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
+            std.posix.SOCK.STREAM,
             std.posix.IPPROTO.TCP,
-        ) catch {
+        );
+
+        if (sock < 0) {
             self.state = .disconnected;
             return error.ConnectionFailed;
-        };
-        errdefer std.posix.close(sock);
+        }
+        _ = std.c.fcntl(
+            sock,
+            std.c.F.SETFD,
+            @as(c_int, std.posix.FD_CLOEXEC),
+        );
+
+        errdefer _ = std.c.close(sock);
         setSocketBuffers(sock);
 
-        const flags = std.posix.fcntl(sock, std.posix.F.GETFL, 0) catch {
+        const flags = std.c.fcntl(
+            sock,
+            std.c.F.GETFL,
+            @as(c_int, 0),
+        );
+
+        if (flags < 0) {
             self.state = .disconnected;
             return error.ConnectionFailed;
-        };
-        var o: std.posix.O = @bitCast(@as(u32, @truncate(flags)));
-        o.NONBLOCK = true;
-        _ = std.posix.fcntl(sock, std.posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
+        }
 
-        std.posix.connect(sock, &self.address.any, @sizeOf(std.posix.sockaddr.in)) catch |err| switch (err) {
-            // EINPROGRESS: connect underway — the session poll loop completes it.
-            error.WouldBlock => {
-                self.stream = .{ .handle = sock };
+        var o: std.c.O = @bitCast(@as(u32, @intCast(flags)));
+        o.NONBLOCK = true;
+
+        _ = std.c.fcntl(
+            sock,
+            std.c.F.SETFL,
+            @as(c_int, @bitCast(o)),
+        );
+
+        const posix_addr = try ip4ToPosix(self.address);
+
+        const rc = std.c.connect(
+            sock,
+            @ptrCast(&posix_addr),
+            @sizeOf(std.posix.sockaddr.in),
+        );
+
+        if (rc != 0) switch (std.posix.errno(rc)) {
+            .AGAIN, .INPROGRESS => {
+                self.stream = .{
+                    .socket = .{
+                        .handle = sock,
+                        .address = self.address,
+                    },
+                };
                 self.state = .connecting;
-                self.connect_started_at = std.time.timestamp();
+                self.connect_started_at =
+                    std.Io.Clock.real.now(self.io).toSeconds();
                 return;
             },
             else => {
@@ -405,8 +520,15 @@ pub const PeerConnection = struct {
 
         // Immediate success (loopback / same host): finish without blocking.
         o.NONBLOCK = false;
-        _ = std.posix.fcntl(sock, std.posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
-        self.stream = .{ .handle = sock };
+        _ = std.c.fcntl(
+            sock,
+            std.c.F.SETFL,
+            @as(c_int, @bitCast(o)),
+        );
+        self.stream = .{ .socket = .{
+            .handle = sock,
+            .address = self.address,
+        } };
         setNoDelay(self.stream.?);
         self.state = .handshaking;
         try self.sendHandshake(info_hash, peer_id);
@@ -417,17 +539,39 @@ pub const PeerConnection = struct {
     /// restores blocking mode and queues the BitTorrent handshake.
     pub fn finishConnect(self: *PeerConnection, info_hash: [20]u8, peer_id: [20]u8) !void {
         const s = self.stream orelse return error.ConnectionFailed;
-        std.posix.getsockoptError(s.handle) catch {
+        var socket_error: c_int = 0;
+        var socket_error_len: std.c.socklen_t = @sizeOf(c_int);
+
+        if (std.c.getsockopt(
+            s.socket.handle,
+            std.c.SOL.SOCKET,
+            std.c.SO.ERROR,
+            &socket_error,
+            &socket_error_len,
+        ) != 0 or socket_error != 0) {
             self.state = .disconnected;
             return error.ConnectionFailed;
-        };
-        const flags = std.posix.fcntl(s.handle, std.posix.F.GETFL, 0) catch {
+        }
+
+        const flags = std.c.fcntl(
+            s.socket.handle,
+            std.c.F.GETFL,
+            @as(c_int, 0),
+        );
+
+        if (flags < 0) {
             self.state = .disconnected;
             return error.ConnectionFailed;
-        };
-        var o: std.posix.O = @bitCast(@as(u32, @truncate(flags)));
+        }
+
+        var o: std.c.O = @bitCast(@as(u32, @intCast(flags)));
         o.NONBLOCK = false;
-        _ = std.posix.fcntl(s.handle, std.posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
+
+        _ = std.c.fcntl(
+            s.socket.handle,
+            std.c.F.SETFL,
+            @as(c_int, @bitCast(o)),
+        );
         setNoDelay(s);
         self.state = .handshaking;
         try self.sendHandshake(info_hash, peer_id);
@@ -438,38 +582,68 @@ pub const PeerConnection = struct {
     /// finishProxyConnect when the socket is readable (Tor circuit built).
     fn startProxyConnect(self: *PeerConnection) !void {
         const px = self.proxy orelse return error.ConnectionFailed;
-        self.stream = proxy_mod.connectThroughProxyAddrStart(self.allocator, px, self.address) catch {
+        self.stream = proxy_mod.connectThroughProxyAddrStart(
+            self.io,
+            self.allocator,
+            px,
+            self.address,
+        ) catch {
             self.state = .disconnected;
             return error.ConnectionFailed;
         };
-        const flags = std.posix.fcntl(self.stream.?.handle, std.posix.F.GETFL, 0) catch {
+        const flags = std.c.fcntl(
+            self.stream.?.socket.handle,
+            std.c.F.GETFL,
+            @as(c_int, 0),
+        );
+
+        if (flags < 0) {
             self.state = .disconnected;
             return error.ConnectionFailed;
-        };
-        var o: std.posix.O = @bitCast(@as(u32, @truncate(flags)));
+        }
+
+        var o: std.c.O = @bitCast(@as(u32, @intCast(flags)));
         o.NONBLOCK = true;
-        _ = std.posix.fcntl(self.stream.?.handle, std.posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
+
+        _ = std.c.fcntl(
+            self.stream.?.socket.handle,
+            std.c.F.SETFL,
+            @as(c_int, @bitCast(o)),
+        );
         self.state = .socks_connecting;
-        self.connect_started_at = std.time.timestamp();
+        self.connect_started_at =
+            std.Io.Clock.real.now(self.io).toSeconds();
     }
 
     /// Complete an async SOCKS5 proxy connect: read the CONNECT reply (socket
     /// is readable so this is instant), restore blocking, queue BT handshake.
     pub fn finishProxyConnect(self: *PeerConnection, info_hash: [20]u8, peer_id: [20]u8) !void {
         const s = self.stream orelse return error.ConnectionFailed;
-        const flags = std.posix.fcntl(s.handle, std.posix.F.GETFL, 0) catch {
+        const flags = std.c.fcntl(
+            s.socket.handle,
+            std.c.F.GETFL,
+            @as(c_int, 0),
+        );
+
+        if (flags < 0) {
             self.state = .disconnected;
             return error.ConnectionFailed;
-        };
-        var o: std.posix.O = @bitCast(@as(u32, @truncate(flags)));
+        }
+
+        var o: std.c.O = @bitCast(@as(u32, @intCast(flags)));
         o.NONBLOCK = false;
-        _ = std.posix.fcntl(s.handle, std.posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
-        proxy_mod.readSocks5ReplyPub(s) catch {
+
+        _ = std.c.fcntl(
+            s.socket.handle,
+            std.c.F.SETFL,
+            @as(c_int, @bitCast(o)),
+        );
+        proxy_mod.readSocks5ReplyPub(self.io, s) catch {
             self.state = .disconnected;
             return error.ConnectionFailed;
         };
         setNoDelay(s);
-        setSocketBuffers(s.handle);
+        setSocketBuffers(s.socket.handle);
         self.state = .handshaking;
         try self.sendHandshake(info_hash, peer_id);
     }
@@ -500,12 +674,16 @@ pub const PeerConnection = struct {
         const remaining = self.send_buf.items[self.send_pos..];
         if (remaining.len == 0) return 0;
 
-        const written = s.write(remaining) catch {
+        var write_buffer: [0]u8 = .{};
+        var writer = s.writer(self.io, &write_buffer);
+
+        const written = writer.interface.write(remaining) catch {
             self.state = .disconnected;
             return error.IoError;
         };
         self.send_pos += written;
-        self.last_send_time = std.time.timestamp();
+        self.last_send_time =
+            std.Io.Clock.real.now(self.io).toSeconds();
 
         // Compact send buffer when half consumed
         if (self.send_pos > self.send_buf.items.len / 2 and self.send_pos > 0) {
@@ -523,17 +701,31 @@ pub const PeerConnection = struct {
     /// syscall + poll round per block.
     pub fn readIncoming(self: *PeerConnection) !usize {
         const s = self.stream orelse return 0;
+
         var buf: [65536]u8 = undefined;
-        const n = s.read(&buf) catch {
-            self.state = .disconnected;
-            return error.IoError;
+        var read_buffer: [0]u8 = .{};
+        var reader = s.reader(self.io, &read_buffer);
+        var data = [_][]u8{&buf};
+
+        const n = reader.interface.readVec(&data) catch |err| switch (err) {
+            error.EndOfStream => {
+                self.state = .disconnected;
+                return 0;
+            },
+            else => {
+                self.state = .disconnected;
+                return error.IoError;
+            },
         };
-        if (n == 0) {
-            self.state = .disconnected;
-            return 0;
-        }
-        self.recv_buf.appendSlice(self.allocator, buf[0..n]) catch return error.OutOfMemory;
-        self.last_recv_time = std.time.timestamp();
+
+        self.recv_buf.appendSlice(
+            self.allocator,
+            buf[0..n],
+        ) catch return error.OutOfMemory;
+
+        self.last_recv_time =
+            std.Io.Clock.real.now(self.io).toSeconds();
+
         return n;
     }
 
@@ -581,7 +773,7 @@ pub const PeerConnection = struct {
     }
 
     pub fn fd(self: PeerConnection) std.posix.fd_t {
-        return if (self.stream) |s| s.handle else -1;
+        return if (self.stream) |s| s.socket.handle else -1;
     }
 
     pub fn wantsSend(self: PeerConnection) bool {
@@ -597,7 +789,7 @@ pub const PeerConnection = struct {
             .index = req.index,
             .begin = req.begin,
             .length = req.length,
-            .requested_at = std.time.timestamp(),
+            .requested_at = std.Io.Clock.real.now(self.io).toSeconds(),
         }) catch return error.OutOfMemory;
     }
 
@@ -647,7 +839,7 @@ pub const PeerConnection = struct {
 
     pub fn disconnect(self: *PeerConnection) void {
         if (self.stream) |s| {
-            s.close();
+            s.close(self.io);
             self.stream = null;
         }
         self.state = .disconnected;
@@ -664,8 +856,13 @@ pub const PeerConnection = struct {
 
 test "peer init defaults" {
     const allocator = std.testing.allocator;
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6881);
-    var peer = PeerConnection.init(allocator, addr);
+    const addr: std.Io.net.IpAddress = .{
+        .ip4 = .{
+            .bytes = .{ 127, 0, 0, 1 },
+            .port = 6881,
+        },
+    };
+    var peer = PeerConnection.init(std.testing.io, allocator, addr);
     defer peer.deinit();
 
     try std.testing.expectEqual(PeerState.connecting, peer.state);
@@ -678,8 +875,13 @@ test "peer init defaults" {
 
 test "peer request pipeline" {
     const allocator = std.testing.allocator;
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6881);
-    var peer = PeerConnection.init(allocator, addr);
+    const addr: std.Io.net.IpAddress = .{
+        .ip4 = .{
+            .bytes = .{ 127, 0, 0, 1 },
+            .port = 6881,
+        },
+    };
+    var peer = PeerConnection.init(std.testing.io, allocator, addr);
     defer peer.deinit();
 
     // Peer is choking us by default
@@ -705,8 +907,13 @@ test "peer request pipeline" {
 
 test "peer pipeline limit scales with measured rate" {
     const allocator = std.testing.allocator;
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6881);
-    var peer = PeerConnection.init(allocator, addr);
+    const addr: std.Io.net.IpAddress = .{
+        .ip4 = .{
+            .bytes = .{ 127, 0, 0, 1 },
+            .port = 6881,
+        },
+    };
+    var peer = PeerConnection.init(std.testing.io, allocator, addr);
     defer peer.deinit();
 
     try std.testing.expectEqual(min_pipeline, peer.pipeline_limit);
@@ -727,8 +934,13 @@ test "peer pipeline limit scales with measured rate" {
 
 test "peer enqueue and send buffer" {
     const allocator = std.testing.allocator;
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6881);
-    var peer = PeerConnection.init(allocator, addr);
+    const addr: std.Io.net.IpAddress = .{
+        .ip4 = .{
+            .bytes = .{ 127, 0, 0, 1 },
+            .port = 6881,
+        },
+    };
+    var peer = PeerConnection.init(std.testing.io, allocator, addr);
     defer peer.deinit();
 
     try peer.enqueueMessage(.choke);
@@ -738,8 +950,13 @@ test "peer enqueue and send buffer" {
 
 test "peer handshake serialization" {
     const allocator = std.testing.allocator;
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6881);
-    var peer = PeerConnection.init(allocator, addr);
+    const addr: std.Io.net.IpAddress = .{
+        .ip4 = .{
+            .bytes = .{ 127, 0, 0, 1 },
+            .port = 6881,
+        },
+    };
+    var peer = PeerConnection.init(std.testing.io, allocator, addr);
     defer peer.deinit();
 
     try peer.sendHandshake([_]u8{0xAA} ** 20, [_]u8{0xBB} ** 20);
@@ -749,13 +966,19 @@ test "peer handshake serialization" {
 test "connect timeout is per-transport" {
     const a = std.testing.allocator;
 
-    var clearnet = PeerConnection.init(a, std.net.Address.initIp4(.{ 1, 2, 3, 4 }, 6881));
+    const addr: std.Io.net.IpAddress = .{
+        .ip4 = .{
+            .bytes = .{ 1, 2, 3, 4 },
+            .port = 6881,
+        },
+    };
+    var clearnet = PeerConnection.init(std.testing.io, a, addr);
     defer clearnet.deinit();
     try std.testing.expectEqual(PeerConnection.connect_timeout_secs, clearnet.currentConnectTimeout());
 
     // A hostname dial (Tor/SAM) must survive circuit build plus descriptor
     // propagation, which routinely outlasts the clearnet TCP timeout.
-    var onion = try PeerConnection.initOnion(a, "examplepeer.onion", 6881);
+    var onion = try PeerConnection.initOnion(std.testing.io, a, "examplepeer.onion", 6881);
     defer onion.deinit();
     try std.testing.expectEqual(PeerConnection.anon_connect_timeout_secs, onion.currentConnectTimeout());
     try std.testing.expect(onion.currentConnectTimeout() > clearnet.currentConnectTimeout());

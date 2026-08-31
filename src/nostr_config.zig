@@ -8,6 +8,13 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+
+pub const Context = struct {
+    io: std.Io,
+    home: ?[]const u8,
+    xdg_config_home: ?[]const u8,
+};
+
 const secp = @import("secp.zig");
 const nip19 = @import("nip19.zig");
 
@@ -21,22 +28,29 @@ const log = std.log.scoped(.config);
 
 /// Resolve the config directory: $XDG_CONFIG_HOME/carl or $HOME/.config/carl.
 /// Caller owns the returned slice.
-pub fn configDir(allocator: Allocator) ![]u8 {
-    if (std.process.getEnvVarOwned(allocator, "XDG_CONFIG_HOME")) |xdg| {
-        defer allocator.free(xdg);
-        return try std.fmt.allocPrint(allocator, "{s}/carl", .{xdg});
-    } else |_| {}
+pub fn configDir(ctx: Context, allocator: Allocator) ![]u8 {
+    if (ctx.xdg_config_home) |xdg| {
+        return try std.fmt.allocPrint(
+            allocator,
+            "{s}/carl",
+            .{xdg},
+        );
+    }
 
-    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return error.NoConfigDir;
-    defer allocator.free(home);
-    return try std.fmt.allocPrint(allocator, "{s}/.config/carl", .{home});
+    const home = ctx.home orelse return error.NoConfigDir;
+
+    return try std.fmt.allocPrint(
+        allocator,
+        "{s}/.config/carl",
+        .{home},
+    );
 }
 
 /// Ensure the config directory exists; mode 0700.
-pub fn ensureConfigDir(allocator: Allocator) ![]u8 {
-    const dir = try configDir(allocator);
+pub fn ensureConfigDir(ctx: Context, allocator: Allocator) ![]u8 {
+    const dir = try configDir(ctx, allocator);
     errdefer allocator.free(dir);
-    std.fs.cwd().makePath(dir) catch |err| switch (err) {
+    std.Io.Dir.cwd().createDirPath(ctx.io, dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -45,27 +59,41 @@ pub fn ensureConfigDir(allocator: Allocator) ![]u8 {
 
 /// Write the secret key as bech32 nsec to `<config>/nsec` with 0600 perms.
 /// Overwrites any existing file. Returns the bech32 string (caller owns it).
-pub fn writeSecretKey(allocator: Allocator, sk: secp.SecretKey) ![]u8 {
-    const dir = try ensureConfigDir(allocator);
+/// Write the secret key as bech32 nsec to `<config>/nsec` with 0600 perms.
+/// Overwrites any existing file. Returns the bech32 string (caller owns it).
+pub fn writeSecretKey(
+    ctx: Context,
+    allocator: Allocator,
+    sk: secp.SecretKey,
+) ![]u8 {
+    const dir = try ensureConfigDir(ctx, allocator);
     defer allocator.free(dir);
 
-    const path = try std.fmt.allocPrint(allocator, "{s}/nsec", .{dir});
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/nsec",
+        .{dir},
+    );
     defer allocator.free(path);
 
     const nsec = try nip19.encode32(allocator, .nsec, sk);
     errdefer allocator.free(nsec);
 
-    var file = try std.fs.cwd().createFile(path, .{ .truncate = true, .mode = 0o600 });
-    defer file.close();
-    // `createFile`'s mode is only used when the file is newly created. If an
-    // earlier-keygen left the file world- or group-readable, overwriting it
-    // doesn't tighten the perms. Explicitly fchmod every write so the
-    // documented 0600 invariant actually holds. `chmod` errors are surfaced
-    // because a key file we can't restrict is a real security problem the
-    // user needs to know about.
-    try file.chmod(0o600);
-    try file.writeAll(nsec);
-    try file.writeAll("\n");
+    const secret_permissions: std.Io.File.Permissions = @enumFromInt(0o600);
+
+    var file = try std.Io.Dir.cwd().createFile(ctx.io, path, .{
+        .truncate = true,
+        .permissions = secret_permissions,
+    });
+    defer file.close(ctx.io);
+
+    // `createFile` permissions only affect newly created files.
+    // Explicitly reset permissions when overwriting an existing key file.
+    try file.setPermissions(ctx.io, secret_permissions);
+
+    try file.writeStreamingAll(ctx.io, nsec);
+    try file.writeStreamingAll(ctx.io, "\n");
+
     return nsec;
 }
 
@@ -84,22 +112,30 @@ pub fn parseNsecFile(content: []const u8) !secp.SecretKey {
 }
 
 /// Read the secret key from `<config>/nsec`. Returns NoKey if absent.
-pub fn readSecretKey(allocator: Allocator) !secp.SecretKey {
-    const dir = try configDir(allocator);
+pub fn readSecretKey(ctx: Context, allocator: Allocator) !secp.SecretKey {
+    const dir = try configDir(ctx, allocator);
     defer allocator.free(dir);
 
-    const path = std.fmt.allocPrint(allocator, "{s}/nsec", .{dir}) catch return error.OutOfMemory;
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/nsec",
+        .{dir},
+    );
     defer allocator.free(path);
 
-    var file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
+    const data = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        path,
+        allocator,
+        .limited(128),
+    ) catch |err| switch (err) {
         error.FileNotFound => return error.NoKey,
+        error.StreamTooLong => return error.BadKeyFile,
         else => return err,
     };
-    defer file.close();
+    defer allocator.free(data);
 
-    var buf: [128]u8 = undefined;
-    const n = file.readAll(&buf) catch return error.BadKeyFile;
-    return parseNsecFile(buf[0..n]);
+    return parseNsecFile(data);
 }
 
 /// Read the relay list from `<config>/relays` (one per line). Fall back to
@@ -109,19 +145,27 @@ pub fn readSecretKey(allocator: Allocator) !secp.SecretKey {
 /// have their announce/search silently routed to the public defaults if
 /// their config file is unreadable for some reason. Caller owns the slice
 /// and each entry.
-pub fn readRelays(allocator: Allocator) ![][]const u8 {
-    const dir = try configDir(allocator);
+/// Read the relay list from `<config>/relays` (one per line).
+pub fn readRelays(ctx: Context, allocator: Allocator) ![][]const u8 {
+    const dir = try configDir(ctx, allocator);
     defer allocator.free(dir);
-    const path = try std.fmt.allocPrint(allocator, "{s}/relays", .{dir});
+
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/relays",
+        .{dir},
+    );
     defer allocator.free(path);
 
-    var file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
+    const data = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        path,
+        allocator,
+        .limited(64 * 1024),
+    ) catch |err| switch (err) {
         error.FileNotFound => return dupeDefaults(allocator),
         else => return err,
     };
-    defer file.close();
-
-    const data = try file.readToEndAlloc(allocator, 64 * 1024);
     defer allocator.free(data);
 
     var list: std.ArrayList([]const u8) = .empty;
@@ -129,14 +173,25 @@ pub fn readRelays(allocator: Allocator) ![][]const u8 {
         for (list.items) |s| allocator.free(s);
         list.deinit(allocator);
     }
+
     var it = std.mem.tokenizeAny(u8, data, "\r\n");
+
     while (it.next()) |line| {
         const t = std.mem.trim(u8, line, " \t");
+
         if (t.len == 0 or t[0] == '#') continue;
-        const dup = try allocator.dupe(u8, t);
-        try list.append(allocator, dup);
+
+        try list.append(
+            allocator,
+            try allocator.dupe(u8, t),
+        );
     }
-    if (list.items.len == 0) return dupeDefaults(allocator);
+
+    if (list.items.len == 0) {
+        list.deinit(allocator);
+        return dupeDefaults(allocator);
+    }
+
     return list.toOwnedSlice(allocator);
 }
 
@@ -157,21 +212,29 @@ pub fn freeRelays(allocator: Allocator, relays: [][]const u8) void {
 /// Overwrite `<config>/relays` with `relays` (one per line). Blank entries are
 /// skipped. Used by the daemon's settings endpoint so edits from the GUI
 /// persist and are visible to search, peer-announce, and the CLI.
-pub fn writeRelays(allocator: Allocator, relays: []const []const u8) !void {
-    const dir = try ensureConfigDir(allocator);
+pub fn writeRelays(
+    ctx: Context,
+    allocator: Allocator,
+    relays: []const []const u8,
+) !void {
+    const dir = try ensureConfigDir(ctx, allocator);
     defer allocator.free(dir);
 
-    const path = try std.fmt.allocPrint(allocator, "{s}/relays", .{dir});
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/relays",
+        .{dir},
+    );
     defer allocator.free(path);
 
-    var file = try std.fs.cwd().createFile(path, .{ .truncate = true, .mode = 0o600 });
-    defer file.close();
+    var file = try std.Io.Dir.cwd().createFile(ctx.io, path, .{
+        .truncate = true,
+    });
+    defer file.close(ctx.io);
 
-    for (relays) |r| {
-        const t = std.mem.trim(u8, r, " \t\r\n");
-        if (t.len == 0) continue;
-        try file.writeAll(t);
-        try file.writeAll("\n");
+    for (relays) |relay| {
+        try file.writeStreamingAll(ctx.io, relay);
+        try file.writeStreamingAll(ctx.io, "\n");
     }
 }
 

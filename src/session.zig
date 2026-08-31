@@ -17,6 +17,10 @@ const nostr_config = @import("nostr_config.zig");
 const proxy_mod = @import("proxy.zig");
 const i2p_sam = @import("i2p_sam.zig");
 
+const Net = std.Io.net;
+const IpAddress = Net.IpAddress;
+const Server = Net.Server;
+
 const log = std.log.scoped(.session);
 
 const max_peers: usize = 50;
@@ -68,7 +72,7 @@ pub const OnComplete = struct {
 /// written from a signal handler and read from event loop / test threads.
 pub var shutdown_requested = std.atomic.Value(bool).init(false);
 
-fn sigintHandler(_: i32) callconv(.c) void {
+fn sigintHandler(_: std.posix.SIG) callconv(.c) void {
     shutdown_requested.store(true, .release);
 }
 
@@ -80,7 +84,8 @@ pub const ListenBind = enum { any, loopback };
 /// Kept on the heap so the worker can finish (and free it) after the session
 /// is destroyed — the session never joins a lookup, so shutdown stays instant.
 const DhtState = struct {
-    mutex: std.Thread.Mutex = .{},
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
     query_active: bool = false,
     failed: bool = false,
     /// Earliest time a new lookup may start; set after a failed lookup so a
@@ -109,6 +114,8 @@ const DhtState = struct {
 
 pub const Session = struct {
     allocator: Allocator,
+    io: std.Io,
+    nostr_ctx: nostr_config.Context,
     meta: metainfo.Metainfo,
     info_hash: [20]u8,
     peer_id: [20]u8,
@@ -131,7 +138,7 @@ pub const Session = struct {
     // Piece availability counts (how many peers have each piece)
     piece_availability: []u32,
 
-    listener: ?std.net.Server,
+    listener: ?Server,
     listen_port: u16,
     output_dir: []const u8,
     mode: Mode,
@@ -154,7 +161,7 @@ pub const Session = struct {
     // transition (which reallocates `our_bitfield`). Lets the daemon read live
     // progress from another thread without a use-after-free. Defaulted so the
     // init struct literal need not set it.
-    snapshot_mutex: std.Thread.Mutex = .{},
+    snapshot_mutex: std.Io.Mutex = .init,
 
     // The resolved `.torrent` bytes, built once metadata completes (magnet path)
     // so the daemon can persist it and resume the torrent fully — verifying
@@ -217,11 +224,11 @@ pub const Session = struct {
 
     /// Guards the published per-file snapshot. Written by the session thread
     /// in `maintenance` (1 Hz), read by `fileSnapshot` from the daemon thread.
-    file_snap_mutex: std.Thread.Mutex = .{},
+    file_snap_mutex: std.Io.Mutex = .init,
     /// Published per-file snapshot, or null before metadata is in. Owned by
     /// the session; freed before each re-publish and in `deinit`.
     file_snap: ?[]FileSnap = null,
-    peer_snap_mutex: std.Thread.Mutex = .{},
+    peer_snap_mutex: std.Io.Mutex = .init,
     peer_snap: ?[]PeerInfo = null,
     /// Primary tracker URL (owned), captured at init and re-captured on
     /// metadata completion. Guarded by `snapshot_mutex`. Freed in deinit.
@@ -312,6 +319,8 @@ pub const Session = struct {
     last_progress_bytes: u64,
 
     pub fn init(
+        io: std.Io,
+        nostr_ctx: nostr_config.Context,
         allocator: Allocator,
         meta: metainfo.Metainfo,
         output_dir: []const u8,
@@ -342,7 +351,7 @@ pub const Session = struct {
 
         var peer_id: [20]u8 = undefined;
         @memcpy(peer_id[0..8], "-CA0010-");
-        std.crypto.random.bytes(peer_id[8..]);
+        io.random(peer_id[8..]);
 
         var our_bitfield = try piece_mod.Bitfield.init(allocator, num_pieces);
         errdefer our_bitfield.deinit(allocator);
@@ -352,13 +361,23 @@ pub const Session = struct {
         errdefer allocator.free(piece_availability);
 
         const create = mode == .download;
-        var store = storage_mod.Storage.init(allocator, meta, output_dir, create) catch
+        var store = storage_mod.Storage.init(
+            io,
+            allocator,
+            meta,
+            output_dir,
+            create,
+        ) catch
             return error.StorageInitFailed;
         errdefer store.deinit();
 
         // Verify existing pieces (resume + seed)
         {
-            const stderr = std.fs.File.stderr().deprecatedWriter();
+            var stderr_buffer: [1024]u8 = undefined;
+            var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
+            const stderr = &stderr_writer.interface;
+            defer stderr.flush() catch {};
+
             stderr.print("verifying existing pieces...\n", .{}) catch {};
             for (0..num_pieces) |i| {
                 const idx: u32 = @intCast(i);
@@ -381,20 +400,28 @@ pub const Session = struct {
         // real IP. The exception is an I2P inbound seed (`i2p_hidden`): its
         // listener binds loopback and is fed only by the SAM forward, never the
         // clearnet — the same shape as a Tor hidden-service seed.
-        var listener: ?std.net.Server = null;
+        var listener: ?Server = null;
         if (((proxy == null and i2p == null) or i2p_hidden) and (mode == .seed or our_bitfield.count() > 0)) {
             const bind_ip: [4]u8 = switch (listen_bind) {
                 .any => .{ 0, 0, 0, 0 },
                 .loopback => .{ 127, 0, 0, 1 },
             };
-            const addr = std.net.Address.initIp4(bind_ip, listen_port);
-            listener = addr.listen(.{ .reuse_address = true }) catch null;
+            const addr: IpAddress = .{ .ip4 = .{
+                .bytes = bind_ip,
+                .port = listen_port,
+            } };
+
+            listener = addr.listen(io, .{
+                .reuse_address = true,
+            }) catch null;
         }
 
-        const now = std.time.timestamp();
+        const now = std.Io.Clock.real.now(io).toSeconds();
 
         return .{
             .allocator = allocator,
+            .io = io,
+            .nostr_ctx = nostr_ctx,
             .meta = meta,
             .info_hash = info_hash,
             .peer_id = peer_id,
@@ -459,7 +486,7 @@ pub const Session = struct {
         if (self.metadata_download) |*md| md.deinit();
         if (self.web_seed_client) |*c| c.deinit();
         if (self.web_seed_off) |b| self.allocator.free(b);
-        if (self.listener) |*l| l.deinit();
+        if (self.listener) |*l| l.deinit(self.io);
         if (self.torrent_blob) |b| self.allocator.free(b);
         self.freeFileSnapSlice(self.file_snap);
         self.freePeerSnapSlice(self.peer_snap);
@@ -530,15 +557,15 @@ pub const Session = struct {
     /// A copy of the resolved `.torrent` bytes, or null if metadata isn't in
     /// yet (or this was never a magnet). Caller owns the result.
     pub fn copyTorrent(self: *Session, a: Allocator) ?[]u8 {
-        self.snapshot_mutex.lock();
-        defer self.snapshot_mutex.unlock();
+        self.snapshot_mutex.lockUncancelable(self.io);
+        defer self.snapshot_mutex.unlock(self.io);
         const blob = self.torrent_blob orelse return null;
         return a.dupe(u8, blob) catch null;
     }
 
     pub fn progressSnapshot(self: *Session) Progress {
-        self.snapshot_mutex.lock();
-        defer self.snapshot_mutex.unlock();
+        self.snapshot_mutex.lockUncancelable(self.io);
+        defer self.snapshot_mutex.unlock(self.io);
         // `have`/`peers` come from atomics the session thread keeps exact, so we
         // never touch `our_bitfield`/`peers` (mutated lockless on that thread).
         // `num_pieces`/`total_length` are still read under the mutex because the
@@ -559,7 +586,10 @@ pub const Session = struct {
             .up_rate = self.up_rate.load(.monotonic),
             .meta_have = self.meta_have.load(.monotonic),
             .meta_total = self.meta_total.load(.monotonic),
-            .idle_secs = @max(0, std.time.timestamp() - last_prog),
+            .idle_secs = @max(
+                0,
+                std.Io.Clock.real.now(self.io).toSeconds() - last_prog,
+            ),
             .tracker_url = if (self.src_tracker_url) |u| u else "",
             .seeders = self.src_seeders.load(.monotonic),
             .leechers = self.src_leechers.load(.monotonic),
@@ -583,8 +613,8 @@ pub const Session = struct {
 
     /// Copy the session's published per-file snapshot for cross-thread reads.
     pub fn fileSnapshot(self: *Session, a: Allocator) Allocator.Error![]FileSnap {
-        self.file_snap_mutex.lock();
-        defer self.file_snap_mutex.unlock();
+        self.file_snap_mutex.lockUncancelable(self.io);
+        defer self.file_snap_mutex.unlock(self.io);
         const snap = self.file_snap orelse return try a.alloc(FileSnap, 0);
         const out = try a.alloc(FileSnap, snap.len);
         for (snap, 0..) |f, i| {
@@ -603,10 +633,10 @@ pub const Session = struct {
     fn publishFileSnap(self: *Session) void {
         const count = self.meta.files.len;
         if (count == 0 or self.piece_len == 0) {
-            self.file_snap_mutex.lock();
+            self.file_snap_mutex.lockUncancelable(self.io);
             const old = self.file_snap;
             self.file_snap = null;
-            self.file_snap_mutex.unlock();
+            self.file_snap_mutex.unlock(self.io);
             self.freeFileSnapSlice(old);
             return;
         }
@@ -648,10 +678,10 @@ pub const Session = struct {
             written += 1;
         }
 
-        self.file_snap_mutex.lock();
+        self.file_snap_mutex.lockUncancelable(self.io);
         const old = self.file_snap;
         self.file_snap = snap[0..written];
-        self.file_snap_mutex.unlock();
+        self.file_snap_mutex.unlock(self.io);
         self.freeFileSnapSlice(old);
     }
 
@@ -669,8 +699,8 @@ pub const Session = struct {
     }
 
     pub fn peerSnapshot(self: *Session, a: Allocator) Allocator.Error![]PeerInfo {
-        self.peer_snap_mutex.lock();
-        defer self.peer_snap_mutex.unlock();
+        self.peer_snap_mutex.lockUncancelable(self.io);
+        defer self.peer_snap_mutex.unlock(self.io);
         const snap = self.peer_snap orelse return try a.alloc(PeerInfo, 0);
         const out = try a.alloc(PeerInfo, snap.len);
         for (snap, 0..) |p, i| {
@@ -691,10 +721,10 @@ pub const Session = struct {
     fn publishPeerSnap(self: *Session) void {
         const count = self.peers.items.len;
         if (count == 0) {
-            self.peer_snap_mutex.lock();
+            self.peer_snap_mutex.lockUncancelable(self.io);
             const old = self.peer_snap;
             self.peer_snap = null;
-            self.peer_snap_mutex.unlock();
+            self.peer_snap_mutex.unlock(self.io);
             self.freePeerSnapSlice(old);
             return;
         }
@@ -708,10 +738,10 @@ pub const Session = struct {
         }
 
         const published = self.allocator.realloc(snap, written) catch snap[0..written];
-        self.peer_snap_mutex.lock();
+        self.peer_snap_mutex.lockUncancelable(self.io);
         const old = self.peer_snap;
         self.peer_snap = published;
-        self.peer_snap_mutex.unlock();
+        self.peer_snap_mutex.unlock(self.io);
         self.freePeerSnapSlice(old);
     }
 
@@ -812,11 +842,17 @@ pub const Session = struct {
     }
 
     pub fn run(self: *Session) !void {
-        const stdout = std.fs.File.stdout().deprecatedWriter();
-        const stderr = std.fs.File.stderr().deprecatedWriter();
+        var stdout_buffer: [0]u8 = .{};
+        var stdout_writer = std.Io.File.stdout().writer(self.io, &stdout_buffer);
+        const stdout = &stdout_writer.interface;
+
+        var stderr_buffer: [0]u8 = .{};
+        var stderr_writer = std.Io.File.stderr().writer(self.io, &stderr_buffer);
+        const stderr = &stderr_writer.interface;
         // Start the re-discovery clock now so the first retry waits a full
         // interval after any startup discovery the caller already ran.
-        self.last_peer_discovery_s = std.time.timestamp();
+        self.last_peer_discovery_s =
+            std.Io.Clock.real.now(self.io).toSeconds();
 
         const act = std.posix.Sigaction{
             .handler = .{ .handler = sigintHandler },
@@ -885,8 +921,16 @@ pub const Session = struct {
                         .any => .{ 0, 0, 0, 0 },
                         .loopback => .{ 127, 0, 0, 1 },
                     };
-                    const addr = std.net.Address.initIp4(bind_ip, self.listen_port);
-                    self.listener = addr.listen(.{ .reuse_address = true }) catch null;
+                    const addr: IpAddress = .{
+                        .ip4 = .{
+                            .bytes = bind_ip,
+                            .port = self.listen_port,
+                        },
+                    };
+
+                    self.listener = addr.listen(self.io, .{
+                        .reuse_address = true,
+                    }) catch null;
                 }
                 self.mode = .seed;
                 // Seeding only reads — swap the write handles for read-only
@@ -939,7 +983,7 @@ pub const Session = struct {
         var n: usize = 0;
 
         if (self.listener) |l| {
-            fds[n] = .{ .fd = l.stream.handle, .events = std.posix.POLL.IN, .revents = 0 };
+            fds[n] = .{ .fd = l.socket.handle, .events = std.posix.POLL.IN, .revents = 0 };
             n += 1;
         }
 
@@ -980,7 +1024,7 @@ pub const Session = struct {
             const revents = fds[fd_idx].revents;
 
             if (revents & (std.posix.POLL.HUP | std.posix.POLL.ERR) != 0) {
-                if (p.state == .active) log.debug("peer dropped (HUP/ERR), idle {d}s", .{std.time.timestamp() - p.last_recv_time});
+                if (p.state == .active) log.debug("peer dropped (HUP/ERR), idle {d}s", .{std.Io.Clock.real.now(self.io)});
                 p.disconnect();
                 fd_idx += 1;
                 continue;
@@ -1021,7 +1065,7 @@ pub const Session = struct {
 
             if (revents & std.posix.POLL.IN != 0) {
                 _ = p.readIncoming() catch {
-                    if (p.state == .active) log.debug("peer read-err, idle {d}s", .{std.time.timestamp() - p.last_recv_time});
+                    if (p.state == .active) log.debug("peer read-err, idle {d}s", .{std.Io.Clock.real.now(self.io).toSeconds() - p.last_recv_time});
                     p.disconnect();
                     fd_idx += 1;
                     continue;
@@ -1563,8 +1607,8 @@ pub const Session = struct {
         // the geometry + bitfield swap so a concurrent `progressSnapshot` never
         // reads a freed `our_bitfield` (the daemon reads it from another thread).
         {
-            self.snapshot_mutex.lock();
-            defer self.snapshot_mutex.unlock();
+            self.snapshot_mutex.lockUncancelable(self.io);
+            defer self.snapshot_mutex.unlock(self.io);
 
             self.total_length = piece_mod.totalLength(self.meta.files);
             self.num_pieces = piece_mod.numPieces(self.total_length, piece_length);
@@ -1582,7 +1626,13 @@ pub const Session = struct {
 
         // Reinitialize storage with the real metadata
         self.store.deinit();
-        self.store = storage_mod.Storage.init(self.allocator, self.meta, self.output_dir, true) catch
+        self.store = storage_mod.Storage.init(
+            self.io,
+            self.allocator,
+            self.meta,
+            self.output_dir,
+            true,
+        ) catch
             return error.StorageInitFailed;
 
         // Metadata is in; clear the fetch-progress atomics BEFORE flipping to
@@ -1596,8 +1646,8 @@ pub const Session = struct {
         // snapshot_mutex; the tracker itself is session-private (the snapshot
         // reads the meta atomics, not the tracker).
         {
-            self.snapshot_mutex.lock();
-            defer self.snapshot_mutex.unlock();
+            self.snapshot_mutex.lockUncancelable(self.io);
+            defer self.snapshot_mutex.unlock(self.io);
             // Update the published tracker URL from the resolved metadata.
             if (self.src_tracker_url) |old| self.allocator.free(old);
             self.src_tracker_url = if (self.meta.announce.len > 0)
@@ -1613,9 +1663,9 @@ pub const Session = struct {
         // resume this torrent fully on restart. Built here where `meta` is
         // settled; published under snapshot_mutex for the reader thread.
         if (buildTorrentBytes(self.allocator, self.meta)) |blob| {
-            self.snapshot_mutex.lock();
+            self.snapshot_mutex.lockUncancelable(self.io);
             self.torrent_blob = blob;
-            self.snapshot_mutex.unlock();
+            self.snapshot_mutex.unlock(self.io);
         } else |_| {}
 
         // Re-parse any bitfields that arrived before we knew the piece count, so
@@ -1836,7 +1886,10 @@ pub const Session = struct {
         }
         if (missing > 0 and missing == active and missing <= 5) {
             self.endgame_active = true;
-            const stderr = std.fs.File.stderr().deprecatedWriter();
+            const stderr_file = std.Io.File.stderr();
+            var stderr_buffer: [0]u8 = .{};
+            var stderr_writer = stderr_file.writer(self.io, &stderr_buffer);
+            const stderr = &stderr_writer.interface;
             stderr.print("endgame mode: {d} pieces remaining\n", .{missing}) catch {};
         }
     }
@@ -1844,7 +1897,7 @@ pub const Session = struct {
     // --- Choking algorithm (BEP 3) ---
 
     fn runChokingAlgorithm(self: *Session) void {
-        const now = std.time.timestamp();
+        const now = std.Io.Clock.real.now(self.io).toSeconds();
 
         // Regular unchoke: every 10 seconds
         if (now - self.last_unchoke_time >= unchoke_interval_secs) {
@@ -1918,7 +1971,9 @@ pub const Session = struct {
         }
 
         if (count > 0) {
-            const idx = std.crypto.random.intRangeAtMost(usize, 0, count - 1);
+            const rng_source: std.Random.IoSource = .{ .io = self.io };
+            const rng = rng_source.interface();
+            const idx = rng.intRangeAtMost(usize, 0, count - 1);
             const p = candidates[idx];
             p.am_choking = false;
             p.enqueueMessage(.unchoke) catch {};
@@ -1959,21 +2014,27 @@ pub const Session = struct {
     // --- Connection management ---
 
     fn acceptIncoming(self: *Session) !void {
-        var l = self.listener orelse return;
-        const conn = l.accept() catch return;
+        const l = if (self.listener) |*listener| listener else return;
+        const stream = l.accept(self.io) catch return;
 
         if (self.peers.items.len >= max_peers) {
-            conn.stream.close();
+            stream.close(self.io);
             return;
         }
 
         const p = self.allocator.create(peer_mod.PeerConnection) catch {
-            conn.stream.close();
+            stream.close(self.io);
             return;
         };
-        p.* = peer_mod.PeerConnection.init(self.allocator, conn.address);
-        p.stream = conn.stream;
-        peer_mod.PeerConnection.setNoDelay(conn.stream);
+
+        p.* = peer_mod.PeerConnection.init(
+            self.io,
+            self.allocator,
+            stream.socket.address,
+        );
+
+        p.stream = stream;
+        peer_mod.PeerConnection.setNoDelay(stream);
         p.state = .handshaking;
 
         p.sendHandshake(self.info_hash, self.peer_id) catch {
@@ -1989,7 +2050,7 @@ pub const Session = struct {
     }
 
     fn maintenance(self: *Session) !void {
-        const now = std.time.timestamp();
+        const now = std.Io.Clock.real.now(self.io).toSeconds();
 
         // Resample the live transfer rate (≤ once a second; `now` is seconds).
         self.sampleRate(now);
@@ -2046,11 +2107,14 @@ pub const Session = struct {
             // Publish the DHT node count from the last completed lookup and
             // consume any peers it found (connects happen on this thread).
             if (self.dht_state) |st| {
-                st.mutex.lock();
+                st.mutex.lockUncancelable(st.io);
+                // work
+                st.mutex.unlock(st.io);
+
                 const nodes = st.nodes;
                 const peers = st.peers;
                 st.peers = &.{};
-                st.mutex.unlock();
+                st.mutex.unlock(st.io);
                 self.src_dht_nodes.store(nodes, .monotonic);
                 if (peers.len > 0) {
                     log.info("DHT found {d} peers", .{peers.len});
@@ -2176,7 +2240,13 @@ pub const Session = struct {
         // tracker_mod.announce owns the transport choice (udp:// vs http://)
         // and the fail-closed proxy rewrite, so the session and `carl announce`
         // cannot drift apart on which trackers are safe to dial.
-        return tracker_mod.announce(self.allocator, url, req, self.proxy) catch |err| {
+        return tracker_mod.announce(
+            self.io,
+            self.allocator,
+            url,
+            req,
+            self.proxy,
+        ) catch |err| {
             log.warn("tracker {s} failed: {t}", .{ url, err });
             return null;
         };
@@ -2186,13 +2256,16 @@ pub const Session = struct {
         defer resp.deinit(self.allocator);
 
         if (resp.failure_reason) |reason| {
-            const stderr = std.fs.File.stderr().deprecatedWriter();
+            var stderr_buffer: [0]u8 = .{};
+            var stderr_writer = std.Io.File.stderr().writer(self.io, &stderr_buffer);
+            const stderr = &stderr_writer.interface;
             stderr.print("tracker error: {s}\n", .{reason}) catch {};
             return;
         }
 
         self.tracker_interval = resp.interval;
-        self.last_announce_time = std.time.timestamp();
+        self.last_announce_time =
+            std.Io.Clock.real.now(self.io).toSeconds();
 
         // Publish source snapshot data for cross-thread reads.
         self.src_tracker_state.store(1, .monotonic);
@@ -2201,7 +2274,9 @@ pub const Session = struct {
         self.src_announce_interval_s.store(@intCast(resp.interval), .monotonic);
         self.src_last_announce_s.store(self.last_announce_time, .monotonic);
 
-        const stderr = std.fs.File.stderr().deprecatedWriter();
+        var stderr_buffer: [0]u8 = .{};
+        var stderr_writer = std.Io.File.stderr().writer(self.io, &stderr_buffer);
+        const stderr = &stderr_writer.interface;
         stderr.print("tracker: {d} peers", .{resp.peers.len}) catch {};
         if (resp.complete) |c| stderr.print(", {d} seeders", .{c}) catch {};
         if (resp.incomplete) |ic| stderr.print(", {d} leechers", .{ic}) catch {};
@@ -2248,8 +2323,11 @@ pub const Session = struct {
 
         // Rotate start offset so repeated announces don't always retry
         // the same failing peers at the front of the list.
+        const rng_impl: std.Random.IoSource = .{ .io = self.io };
+        const rng = rng_impl.interface();
+
         const offset = if (peer_list.len > 0)
-            std.crypto.random.intRangeAtMost(usize, 0, peer_list.len - 1)
+            rng.intRangeAtMost(usize, 0, peer_list.len - 1)
         else
             0;
 
@@ -2258,7 +2336,12 @@ pub const Session = struct {
             if (self.peers.items.len >= max_peers) break;
             if (attempts >= max_attempts) break;
 
-            const addr = std.net.Address.initIp4(tracker_peer.ip, tracker_peer.port);
+            const addr: IpAddress = .{
+                .ip4 = .{
+                    .bytes = tracker_peer.ip,
+                    .port = tracker_peer.port,
+                },
+            };
             var already = false;
             for (self.peers.items) |existing| {
                 if (std.mem.eql(u8, &std.mem.toBytes(existing.address), &std.mem.toBytes(addr))) {
@@ -2271,7 +2354,11 @@ pub const Session = struct {
             attempts += 1;
 
             const p = self.allocator.create(peer_mod.PeerConnection) catch continue;
-            p.* = peer_mod.PeerConnection.init(self.allocator, addr);
+            p.* = peer_mod.PeerConnection.init(
+                self.io,
+                self.allocator,
+                addr,
+            );
             p.proxy = self.proxy;
 
             // Non-blocking for clearnet: startConnect issues connect() and
@@ -2295,7 +2382,10 @@ pub const Session = struct {
 
     /// Connect directly to a peer address, bypassing the tracker.
     /// Useful for testing and for manual peer addition.
-    pub fn connectDirectPeer(self: *Session, addr: std.net.Address) !void {
+    pub fn connectDirectPeer(
+        self: *Session,
+        addr: std.Io.net.IpAddress,
+    ) !void {
         if (self.peers.items.len >= max_peers) return;
         // On the I2P transport there is no clearnet route (and no proxy to tunnel
         // through), so a clearnet IPv4 peer is unreachable and dialing it would
@@ -2304,7 +2394,11 @@ pub const Session = struct {
 
         const p = self.allocator.create(peer_mod.PeerConnection) catch return error.OutOfMemory;
         errdefer self.allocator.destroy(p);
-        p.* = peer_mod.PeerConnection.init(self.allocator, addr);
+        p.* = peer_mod.PeerConnection.init(
+            self.io,
+            self.allocator,
+            addr,
+        );
         errdefer p.deinit();
         p.proxy = self.proxy;
 
@@ -2318,7 +2412,12 @@ pub const Session = struct {
 
         const p = self.allocator.create(peer_mod.PeerConnection) catch return error.OutOfMemory;
         errdefer self.allocator.destroy(p);
-        p.* = try peer_mod.PeerConnection.initOnion(self.allocator, host, port);
+        p.* = try peer_mod.PeerConnection.initOnion(
+            self.io,
+            self.allocator,
+            host,
+            port,
+        );
         errdefer p.deinit();
         p.proxy = px;
         try self.finishPeerConnect(p);
@@ -2343,7 +2442,13 @@ pub const Session = struct {
 
         const p = self.allocator.create(peer_mod.PeerConnection) catch return error.OutOfMemory;
         errdefer self.allocator.destroy(p);
-        p.* = try peer_mod.PeerConnection.initI2p(self.allocator, dest, port, sam);
+        p.* = try peer_mod.PeerConnection.initI2p(
+            self.io,
+            self.allocator,
+            dest,
+            port,
+            sam,
+        );
         errdefer p.deinit();
         try self.finishPeerConnect(p);
     }
@@ -2401,17 +2506,20 @@ pub const Session = struct {
                 log.warn("DHT disabled: out of memory allocating lookup state", .{});
                 return;
             };
-            st.* = .{};
+            st.* = .{
+                .io = self.io,
+            };
             self.dht_state = st;
         }
         const st = self.dht_state.?;
 
         // Don't retry if DHT previously failed to start (e.g. port busy);
         // only one lookup in flight at a time; back off after a failed walk.
-        const now = std.time.timestamp();
+        const now = std.Io.Clock.real.now(self.io).toSeconds();
         {
-            st.mutex.lock();
-            defer st.mutex.unlock();
+            st.mutex.lockUncancelable(st.io);
+            defer st.mutex.unlock(st.io);
+
             if (st.failed) return;
             if (st.query_active) return;
             if (now < st.retry_after) return;
@@ -2424,7 +2532,7 @@ pub const Session = struct {
         self.joinDhtWorker();
 
         if (!self.dht_node_id_set) {
-            std.crypto.random.bytes(&self.dht_node_id);
+            self.io.random(&self.dht_node_id);
             self.dht_node_id_set = true;
         }
 
@@ -2438,9 +2546,10 @@ pub const Session = struct {
         // so a slice into a local would dangle by the time it opens the file.
         // Ownership transfers to the worker, which frees it.
         const dht_cache_path: []const u8 = blk: {
-            const cfg_dir = nostr_config.configDir(self.allocator) catch break :blk "";
+            const cfg_dir =
+                nostr_config.configDir(self.nostr_ctx, self.allocator) catch break :blk "";
             defer self.allocator.free(cfg_dir);
-            std.fs.cwd().makePath(cfg_dir) catch {};
+            std.Io.Dir.cwd().createDirPath(self.io, cfg_dir) catch {};
             break :blk std.fmt.allocPrint(self.allocator, "{s}/dht_nodes.dat", .{cfg_dir}) catch "";
         };
         const thread = std.Thread.spawn(.{}, dhtQueryWorker, .{
@@ -2448,9 +2557,9 @@ pub const Session = struct {
         }) catch |err| {
             log.warn("DHT thread spawn failed: {t}", .{err});
             if (dht_cache_path.len > 0) self.allocator.free(dht_cache_path);
-            st.mutex.lock();
+            st.mutex.lockUncancelable(st.io);
             st.query_active = false;
-            st.mutex.unlock();
+            st.mutex.unlock(st.io);
             st.unref(self.allocator);
             return;
         };
@@ -2493,12 +2602,19 @@ pub const Session = struct {
         defer if (cache_path.len > 0) allocator.free(cache_path);
         defer st.unref(allocator);
         defer {
-            st.mutex.lock();
+            st.mutex.lockUncancelable(st.io);
+            // work
+            st.mutex.unlock(st.io);
             st.query_active = false;
-            st.mutex.unlock();
+            st.mutex.unlock(st.io);
         }
 
-        var d = dht_mod.Dht.initWithId(allocator, port, node_id);
+        var d = dht_mod.Dht.initWithId(
+            st.io,
+            allocator,
+            port,
+            node_id,
+        );
         defer d.deinit();
         if (cache_path.len > 0) {
             const warmed = dht_mod.loadNodeCache(&d, cache_path);
@@ -2506,9 +2622,11 @@ pub const Session = struct {
         }
         d.start() catch {
             log.warn("DHT failed to start", .{});
-            st.mutex.lock();
+            st.mutex.lockUncancelable(st.io);
+            // work
+            st.mutex.unlock(st.io);
             st.failed = true;
-            st.mutex.unlock();
+            st.mutex.unlock(st.io);
             return;
         };
 
@@ -2526,17 +2644,21 @@ pub const Session = struct {
 
         const peers = d.getPeers(allocator, info_hash, &st.cancel) catch {
             // Don't cold-bootstrap again on the very next maintenance tick.
-            st.mutex.lock();
-            st.retry_after = std.time.timestamp() + dht_retry_backoff_secs;
-            st.mutex.unlock();
+            st.mutex.lockUncancelable(st.io);
+            // work
+            st.mutex.unlock(st.io);
+            st.retry_after =
+                std.Io.Clock.real.now(st.io).toSeconds() +
+                dht_retry_backoff_secs;
+            st.mutex.unlock(st.io);
             return;
         };
 
         var node_count: u32 = 0;
         for (&d.buckets) |*b| node_count += @intCast(b.items.len);
 
-        st.mutex.lock();
-        defer st.mutex.unlock();
+        st.mutex.lockUncancelable(st.io);
+        defer st.mutex.unlock(st.io);
         if (st.peers.len > 0) allocator.free(st.peers);
         st.peers = peers;
         st.nodes = node_count;
@@ -2636,15 +2758,15 @@ pub const Session = struct {
         // consecutive piece fetches reuse keep-alive connections from the
         // client's connection pool instead of paying a fresh TCP handshake
         // (and TLS, for https web seeds) per piece.
-        if (self.web_seed_client == null) self.web_seed_client = .{ .allocator = self.allocator };
+        if (self.web_seed_client == null)
+            self.web_seed_client = .{
+                .allocator = self.allocator,
+                .io = self.io,
+            };
         const client = &self.web_seed_client.?;
 
-        var response_body: std.ArrayList(u8) = .empty;
-        defer response_body.deinit(self.allocator);
-
-        var adapt_buf: [4096]u8 = undefined;
-        const deprecated_writer = response_body.writer(self.allocator);
-        var adapter = deprecated_writer.adaptToNewApi(&adapt_buf);
+        var response_body: std.Io.Writer.Allocating = .init(self.allocator);
+        defer response_body.deinit();
 
         const extra_headers = [_]std.http.Header{
             .{ .name = "Range", .value = range_str },
@@ -2652,7 +2774,7 @@ pub const Session = struct {
 
         const result = client.fetch(.{
             .location = .{ .url = url },
-            .response_writer = &adapter.new_interface,
+            .response_writer = &response_body.writer,
             .extra_headers = &extra_headers,
         }) catch return false;
 
@@ -2668,13 +2790,7 @@ pub const Session = struct {
         }
         if (result.status != .partial_content and result.status != .ok) return false;
 
-        // Flush remaining buffered data from the adapter
-        const buffered = adapter.new_interface.buffered();
-        if (buffered.len > 0) {
-            response_body.appendSlice(self.allocator, buffered) catch return false;
-        }
-
-        const data = response_body.items;
+        const data = response_body.written();
         if (data.len != plen) return false;
 
         // Verify SHA-1
@@ -2706,11 +2822,13 @@ pub const Session = struct {
         // stdout is piped to a log file or another process, the carriage-return
         // redraws are noise -- and a reader that doesn't promptly drain stdout
         // could fill the pipe and block our single-threaded event loop.
-        const stdout_file = std.fs.File.stdout();
-        if (!std.posix.isatty(stdout_file.handle)) return;
+        const stdout_file = std.Io.File.stdout();
+        if (!(stdout_file.isTty(self.io) catch false)) return;
 
-        const stdout = stdout_file.deprecatedWriter();
-        const now = std.time.timestamp();
+        var stdout_buffer: [0]u8 = .{};
+        var stdout_writer = stdout_file.writer(self.io, &stdout_buffer);
+        const stdout = &stdout_writer.interface;
+        const now = std.Io.Clock.real.now(self.io).toSeconds();
         const have = self.our_bitfield.count();
         const pct = if (self.num_pieces > 0) (have * 100) / self.num_pieces else 0;
 

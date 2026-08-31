@@ -57,7 +57,7 @@ pub const MessageId = enum(u8) {
     extended = 20, // BEP 10
 
     pub fn fromByte(b: u8) ParseError!MessageId {
-        return std.meta.intToEnum(MessageId, b) catch return error.UnknownMessageId;
+        return std.enums.fromInt(MessageId, b) orelse return error.UnknownMessageId;
     }
 };
 

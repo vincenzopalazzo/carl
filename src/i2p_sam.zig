@@ -26,6 +26,11 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
 
+const Net = std.Io.net;
+const Stream = Net.Stream;
+const HostName = Net.HostName;
+const IpAddress = Net.IpAddress;
+
 const log = std.log.scoped(.i2p);
 
 pub const SamError = error{
@@ -73,39 +78,86 @@ pub fn parseUrl(url: []const u8) SamError!Bridge {
     return .{ .host = rest, .port = default_port };
 }
 
-// --- low-level socket helpers (blocking, bounded; mirrors proxy.zig) ---
+fn resolveIp4(
+    io: std.Io,
+    host: []const u8,
+    port: u16,
+) SamError!IpAddress {
+    const host_name =
+        HostName.init(host) catch return error.ConnectFailed;
 
-fn dial(allocator: Allocator, bridge: Bridge) SamError!std.net.Stream {
-    const list = std.net.getAddressList(allocator, bridge.host, bridge.port) catch
-        return error.ConnectFailed;
-    defer list.deinit();
-    var target: ?std.net.Address = null;
-    for (list.addrs) |a| {
-        if (a.any.family == posix.AF.INET) {
-            target = a;
-            break;
+    var canonical_name_buffer: [HostName.max_len]u8 = undefined;
+    var lookup_buffer: [16]HostName.LookupResult = undefined;
+    var lookup_queue: std.Io.Queue(HostName.LookupResult) =
+        .init(&lookup_buffer);
+
+    host_name.lookup(io, &lookup_queue, .{
+        .port = port,
+        .canonical_name_buffer = &canonical_name_buffer,
+    }) catch return error.ConnectFailed;
+
+    while (lookup_queue.getOneUncancelable(io)) |result| {
+        switch (result) {
+            .address => |address| switch (address) {
+                .ip4 => return address,
+                .ip6 => {},
+            },
+            .canonical_name => {},
         }
+    } else |err| switch (err) {
+        error.Closed => {},
     }
-    const addr = target orelse return error.ConnectFailed;
 
-    const sock = posix.socket(
-        posix.AF.INET,
-        posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
-        posix.IPPROTO.TCP,
-    ) catch return error.SocketFailed;
-    errdefer posix.close(sock);
-
-    const tv = posix.timeval{ .sec = @intCast(timeout_secs), .usec = 0 };
-    posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
-    posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
-    posix.connect(sock, &addr.any, addr.getOsSockLen()) catch return error.ConnectFailed;
-    return std.net.Stream{ .handle = sock };
+    return error.ConnectFailed;
 }
 
-fn writeAll(stream: std.net.Stream, bytes: []const u8) SamError!void {
+// --- low-level socket helpers (blocking, bounded; mirrors proxy.zig) ---
+
+fn dial(io: std.Io, bridge: Bridge) SamError!Stream {
+    const addr =
+        resolveIp4(io, bridge.host, bridge.port) catch
+            return error.ConnectFailed;
+
+    const stream = addr.connect(io, .{
+        .mode = .stream,
+    }) catch return error.ConnectFailed;
+
+    const tv = std.c.timeval{
+        .sec = @intCast(timeout_secs),
+        .usec = 0,
+    };
+
+    _ = std.c.setsockopt(
+        stream.socket.handle,
+        std.c.SOL.SOCKET,
+        std.c.SO.SNDTIMEO,
+        &tv,
+        @intCast(@sizeOf(std.c.timeval)),
+    );
+
+    _ = std.c.setsockopt(
+        stream.socket.handle,
+        std.c.SOL.SOCKET,
+        std.c.SO.RCVTIMEO,
+        &tv,
+        @intCast(@sizeOf(std.c.timeval)),
+    );
+
+    return stream;
+}
+
+fn writeAll(
+    io: std.Io,
+    stream: Stream,
+    bytes: []const u8,
+) SamError!void {
+    var write_buffer: [0]u8 = .{};
+    var writer = stream.writer(io, &write_buffer);
+
     var off: usize = 0;
     while (off < bytes.len) {
-        const n = stream.write(bytes[off..]) catch return error.HandshakeFailed;
+        const n = writer.interface.write(bytes[off..]) catch return error.HandshakeFailed;
+
         if (n == 0) return error.HandshakeFailed;
         off += n;
     }
@@ -114,18 +166,35 @@ fn writeAll(stream: std.net.Stream, bytes: []const u8) SamError!void {
 /// Read a single newline-terminated SAM reply line into `buf` (without the
 /// trailing CR/LF). Reads one byte at a time so we never consume past the line
 /// into the subsequent data stream. Errors if the line exceeds `buf`.
-fn readLine(stream: std.net.Stream, buf: []u8) SamError![]u8 {
+fn readLine(
+    io: std.Io,
+    stream: Stream,
+    buf: []u8,
+) SamError![]u8 {
+    var read_buffer: [0]u8 = .{};
+    var reader = stream.reader(io, &read_buffer);
+
     var i: usize = 0;
+
     while (true) {
         if (i >= buf.len) return error.InvalidResponse;
+
         var b: [1]u8 = undefined;
-        const n = stream.read(&b) catch return error.HandshakeFailed;
-        if (n == 0) return error.HandshakeFailed; // EOF before newline
+
+        const n = reader.interface.readSliceShort(&b) catch
+            return error.HandshakeFailed;
+
+        if (n == 0)
+            return error.HandshakeFailed;
+
         if (b[0] == '\n') break;
+
         buf[i] = b[0];
         i += 1;
     }
+
     if (i > 0 and buf[i - 1] == '\r') i -= 1;
+
     return buf[0..i];
 }
 
@@ -172,13 +241,15 @@ pub fn parseVersion(s: []const u8) Version {
 
 /// Perform the SAM `HELLO` version handshake and return the version the bridge
 /// negotiated (the highest within our MIN..MAX it supports).
-fn hello(stream: std.net.Stream) SamError!Version {
-    try writeAll(stream, "HELLO VERSION MIN=3.0 MAX=3.3\n");
+fn hello(io: std.Io, stream: Stream) SamError!Version {
+    try writeAll(io, stream, "HELLO VERSION MIN=3.0 MAX=3.3\n");
+
     var buf: [256]u8 = undefined;
-    const line = try readLine(stream, &buf);
+    const line = try readLine(io, stream, &buf);
+
     if (!std.mem.startsWith(u8, line, "HELLO REPLY") or !samOk(line))
         return error.HandshakeFailed;
-    // A 3.x bridge always echoes VERSION; default to 3.0 if it somehow doesn't.
+
     return parseVersion(samField(line, "VERSION") orelse "3.0");
 }
 
@@ -209,52 +280,149 @@ pub const Health = enum {
 /// `SO_SNDTIMEO` does not bound `connect()` on macOS), then a `HELLO VERSION`
 /// handshake. Never creates a session or leaks; greeting only. Mirrors
 /// `proxy.classifySocks5`.
-pub fn classifyBridge(allocator: Allocator, bridge: Bridge, timeout_s: u32) Health {
-    const list = std.net.getAddressList(allocator, bridge.host, bridge.port) catch
-        return .not_running;
-    defer list.deinit();
-    var target: ?std.net.Address = null;
-    for (list.addrs) |a| {
-        if (a.any.family == posix.AF.INET) {
-            target = a;
-            break;
-        }
-    }
-    const addr = target orelse return .not_running;
+pub fn classifyBridge(
+    io: std.Io,
+    bridge: Bridge,
+    timeout_s: u32,
+) Health {
+    const addr =
+        resolveIp4(io, bridge.host, bridge.port) catch
+            return .not_running;
 
-    const timeout_ms: i32 = if (timeout_s > 600) 600_000 else @intCast(timeout_s * 1000);
-    const sock = posix.socket(
-        posix.AF.INET,
-        posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
-        posix.IPPROTO.TCP,
-    ) catch return .timeout;
-    defer posix.close(sock);
+    const timeout_ms: i32 =
+        if (timeout_s > 600) 600_000 else @intCast(timeout_s * 1000);
 
-    const flags = posix.fcntl(sock, posix.F.GETFL, 0) catch return .timeout;
-    var o: posix.O = @bitCast(@as(u32, @truncate(flags)));
+    const sock = std.c.socket(
+        std.posix.AF.INET,
+        std.posix.SOCK.STREAM,
+        std.posix.IPPROTO.TCP,
+    );
+
+    if (sock < 0)
+        return .timeout;
+
+    defer _ = std.c.close(sock);
+
+    _ = std.c.fcntl(
+        sock,
+        std.c.F.SETFD,
+        @as(c_int, std.posix.FD_CLOEXEC),
+    );
+
+    const flags = std.c.fcntl(
+        sock,
+        std.c.F.GETFL,
+        @as(c_int, 0),
+    );
+
+    if (flags < 0)
+        return .timeout;
+
+    var o: std.c.O = @bitCast(@as(u32, @intCast(flags)));
     o.NONBLOCK = true;
-    _ = posix.fcntl(sock, posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
 
-    posix.connect(sock, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
-        error.WouldBlock => {
-            var pfd = [_]posix.pollfd{.{ .fd = sock, .events = posix.POLL.OUT, .revents = 0 }};
-            const ready = posix.poll(&pfd, timeout_ms) catch return .timeout;
-            if (ready == 0) return .timeout;
-            posix.getsockoptError(sock) catch |e| return if (e == error.ConnectionRefused) .not_running else .timeout;
+    _ = std.c.fcntl(
+        sock,
+        std.c.F.SETFL,
+        @as(c_int, @bitCast(o)),
+    );
+
+    const ip4 = switch (addr) {
+        .ip4 => |a| a,
+        .ip6 => return .not_running,
+    };
+
+    const posix_addr: std.posix.sockaddr.in = .{
+        .port = std.mem.nativeToBig(u16, ip4.port),
+        .addr = @bitCast(ip4.bytes),
+    };
+
+    const rc = std.c.connect(
+        sock,
+        @ptrCast(&posix_addr),
+        @sizeOf(std.posix.sockaddr.in),
+    );
+
+    if (rc != 0) switch (std.posix.errno(rc)) {
+        .AGAIN, .INPROGRESS => {
+            var pfd = [_]std.posix.pollfd{.{
+                .fd = sock,
+                .events = std.posix.POLL.OUT,
+                .revents = 0,
+            }};
+
+            const ready = std.posix.poll(
+                &pfd,
+                timeout_ms,
+            ) catch return .timeout;
+
+            if (ready == 0)
+                return .timeout;
+
+            var socket_error: c_int = 0;
+            var socket_error_len: std.c.socklen_t = @sizeOf(c_int);
+
+            if (std.c.getsockopt(
+                sock,
+                std.c.SOL.SOCKET,
+                std.c.SO.ERROR,
+                &socket_error,
+                &socket_error_len,
+            ) != 0) {
+                return .timeout;
+            }
+
+            if (socket_error != 0) {
+                if (socket_error == @intFromEnum(std.c.E.CONNREFUSED))
+                    return .not_running;
+
+                return .timeout;
+            }
         },
-        error.ConnectionRefused => return .not_running,
+        .CONNREFUSED => return .not_running,
         else => return .timeout,
     };
 
-    // Connected. Back to blocking with bounded reads/writes for the handshake.
+    // Connected. Restore blocking mode for the SAM greeting.
     o.NONBLOCK = false;
-    _ = posix.fcntl(sock, posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
-    const tv = posix.timeval{ .sec = @intCast(timeout_s), .usec = 0 };
-    posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
-    posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
 
-    const stream = std.net.Stream{ .handle = sock };
-    _ = hello(stream) catch return .handshake_failed;
+    _ = std.c.fcntl(
+        sock,
+        std.c.F.SETFL,
+        @as(c_int, @bitCast(o)),
+    );
+
+    const tv = std.c.timeval{
+        .sec = @intCast(timeout_s),
+        .usec = 0,
+    };
+
+    _ = std.c.setsockopt(
+        sock,
+        std.c.SOL.SOCKET,
+        std.c.SO.SNDTIMEO,
+        &tv,
+        @intCast(@sizeOf(std.c.timeval)),
+    );
+
+    _ = std.c.setsockopt(
+        sock,
+        std.c.SOL.SOCKET,
+        std.c.SO.RCVTIMEO,
+        &tv,
+        @intCast(@sizeOf(std.c.timeval)),
+    );
+
+    const stream: Stream = .{
+        .socket = .{
+            .handle = sock,
+            .address = addr,
+        },
+    };
+
+    _ = hello(io, stream) catch
+        return .handshake_failed;
+
     return .ok;
 }
 
@@ -330,6 +498,7 @@ pub fn b32Address(allocator: Allocator, dest_b64: []const u8) SamError![]u8 {
 /// A live SAM STREAM session. Owns the control connection that keeps the I2P
 /// session (and our destination) alive — closing it tears the session down.
 pub const Session = struct {
+    io: std.Io,
     allocator: Allocator,
     bridge: Bridge,
     id: []u8,
@@ -337,10 +506,10 @@ pub const Session = struct {
     /// the full private key, so persisting this value and passing it back as
     /// `.{ .priv = ... }` recreates the same destination (stable `.b32.i2p`).
     destination: []u8,
-    control: std.net.Stream,
+    control: Stream,
     /// Open `STREAM FORWARD` registration (inbound). The bridge cancels the
     /// forward when this socket closes, so it lives as long as the session.
-    forward_conn: ?std.net.Stream = null,
+    forward_conn: ?Stream = null,
 
     /// Which destination keys back the session: a fresh transient one (the
     /// bridge generates Ed25519 keys and returns the private key), or a
@@ -352,8 +521,19 @@ pub const Session = struct {
 
     /// Create a SAM STREAM session with a transient destination. `id_prefix` is
     /// a human label; a random suffix makes the SAM session id unique.
-    pub fn create(allocator: Allocator, bridge: Bridge, id_prefix: []const u8) SamError!Session {
-        return createWithDest(allocator, bridge, id_prefix, .transient);
+    pub fn create(
+        io: std.Io,
+        allocator: Allocator,
+        bridge: Bridge,
+        id_prefix: []const u8,
+    ) SamError!Session {
+        return createWithDest(
+            io,
+            allocator,
+            bridge,
+            id_prefix,
+            .transient,
+        );
     }
 
     /// Create a SAM STREAM session backed by `dest`. With `.transient` the
@@ -362,17 +542,18 @@ pub const Session = struct {
     /// with `.priv` the session reuses persisted keys and is reachable at the
     /// same `.b32.i2p` address across restarts.
     pub fn createWithDest(
+        io: std.Io,
         allocator: Allocator,
         bridge: Bridge,
         id_prefix: []const u8,
         dest: Dest,
     ) SamError!Session {
-        var control = try dial(allocator, bridge);
-        errdefer control.close();
-        _ = try hello(control); // control connection sends no version-gated commands
+        var control = try dial(io, bridge);
+        errdefer control.close(io);
+        _ = try hello(io, control); // control connection sends no version-gated commands
 
         var rnd: [4]u8 = undefined;
-        std.crypto.random.bytes(&rnd);
+        io.random(&rnd);
         const suffix = std.mem.readInt(u32, &rnd, .little);
         const id = std.fmt.allocPrint(allocator, "{s}-{x:0>8}", .{ id_prefix, suffix }) catch
             return error.OutOfMemory;
@@ -392,16 +573,17 @@ pub const Session = struct {
         };
         const cmd_buf = cmd catch return error.OutOfMemory;
         defer allocator.free(cmd_buf);
-        try writeAll(control, cmd_buf);
+        try writeAll(io, control, cmd_buf);
 
         var buf: [4096]u8 = undefined; // destination keys are long
-        const line = try readLine(control, &buf);
+        const line = try readLine(io, control, &buf);
         if (!std.mem.startsWith(u8, line, "SESSION STATUS") or !samOk(line))
             return error.SessionFailed;
         const dest_b64 = samField(line, "DESTINATION") orelse return error.SessionFailed;
         const destination = allocator.dupe(u8, dest_b64) catch return error.OutOfMemory;
 
         return .{
+            .io = io,
             .allocator = allocator,
             .bridge = bridge,
             .id = id,
@@ -411,8 +593,8 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: *Session) void {
-        if (self.forward_conn) |f| f.close();
-        self.control.close();
+        if (self.forward_conn) |f| f.close(self.io);
+        self.control.close(self.io);
         self.allocator.free(self.id);
         self.allocator.free(self.destination);
     }
@@ -426,9 +608,9 @@ pub const Session = struct {
     /// `deinit`; closing it cancels the forward. One forward per session.
     pub fn forward(self: *Session, port: u16) SamError!void {
         if (self.forward_conn != null) return error.StreamFailed; // already armed
-        var stream = try dial(self.allocator, self.bridge);
-        errdefer stream.close();
-        _ = try hello(stream);
+        var stream = try dial(self.io, self.bridge);
+        errdefer stream.close(self.io);
+        _ = try hello(self.io, stream);
 
         const cmd = std.fmt.allocPrint(
             self.allocator,
@@ -436,10 +618,10 @@ pub const Session = struct {
             .{ self.id, port },
         ) catch return error.OutOfMemory;
         defer self.allocator.free(cmd);
-        try writeAll(stream, cmd);
+        try writeAll(self.io, stream, cmd);
 
         var buf: [512]u8 = undefined;
-        const line = try readLine(stream, &buf);
+        const line = try readLine(self.io, stream, &buf);
         if (!std.mem.startsWith(u8, line, "STREAM STATUS") or !samOk(line))
             return error.StreamFailed;
         self.forward_conn = stream;
@@ -456,10 +638,14 @@ pub const Session = struct {
     /// 3.0/3.1 bridge can have the CONNECT rejected, so on older bridges we omit
     /// it and dial the destination's default port (best effort). `port == 0`
     /// always omits it.
-    pub fn connect(self: *Session, dest: []const u8, port: u16) SamError!std.net.Stream {
-        var stream = try dial(self.allocator, self.bridge);
-        errdefer stream.close();
-        const ver = try hello(stream);
+    pub fn connect(
+        self: *Session,
+        dest: []const u8,
+        port: u16,
+    ) SamError!Stream {
+        var stream = try dial(self.io, self.bridge);
+        errdefer stream.close(self.io);
+        const ver = try hello(self.io, stream);
 
         const cmd = if (port != 0 and ver.atLeast(3, 2))
             std.fmt.allocPrint(
@@ -475,10 +661,10 @@ pub const Session = struct {
             );
         const cmd_buf = cmd catch return error.OutOfMemory;
         defer self.allocator.free(cmd_buf);
-        try writeAll(stream, cmd_buf);
+        try writeAll(self.io, stream, cmd_buf);
 
         var buf: [512]u8 = undefined;
-        const line = try readLine(stream, &buf);
+        const line = try readLine(self.io, stream, &buf);
         if (!std.mem.startsWith(u8, line, "STREAM STATUS") or !samOk(line))
             return error.StreamFailed;
         // On RESULT=OK the rest of the socket is the bidirectional peer stream.
@@ -531,14 +717,21 @@ test "i2p_sam: parseUrl forms" {
 
 // --- mock SAM bridge: exercises the real wire format end-to-end ---
 
-fn mockHandleConn(stream: std.net.Stream, version: []const u8) void {
-    defer stream.close();
+fn mockHandleConn(stream: std.Io.net.Stream, version: []const u8) void {
+    defer stream.close(std.testing.io);
     var buf: [4096]u8 = undefined;
-    _ = readLine(stream, &buf) catch return; // HELLO VERSION
+    _ = readLine(std.testing.io, stream, &buf) catch return;
+
     var hbuf: [64]u8 = undefined;
-    const hello_reply = std.fmt.bufPrint(&hbuf, "HELLO REPLY RESULT=OK VERSION={s}\n", .{version}) catch return;
-    writeAll(stream, hello_reply) catch return;
-    const cmd = readLine(stream, &buf) catch return;
+    const hello_reply = std.fmt.bufPrint(
+        &hbuf,
+        "HELLO REPLY RESULT=OK VERSION={s}\n",
+        .{version},
+    ) catch return;
+
+    writeAll(std.testing.io, stream, hello_reply) catch return;
+
+    const cmd = readLine(std.testing.io, stream, &buf) catch return;
     if (std.mem.startsWith(u8, cmd, "SESSION CREATE")) {
         // Echo a persisted private key back verbatim so the stable-destination
         // round-trip is exercised; otherwise hand out a canned transient dest.
@@ -546,20 +739,20 @@ fn mockHandleConn(stream: std.net.Stream, version: []const u8) void {
             if (!std.mem.eql(u8, d, "TRANSIENT")) {
                 var rbuf: [256]u8 = undefined;
                 const reply = std.fmt.bufPrint(&rbuf, "SESSION STATUS RESULT=OK DESTINATION={s}\n", .{d}) catch return;
-                writeAll(stream, reply) catch return;
+                writeAll(std.testing.io, stream, reply) catch return;
                 return;
             }
         }
-        writeAll(stream, "SESSION STATUS RESULT=OK DESTINATION=ZmFrZWRlc3Q=\n") catch return;
+        writeAll(std.testing.io, stream, "SESSION STATUS RESULT=OK DESTINATION=ZmFrZWRlc3Q=\n") catch return;
     } else if (std.mem.startsWith(u8, cmd, "STREAM FORWARD")) {
         // A real bridge requires ID + PORT; assert both are present.
         const ok = std.mem.indexOf(u8, cmd, "ID=") != null and
             std.mem.indexOf(u8, cmd, "PORT=") != null;
-        writeAll(stream, if (ok) "STREAM STATUS RESULT=OK\n" else "STREAM STATUS RESULT=I2P_ERROR\n") catch return;
+        writeAll(std.testing.io, stream, if (ok) "STREAM STATUS RESULT=OK\n" else "STREAM STATUS RESULT=I2P_ERROR\n") catch return;
     } else if (std.mem.startsWith(u8, cmd, "STREAM CONNECT")) {
         // Reject any destination containing "bad" to exercise the error path.
         if (std.mem.indexOf(u8, cmd, "bad") != null) {
-            writeAll(stream, "STREAM STATUS RESULT=CANT_REACH_PEER\n") catch return;
+            writeAll(std.testing.io, stream, "STREAM STATUS RESULT=CANT_REACH_PEER\n") catch return;
         } else {
             // The success-path tests dial with a non-zero port. TO_PORT is SAM
             // 3.2+, so it must appear on the wire iff the negotiated version is
@@ -567,17 +760,17 @@ fn mockHandleConn(stream: std.net.Stream, version: []const u8) void {
             const has_to_port = std.mem.indexOf(u8, cmd, "TO_PORT=6881") != null;
             const want_to_port = parseVersion(version).atLeast(3, 2);
             if (has_to_port != want_to_port) {
-                writeAll(stream, "STREAM STATUS RESULT=I2P_ERROR\n") catch return;
+                writeAll(std.testing.io, stream, "STREAM STATUS RESULT=I2P_ERROR\n") catch return;
                 return;
             }
-            writeAll(stream, "STREAM STATUS RESULT=OK\n") catch return;
-            writeAll(stream, "BTpayload") catch return; // simulated peer data
+            writeAll(std.testing.io, stream, "STREAM STATUS RESULT=OK\n") catch return;
+            writeAll(std.testing.io, stream, "BTpayload") catch return; // simulated peer data
         }
     }
 }
 
 const MockCtx = struct {
-    server: *std.net.Server,
+    server: *std.Io.net.Server,
     stop: std.atomic.Value(bool),
     /// SAM version the mock bridge advertises in its HELLO REPLY.
     version: []const u8 = "3.3",
@@ -589,20 +782,27 @@ fn mockRun(ctx: *MockCtx) void {
     // portable way to make the thread exit (neither closing the listener nor
     // SO_RCVTIMEO reliably unblocks a parked accept() across Linux + macOS) and
     // mirrors the daemon's own serve loop.
-    var pfd = [_]std.posix.pollfd{.{ .fd = ctx.server.stream.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    var pfd = [_]std.posix.pollfd{.{ .fd = ctx.server.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
     while (!ctx.stop.load(.acquire)) {
         const ready = std.posix.poll(&pfd, 200) catch 0;
         if (ready == 0) continue; // timeout → re-check stop
-        const conn = ctx.server.accept() catch continue;
-        mockHandleConn(conn.stream, ctx.version);
+        const conn = ctx.server.accept(std.testing.io) catch continue;
+        mockHandleConn(conn, ctx.version);
     }
 }
 
 test "i2p_sam: session create + stream connect against a mock SAM bridge" {
     const allocator = testing.allocator;
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
-    var server = try addr.listen(.{ .reuse_address = true });
-    const port = server.listen_address.getPort();
+    const addr: std.Io.net.IpAddress = .{
+        .ip4 = .loopback(0),
+    };
+
+    var server = try addr.listen(
+        std.testing.io,
+        .{ .reuse_address = true },
+    );
+
+    const port = server.socket.address.getPort();
     var ctx = MockCtx{ .server = &server, .stop = std.atomic.Value(bool).init(false) };
     const t = try std.Thread.spawn(.{}, mockRun, .{&ctx});
     // Stop the thread (it polls `stop` between accept timeouts), join, then close
@@ -610,12 +810,12 @@ test "i2p_sam: session create + stream connect against a mock SAM bridge" {
     defer {
         ctx.stop.store(true, .release);
         t.join();
-        server.deinit();
+        server.deinit(std.testing.io);
     }
 
     const bridge = Bridge{ .host = "127.0.0.1", .port = port };
 
-    var sess = try Session.create(allocator, bridge, "carltest");
+    var sess = try Session.create(std.testing.io, allocator, bridge, "carltest");
     defer sess.deinit();
     try testing.expectEqualStrings("ZmFrZWRlc3Q=", sess.destination);
     try testing.expect(std.mem.startsWith(u8, sess.id, "carltest-"));
@@ -625,13 +825,16 @@ test "i2p_sam: session create + stream connect against a mock SAM bridge" {
     // simulated peer bytes.
     var peer = try sess.connect("examplepeer.b32.i2p", 6881);
     var rbuf: [32]u8 = undefined;
+    var read_buffer: [0]u8 = .{};
+    var reader = peer.reader(std.testing.io, &read_buffer);
+
     var got: usize = 0;
     while (got < "BTpayload".len) {
-        const n = peer.read(rbuf[got..]) catch break;
+        const n = reader.interface.readSliceShort(rbuf[got..]) catch break;
         if (n == 0) break;
         got += n;
     }
-    peer.close();
+    peer.close(std.testing.io);
     try testing.expectEqualStrings("BTpayload", rbuf[0..got]);
 
     // Failed CONNECT surfaces as StreamFailed (port 0 → no TO_PORT on the wire).
@@ -710,9 +913,16 @@ test "i2p_sam: parseVersion + atLeast" {
 
 test "i2p_sam: TO_PORT omitted on a pre-3.2 bridge (best-effort default port)" {
     const allocator = testing.allocator;
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
-    var server = try addr.listen(.{ .reuse_address = true });
-    const port = server.listen_address.getPort();
+    const addr: std.Io.net.IpAddress = .{
+        .ip4 = .loopback(0),
+    };
+
+    var server = try addr.listen(
+        std.testing.io,
+        .{ .reuse_address = true },
+    );
+
+    const port = server.socket.address.getPort();
     // 3.1 bridge: the mock fails the CONNECT if TO_PORT appears, so a passing
     // test proves we omit TO_PORT (rather than send an unsupported parameter).
     var ctx = MockCtx{ .server = &server, .stop = std.atomic.Value(bool).init(false), .version = "3.1" };
@@ -720,61 +930,77 @@ test "i2p_sam: TO_PORT omitted on a pre-3.2 bridge (best-effort default port)" {
     defer {
         ctx.stop.store(true, .release);
         t.join();
-        server.deinit();
+        server.deinit(std.testing.io);
     }
 
     const bridge = Bridge{ .host = "127.0.0.1", .port = port };
-    var sess = try Session.create(allocator, bridge, "carltest");
+    var sess = try Session.create(std.testing.io, allocator, bridge, "carltest");
     defer sess.deinit();
 
     // Dials with a non-zero port; on a 3.1 bridge it must still succeed with
     // TO_PORT omitted.
     var peer = try sess.connect("examplepeer.b32.i2p", 6881);
-    peer.close();
+    peer.close(std.testing.io);
 }
 
 test "i2p_sam: classifyBridge reports ok against a SAM bridge, not_running on a dead port" {
-    const allocator = testing.allocator;
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
-    var server = try addr.listen(.{ .reuse_address = true });
-    const port = server.listen_address.getPort();
+    const addr: std.Io.net.IpAddress = .{
+        .ip4 = .loopback(0),
+    };
+
+    var server = try addr.listen(
+        std.testing.io,
+        .{ .reuse_address = true },
+    );
+
+    const port = server.socket.address.getPort();
     var ctx = MockCtx{ .server = &server, .stop = std.atomic.Value(bool).init(false) };
     const t = try std.Thread.spawn(.{}, mockRun, .{&ctx});
     defer {
         ctx.stop.store(true, .release);
         t.join();
-        server.deinit();
+        server.deinit(std.testing.io);
     }
 
     // Live mock bridge → ok (it answers HELLO with RESULT=OK).
-    try testing.expectEqual(Health.ok, classifyBridge(allocator, .{ .host = "127.0.0.1", .port = port }, 3));
+    try testing.expectEqual(Health.ok, classifyBridge(std.testing.io, .{ .host = "127.0.0.1", .port = port }, 3));
 
     // A port with nothing listening → not_running (connection refused). Bind and
     // immediately release a port to get one that's almost certainly free.
     const probe_port = blk: {
-        var s = try addr.listen(.{ .reuse_address = true });
-        const p = s.listen_address.getPort();
-        s.deinit();
+        var s = try addr.listen(
+            std.testing.io,
+            .{ .reuse_address = true },
+        );
+        const p = s.socket.address.getPort();
+        s.deinit(std.testing.io);
         break :blk p;
     };
-    try testing.expectEqual(Health.not_running, classifyBridge(allocator, .{ .host = "127.0.0.1", .port = probe_port }, 2));
+    try testing.expectEqual(Health.not_running, classifyBridge(std.testing.io, .{ .host = "127.0.0.1", .port = probe_port }, 2));
 }
 
 test "i2p_sam: STREAM FORWARD arms inbound and is idempotent-guarded" {
     const allocator = testing.allocator;
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
-    var server = try addr.listen(.{ .reuse_address = true });
-    const port = server.listen_address.getPort();
+    const addr: std.Io.net.IpAddress = .{
+        .ip4 = .loopback(0),
+    };
+
+    var server = try addr.listen(
+        std.testing.io,
+        .{ .reuse_address = true },
+    );
+
+    const port = server.socket.address.getPort();
     var ctx = MockCtx{ .server = &server, .stop = std.atomic.Value(bool).init(false) };
     const t = try std.Thread.spawn(.{}, mockRun, .{&ctx});
     defer {
         ctx.stop.store(true, .release);
         t.join();
-        server.deinit();
+        server.deinit(std.testing.io);
     }
 
     const bridge = Bridge{ .host = "127.0.0.1", .port = port };
-    var sess = try Session.create(allocator, bridge, "carlseed");
+    var sess = try Session.create(std.testing.io, allocator, bridge, "carlseed");
     defer sess.deinit();
 
     // First FORWARD succeeds and the registration socket is retained.
@@ -788,22 +1014,35 @@ test "i2p_sam: STREAM FORWARD arms inbound and is idempotent-guarded" {
 
 test "i2p_sam: createWithDest reuses a persisted private key (stable address)" {
     const allocator = testing.allocator;
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
-    var server = try addr.listen(.{ .reuse_address = true });
-    const port = server.listen_address.getPort();
+    const addr: std.Io.net.IpAddress = .{
+        .ip4 = .loopback(0),
+    };
+
+    var server = try addr.listen(
+        std.testing.io,
+        .{ .reuse_address = true },
+    );
+
+    const port = server.socket.address.getPort();
     var ctx = MockCtx{ .server = &server, .stop = std.atomic.Value(bool).init(false) };
     const t = try std.Thread.spawn(.{}, mockRun, .{&ctx});
     defer {
         ctx.stop.store(true, .release);
         t.join();
-        server.deinit();
+        server.deinit(std.testing.io);
     }
 
     const bridge = Bridge{ .host = "127.0.0.1", .port = port };
     // The mock echoes a persisted DESTINATION back verbatim, so the session's
     // stored destination must equal what we passed in (proving the key is
     // threaded into SESSION CREATE rather than ignored).
-    var sess = try Session.createWithDest(allocator, bridge, "carlseed", .{ .priv = "cGVyc2lzdGVk" });
+    var sess = try Session.createWithDest(
+        std.testing.io,
+        allocator,
+        bridge,
+        "carlseed",
+        .{ .priv = "cGVyc2lzdGVk" },
+    );
     defer sess.deinit();
     try testing.expectEqualStrings("cGVyc2lzdGVk", sess.destination);
 }
