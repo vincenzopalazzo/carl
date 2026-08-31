@@ -240,11 +240,34 @@ fn open_daemon_log() -> SharedLog {
         let dir = config.join("carl");
         std::fs::create_dir_all(&dir).ok()?;
         let path = dir.join("daemon.log");
+        let old = dir.join("daemon.log.old");
         const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
         if std::fs::metadata(&path).map(|m| m.len() > MAX_LOG_BYTES).unwrap_or(false) {
-            let _ = std::fs::rename(&path, dir.join("daemon.log.old"));
+            let _ = std::fs::rename(&path, &old);
         }
-        std::fs::OpenOptions::new().create(true).append(true).open(path).ok()
+        // 0600: the banner includes `token: <hex>` and debug lines include
+        // peer IPs / tracker URLs. A world-readable log is a leak.
+        // Fail closed: if we cannot tighten an existing file, do not write
+        // secrets into it (review on PR #99). Also tighten daemon.log.old
+        // even when we did not rotate this launch.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let perms = std::fs::Permissions::from_mode(0o600);
+            if old.exists() {
+                std::fs::set_permissions(&old, perms.clone()).ok()?;
+            }
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(&path)
+                .ok()?;
+            file.set_permissions(perms).ok()?;
+            Some(file)
+        }
+        #[cfg(not(unix))]
+        std::fs::OpenOptions::new().create(true).append(true).open(&path).ok()
     })();
     std::sync::Arc::new(std::sync::Mutex::new(file))
 }
