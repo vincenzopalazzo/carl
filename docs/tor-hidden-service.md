@@ -167,7 +167,10 @@ Carl logs `added N peers from nostr` when kind 30078 events are found.
 
 - Public IPv4 in kind 30078 (`--external-ip` forbidden).
 - BitTorrent listener on `0.0.0.0` (loopback only).
-- Tracker and DHT announces (no real IP leaked to trackers).
+- Tracker and DHT announces to **clearnet** trackers/DHT (no real IP leaked).
+  Dictionary hostname peers (`.onion` in BEP 3 dict `ip`) are parsed and dialed
+  over SOCKS when a proxy is set; see [beps/draft-hostname-peers.md](beps/draft-hostname-peers.md).
+  `--tor-seed` still does not announce *to* opentrackr.
 - Incoming peers from the public internet (only Tor circuits to the onion).
 - `--proxy` on seed (use Tor hidden service instead).
 

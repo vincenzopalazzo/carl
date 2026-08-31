@@ -1,6 +1,9 @@
 //! Carl's custom Nostr "peer announce" event — kind 30078, a NIP-33 parameterized
 //! replaceable event.
 //!
+//! The `host` / `port` tags are the same strings a BEP 3 dictionary tracker
+//! peer carries in `ip` / `port`. See docs/beps/nip-30078-hostname.md.
+//!
 //! Each seeder publishes one of these per torrent. The `d` tag carries the
 //! V1 infohash hex, making the event replaceable per (pubkey, infohash) so
 //! seeders can refresh their endpoint without spamming the relay.
