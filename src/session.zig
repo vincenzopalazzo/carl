@@ -46,6 +46,24 @@ const peer_rediscovery_interval_secs: i64 = 45;
 /// enough that one silent peer can't hold blocks hostage while others could
 /// fetch them.
 const request_timeout_secs: i64 = 60;
+/// After a SOCKS CONNECT is rejected (or a proxied connect times out), wait
+/// this long before retrying the same (ip, port). Without this, replenish
+/// every 3s re-dials the same dead hosts through Tor (up to 10 circuits per
+/// burst), crowding the one working seed's circuit.
+const connect_fail_cooldown_secs: i64 = 120;
+/// Hard cap on simultaneous SOCKS CONNECT circuits. Tor serializes circuit
+/// builds; a burst of 10 CONNECTs starves an established download.
+const max_socks_inflight: usize = 3;
+/// Replenish records at most 10 unique failures every 3s (the proxied
+/// `max_attempts` cap). Hold that rate for the full cooldown so a
+/// still-cooling host is not overwritten (review on PR #102).
+const connect_fail_slots: usize = 10 * (@as(usize, @intCast(connect_fail_cooldown_secs)) / 3 + 1);
+
+const ConnectFail = struct {
+    ip: [4]u8 = .{ 0, 0, 0, 0 },
+    port: u16 = 0,
+    retry_after: i64 = 0,
+};
 
 /// Periodic peer re-discovery hook. The session run loop calls `run(ctx)` on
 /// its own thread when the transfer has zero peers, so the callback can safely
@@ -227,6 +245,10 @@ pub const Session = struct {
     // Throttle for peer replenishment (maintenance). Connecting is cheap (async),
     // but rate-limiting avoids hammering the same unreachable hosts every tick.
     last_replenish_s: i64 = 0,
+    /// Ring of recently-failed (ip, port) → retry_after. Used only on proxied
+    /// sessions so a SOCKS CONNECT rejection is not immediately retried.
+    connect_fails: [connect_fail_slots]ConnectFail = [_]ConnectFail{.{}} ** connect_fail_slots,
+    connect_fail_next: usize = 0,
     // BEP 9 metadata bytes received this session. Counted toward the download
     // rate (and progress timestamp) so the metadata-fetch phase shows real speed
     // even though piece `downloaded` is still 0 then.
@@ -1019,6 +1041,7 @@ pub const Session = struct {
 
             if (revents & (std.posix.POLL.HUP | std.posix.POLL.ERR) != 0) {
                 if (p.state == .active) log.debug("peer dropped (HUP/ERR), idle {d}s", .{std.time.timestamp() - p.last_recv_time});
+                if (p.state == .socks_connecting) self.recordPeerConnectFail(p);
                 p.disconnect();
                 fd_idx += 1;
                 continue;
@@ -1045,6 +1068,7 @@ pub const Session = struct {
             if (p.state == .socks_connecting) {
                 if (revents & std.posix.POLL.IN != 0) {
                     p.finishProxyConnect(self.info_hash, self.peer_id) catch {
+                        self.recordPeerConnectFail(p);
                         p.disconnect();
                         fd_idx += 1;
                         continue;
@@ -2092,6 +2116,7 @@ pub const Session = struct {
                 // the connect timeout is a dead host — reclaim its poll slot so
                 // it doesn't squat against the max_peers cap.
                 if ((p.state == .connecting or p.state == .socks_connecting) and now - p.connect_started_at > p.currentConnectTimeout()) {
+                    if (p.state == .socks_connecting) self.recordPeerConnectFail(p);
                     p.disconnect();
                     i += 1;
                     continue;
@@ -2333,6 +2358,62 @@ pub const Session = struct {
         return remaining;
     }
 
+    fn ipv4Of(addr: std.net.Address) [4]u8 {
+        const ip: *const [4]u8 = @ptrCast(&addr.in.sa.addr);
+        return ip.*;
+    }
+
+    fn socksInflight(self: *const Session) usize {
+        var n: usize = 0;
+        for (self.peers.items) |p| {
+            if (p.state == .socks_connecting) n += 1;
+        }
+        return n;
+    }
+
+    fn isConnectCooling(self: *const Session, ip: [4]u8, port: u16, now: i64) bool {
+        for (self.connect_fails) |slot| {
+            if (slot.port == port and std.mem.eql(u8, &slot.ip, &ip) and now < slot.retry_after) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn recordConnectFail(self: *Session, ip: [4]u8, port: u16, now: i64) void {
+        // Refresh an existing slot so a second reject does not push a duplicate
+        // that would evict an unrelated host from the ring.
+        for (&self.connect_fails) |*slot| {
+            if (slot.port == port and std.mem.eql(u8, &slot.ip, &ip)) {
+                slot.retry_after = now + connect_fail_cooldown_secs;
+                return;
+            }
+        }
+        // Prefer empty or expired slots. If every slot is still cooling,
+        // drop this host rather than evict one whose 120s window has not
+        // elapsed — otherwise a large dead swarm would undo the cooldown.
+        var victim: ?usize = null;
+        for (self.connect_fails, 0..) |slot, i| {
+            if (slot.port == 0 or now >= slot.retry_after) {
+                victim = i;
+                break;
+            }
+        }
+        const idx = victim orelse return;
+        self.connect_fails[idx] = .{
+            .ip = ip,
+            .port = port,
+            .retry_after = now + connect_fail_cooldown_secs,
+        };
+        self.connect_fail_next = (idx + 1) % connect_fail_slots;
+    }
+
+    fn recordPeerConnectFail(self: *Session, p: *peer_mod.PeerConnection) void {
+        if (self.proxy == null) return;
+        if (p.connect_host != null) return; // onion / hostname: no IPv4 key
+        self.recordConnectFail(ipv4Of(p.address), p.address.getPort(), std.time.timestamp());
+    }
+
     fn connectToPeers(self: *Session, peer_list: []const tracker_mod.Peer) !void {
         // Clearnet connects are non-blocking (`startConnect` returns on
         // EINPROGRESS). SOCKS5/SOCKS5h finish the CONNECT *reply* on the poll
@@ -2351,10 +2432,12 @@ pub const Session = struct {
         else
             0;
 
+        const now = std.time.timestamp();
         for (0..peer_list.len) |i| {
             const tracker_peer = peer_list[(i + offset) % peer_list.len];
             if (self.peers.items.len >= max_peers) break;
             if (attempts >= max_attempts) break;
+            if (self.proxy != null and self.socksInflight() >= max_socks_inflight) break;
 
             const addr = std.net.Address.initIp4(tracker_peer.ip, tracker_peer.port);
             var already = false;
@@ -2365,6 +2448,7 @@ pub const Session = struct {
                 }
             }
             if (already) continue;
+            if (self.proxy != null and self.isConnectCooling(tracker_peer.ip, tracker_peer.port, now)) continue;
 
             attempts += 1;
 
@@ -2378,6 +2462,12 @@ pub const Session = struct {
             // via finishConnect on POLLOUT. Proxied/I2P connects still block
             // here (synchronous handshake) but are capped by max_attempts.
             p.startConnect(self.info_hash, self.peer_id) catch {
+                // SOCKS5 startConnect only dials the local proxy and sends
+                // CONNECT; the destination reply is read later in
+                // finishProxyConnect. A failure here is the proxy itself
+                // (down, greeting timeout, auth reject) — do NOT cool the
+                // tracker peer or a brief Tor restart would skip the only
+                // reachable seed for 120s (review on PR #102).
                 p.deinit();
                 self.allocator.destroy(p);
                 continue;
@@ -2999,6 +3089,77 @@ test "pickRarestPiece concentrates on the concurrent-piece cap" {
 
     // Override: a new piece is allowed so the download does not stall.
     try std.testing.expectEqual(@as(?u32, @intCast(max_concurrent_pieces)), s.pickRarestPiece(&peer));
+}
+
+test "connect cooldown skips a recently-failed SOCKS peer" {
+    // Regression: replenish every 3s re-dialed every cached peer through
+    // Tor. A swarm of unreachable hosts then burns 10 SOCKS CONNECT circuits
+    // per burst and crowds the one working seed.
+    var s: Session = undefined;
+    s.connect_fails = [_]ConnectFail{.{}} ** connect_fail_slots;
+    s.connect_fail_next = 0;
+
+    const ip = [4]u8{ 1, 2, 3, 4 };
+    const port: u16 = 6881;
+    const now: i64 = 1_000_000;
+    s.recordConnectFail(ip, port, now);
+
+    try std.testing.expect(s.isConnectCooling(ip, port, now + 1));
+    try std.testing.expect(s.isConnectCooling(ip, port, now + connect_fail_cooldown_secs - 1));
+    try std.testing.expect(!s.isConnectCooling(ip, port, now + connect_fail_cooldown_secs));
+    try std.testing.expect(!s.isConnectCooling(.{ 9, 9, 9, 9 }, port, now + 1));
+    try std.testing.expect(!s.isConnectCooling(ip, 9999, now + 1));
+
+    // A second fail of the same host refreshes the same slot, not a duplicate.
+    s.recordConnectFail(ip, port, now + 10);
+    var occupied: usize = 0;
+    for (s.connect_fails) |slot| {
+        if (slot.port != 0) occupied += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), occupied);
+    try std.testing.expect(s.isConnectCooling(ip, port, now + 10 + connect_fail_cooldown_secs - 1));
+}
+
+test "connect cooldown prefers expired slots over live ones" {
+    // Regression: a full ring used to overwrite the oldest still-cooling
+    // entry. Replenish can record max_socks_inflight failures every 3s, so
+    // a 64-slot ring dropped hosts before the 120s deadline.
+    var s: Session = undefined;
+    s.connect_fails = [_]ConnectFail{.{}} ** connect_fail_slots;
+    s.connect_fail_next = 0;
+
+    const now: i64 = 1_000_000;
+    var i: usize = 0;
+    while (i < connect_fail_slots) : (i += 1) {
+        const last: u8 = @intCast(i % 256);
+        const hi: u8 = @intCast(i / 256);
+        s.recordConnectFail(.{ 10, 0, hi, last }, @as(u16, @intCast(i + 1)), now);
+    }
+    try std.testing.expect(s.isConnectCooling(.{ 10, 0, 0, 0 }, 1, now + 1));
+
+    s.connect_fails[0].retry_after = now; // expire the first host
+    s.recordConnectFail(.{ 9, 9, 9, 9 }, 9999, now + 1);
+
+    try std.testing.expect(s.isConnectCooling(.{ 9, 9, 9, 9 }, 9999, now + 1));
+    try std.testing.expect(s.isConnectCooling(.{ 10, 0, 0, 1 }, 2, now + 1));
+    try std.testing.expect(!s.isConnectCooling(.{ 10, 0, 0, 0 }, 1, now + 1));
+}
+
+test "connect cooldown never evicts a still-cooling host" {
+    var s: Session = undefined;
+    s.connect_fails = [_]ConnectFail{.{}} ** connect_fail_slots;
+    s.connect_fail_next = 0;
+
+    const now: i64 = 1_000_000;
+    var i: usize = 0;
+    while (i < connect_fail_slots) : (i += 1) {
+        const last: u8 = @intCast(i % 256);
+        const hi: u8 = @intCast(i / 256);
+        s.recordConnectFail(.{ 10, 0, hi, last }, @as(u16, @intCast(i + 1)), now);
+    }
+    s.recordConnectFail(.{ 9, 9, 9, 9 }, 9999, now + 1);
+    try std.testing.expect(!s.isConnectCooling(.{ 9, 9, 9, 9 }, 9999, now + 1));
+    try std.testing.expect(s.isConnectCooling(.{ 10, 0, 0, 0 }, 1, now + 1));
 }
 
 /// Re-encode a resolved Metainfo into full `.torrent` bytes: a top-level dict
