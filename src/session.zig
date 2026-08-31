@@ -2462,7 +2462,12 @@ pub const Session = struct {
             // via finishConnect on POLLOUT. Proxied/I2P connects still block
             // here (synchronous handshake) but are capped by max_attempts.
             p.startConnect(self.info_hash, self.peer_id) catch {
-                if (self.proxy != null) self.recordConnectFail(tracker_peer.ip, tracker_peer.port, now);
+                // SOCKS5 startConnect only dials the local proxy and sends
+                // CONNECT; the destination reply is read later in
+                // finishProxyConnect. A failure here is the proxy itself
+                // (down, greeting timeout, auth reject) — do NOT cool the
+                // tracker peer or a brief Tor restart would skip the only
+                // reachable seed for 120s (review on PR #102).
                 p.deinit();
                 self.allocator.destroy(p);
                 continue;
