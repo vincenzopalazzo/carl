@@ -13,6 +13,12 @@ jobs:
         with:
           version: 0.16.0
 
+      # Zig 0.16 zip fetch expects `<cache>/tmp` to already exist. A fresh
+      # Actions cache dir does not have it, so sqlite's amalgamation zip
+      # fails with "failed to create temporary zip file: FileNotFound".
+      - name: Ensure Zig cache tmp dir
+        run: mkdir -p "$ZIG_GLOBAL_CACHE_DIR/tmp" "$ZIG_LOCAL_CACHE_DIR/tmp"
+
       - name: Build
         run: zig build
 
