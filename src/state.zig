@@ -51,7 +51,7 @@ const SCHEMA =
     \\  id TEXT PRIMARY KEY, role TEXT, dir TEXT, name TEXT, author TEXT, also TEXT, route TEXT);
 ;
 
-pub const Error = error{ DbOpen, DbExec, DbPrepare } || Allocator.Error;
+pub const Error = error{ DbOpen, DbExec, DbPrepare, DbPerms } || Allocator.Error;
 
 pub const Kind = enum {
     download,
@@ -175,6 +175,17 @@ pub fn save(
     try saveTo(path, route, download_dir, specs, follows, drives);
 }
 
+/// Create `path` at 0600 if missing, or chmod an existing file to 0600.
+/// Fail-closed: a world-readable db we cannot restrict is a leak, not a
+/// warning (review on PR #100). Must run *before* sqlite3_open writes
+/// magnets/pubkeys, so a crash between COMMIT and chmod cannot leave
+/// secrets at 0644.
+fn restrictDbFile(path: [:0]const u8) Error!void {
+    var f = std.fs.cwd().createFile(path, .{ .truncate = false, .read = true, .mode = 0o600 }) catch return error.DbPerms;
+    defer f.close();
+    f.chmod(0o600) catch return error.DbPerms;
+}
+
 fn saveTo(
     path: [:0]const u8,
     route: api.Route,
@@ -183,6 +194,7 @@ fn saveTo(
     follows: []const FollowSpec,
     drives: []const DriveSpec,
 ) Error!void {
+    try restrictDbFile(path);
     const db = try open(path);
     defer _ = sqlite3_close(db);
 
@@ -236,6 +248,10 @@ fn saveTo(
     }
 
     try exec(db, "COMMIT");
+
+    // Re-assert after the write in case the journal/VACUUM path recreated
+    // the inode. Failure here is still a leak — surface it.
+    try restrictDbFile(path);
 }
 
 /// Load persisted state, or null if no database exists yet. Caller frees via
@@ -429,6 +445,22 @@ test "sqlite save/load round-trips settings + transfers" {
     try testing.expect(st.transfers[0].nostr);
     try testing.expectEqual(Kind.seed, st.transfers[1].kind);
     try testing.expect(!st.transfers[1].nostr);
+}
+
+test "sqlite save creates the db with mode 0600" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/carl.db", .{dir}, 0);
+    defer a.free(path);
+
+    try saveTo(path, .proxy, "/home/u/dl", &.{}, &.{}, &.{});
+    var f = try std.fs.cwd().openFile(path, .{});
+    defer f.close();
+    const st = try f.stat();
+    try testing.expectEqual(@as(u32, 0o600), st.mode & 0o777);
 }
 
 test "sqlite save replaces prior transfers (no accumulation)" {
