@@ -17,7 +17,8 @@
 //!
 //! This module covers session setup, outbound dial (`STREAM CONNECT`), inbound
 //! seeding (`STREAM FORWARD`), bridge health probing, and `.b32.i2p` address
-//! derivation. I2P trackers and the I2P DHT are follow-up phases.
+//! derivation. HTTP tracker announce over SAM STREAM is in `tracker.announceI2p`.
+//! I2P DHT is specified in docs/beps/i2p-dht.md (not implemented).
 //!
 //! Requires a running I2P router (i2pd or Java I2P) with the SAM bridge enabled.
 //! See docs/i2p.md. The handshake is synchronous and blocking (bounded by
