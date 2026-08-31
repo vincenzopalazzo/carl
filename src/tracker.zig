@@ -3,13 +3,26 @@ const Allocator = std.mem.Allocator;
 const bencode = @import("bencode.zig");
 const proxy_mod = @import("proxy.zig");
 const udp_tracker = @import("udp_tracker.zig");
+const peer_announce = @import("peer_announce.zig");
+const i2p_sam = @import("i2p_sam.zig");
 
 const log = std.log.scoped(.tracker);
 
 /// A peer returned by the tracker.
+///
+/// Compact (BEP 3/15) and DHT values are always IPv4 in `ip` (`host_len == 0`).
+/// Dictionary `peers` may set `host_buf` to a v3 `.onion` or `.b32.i2p`
+/// (see docs/beps/draft-hostname-peers.md). Inline buffer so `Peer` is memcpy-safe.
 pub const Peer = struct {
-    ip: [4]u8,
+    ip: [4]u8 = .{ 0, 0, 0, 0 },
     port: u16,
+    host_buf: [peer_announce.v3_onion_host_len]u8 = [_]u8{0} ** peer_announce.v3_onion_host_len,
+    host_len: u8 = 0,
+
+    pub fn host(self: *const Peer) ?[]const u8 {
+        if (self.host_len == 0) return null;
+        return self.host_buf[0..self.host_len];
+    }
 };
 
 /// Event sent to the tracker in an announce request.
@@ -341,6 +354,7 @@ fn parseCompactPeers(allocator: Allocator, data: []const u8) TrackerError![]Peer
 }
 
 /// Parse dictionary peer format: list of dicts with "ip", "port", "peer id" keys.
+/// `ip` may be an IPv4 dotted quad or a hidden-service hostname (BEP 3 dns name).
 fn parseDictPeers(allocator: Allocator, peer_list: []const bencode.Value) TrackerError![]Peer {
     var peers: std.ArrayList(Peer) = .empty;
     errdefer peers.deinit(allocator);
@@ -350,15 +364,152 @@ fn parseDictPeers(allocator: Allocator, peer_list: []const bencode.Value) Tracke
         const ip_str = ip_val.asString() orelse continue;
         const port_val = entry.dictGet("port") orelse continue;
         const port_int = port_val.asInt() orelse continue;
+        const port = std.math.cast(u16, port_int) orelse continue;
+
+        if (parseHostnamePeer(ip_str, port)) |hp| {
+            peers.append(allocator, hp) catch return error.OutOfMemory;
+            continue;
+        }
 
         const ip = parseIpv4(ip_str) orelse continue;
         peers.append(allocator, .{
             .ip = ip,
-            .port = std.math.cast(u16, port_int) orelse continue,
+            .port = port,
         }) catch return error.OutOfMemory;
     }
 
     return peers.toOwnedSlice(allocator) catch return error.OutOfMemory;
+}
+
+/// Dictionary `ip` as a Tor v3 onion or I2P `.b32.i2p`. Null if not a valid host.
+fn parseHostnamePeer(ip_str: []const u8, port: u16) ?Peer {
+    const is_onion = peer_announce.isValidV3OnionHost(ip_str);
+    const is_i2p = peer_announce.isValidI2pB32Host(ip_str);
+    if (!is_onion and !is_i2p) return null;
+    if (is_onion and port == 0) return null; // onion needs a virtual port
+    if (ip_str.len > peer_announce.v3_onion_host_len) return null;
+    var p = Peer{ .port = port, .host_len = @intCast(ip_str.len) };
+    @memcpy(p.host_buf[0..ip_str.len], ip_str);
+    return p;
+}
+
+const max_i2p_tracker_bytes: usize = 4 * 1024 * 1024;
+
+fn httpGetOverSam(
+    io: std.Io,
+    allocator: Allocator,
+    sam: *i2p_sam.Session,
+    url: []const u8,
+) TrackerError![]u8 {
+    const host, const port, const path = splitI2pHttpUrl(url) orelse return error.HttpError;
+    var stream = sam.connect(host, port) catch return error.HttpError;
+    defer stream.close(io);
+
+    var req: std.ArrayList(u8) = .empty;
+    defer req.deinit(allocator);
+    req.appendSlice(allocator, "GET ") catch return error.OutOfMemory;
+    if (path.len == 0 or path[0] != '/') req.append(allocator, '/') catch return error.OutOfMemory;
+    req.appendSlice(allocator, path) catch return error.OutOfMemory;
+    req.appendSlice(allocator, " HTTP/1.1\r\nHost: ") catch return error.OutOfMemory;
+    req.appendSlice(allocator, host) catch return error.OutOfMemory;
+    req.appendSlice(allocator, "\r\nUser-Agent: carl/0\r\nAccept: */*\r\nConnection: close\r\n\r\n") catch return error.OutOfMemory;
+
+    var off: usize = 0;
+    while (off < req.items.len) {
+        const n = std.posix.write(stream.socket.handle, req.items[off..]) catch return error.HttpError;
+        if (n == 0) return error.HttpError;
+        off += n;
+    }
+
+    var resp: std.ArrayList(u8) = .empty;
+    defer resp.deinit(allocator);
+    var chunk: [8192]u8 = undefined;
+    while (true) {
+        const n = std.posix.read(stream.socket.handle, &chunk) catch break;
+        if (n == 0) break;
+        resp.appendSlice(allocator, chunk[0..n]) catch return error.OutOfMemory;
+        if (resp.items.len > max_i2p_tracker_bytes) return error.HttpError;
+        if (std.mem.indexOf(u8, resp.items, "\r\n\r\n")) |sep| {
+            const cl = contentLengthOf(resp.items[0..sep]);
+            if (cl) |need| {
+                if (resp.items.len >= sep + 4 + need) break;
+            }
+        }
+    }
+    const raw = resp.items;
+    const sep = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.InvalidResponse;
+    const head = raw[0..sep];
+    const body = raw[sep + 4 ..];
+    const line_end = std.mem.indexOf(u8, head, "\r\n") orelse head.len;
+    var it = std.mem.tokenizeScalar(u8, head[0..line_end], ' ');
+    _ = it.next() orelse return error.InvalidResponse;
+    const code_str = it.next() orelse return error.InvalidResponse;
+    const code = std.fmt.parseUnsigned(u16, code_str, 10) catch return error.InvalidResponse;
+    if (code < 200 or code >= 300) return error.HttpError;
+    return allocator.dupe(u8, body) catch error.OutOfMemory;
+}
+
+fn contentLengthOf(head: []const u8) ?usize {
+    var lines = std.mem.tokenizeSequence(u8, head, "\r\n");
+    _ = lines.next();
+    while (lines.next()) |line| {
+        const c = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..c], " \t");
+        if (!std.ascii.eqlIgnoreCase(name, "content-length")) continue;
+        return std.fmt.parseUnsigned(usize, std.mem.trim(u8, line[c + 1 ..], " \t"), 10) catch null;
+    }
+    return null;
+}
+
+fn splitI2pHttpUrl(url: []const u8) ?struct { []const u8, u16, []const u8 } {
+    if (!std.mem.startsWith(u8, url, "http://")) return null;
+    const rest = url[7..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
+    const quest = std.mem.indexOfScalar(u8, rest, '?') orelse rest.len;
+    const auth_end = @min(slash, quest);
+    const authority = rest[0..auth_end];
+    const path = rest[auth_end..];
+    var host = authority;
+    var port: u16 = 80;
+    if (std.mem.lastIndexOfScalar(u8, authority, ':')) |c| {
+        host = authority[0..c];
+        port = std.fmt.parseUnsigned(u16, authority[c + 1 ..], 10) catch return null;
+    }
+    if (host.len == 0 or !std.mem.endsWith(u8, host, ".i2p")) return null;
+    return .{ host, port, path };
+}
+
+/// HTTP GET an I2P-BT tracker over SAM STREAM. `announce_url` must be
+/// `http://*.i2p/…` (`https` is not tunneled in v1). Fail-closed: never dials
+/// clearnet.
+pub fn announceI2p(
+    io: std.Io,
+    allocator: Allocator,
+    sam: *i2p_sam.Session,
+    announce_url: []const u8,
+    req: AnnounceRequest,
+) TrackerError!AnnounceResponse {
+    if (!isI2pHttpUrl(announce_url)) return error.HttpError;
+    const url = buildAnnounceUrl(allocator, announce_url, req) catch return error.OutOfMemory;
+    defer allocator.free(url);
+    const body = httpGetOverSam(io, allocator, sam, url) catch return error.HttpError;
+    defer allocator.free(body);
+    return parseAnnounceResponse(allocator, body);
+}
+
+/// True when `url` is `http://` whose host ends in `.i2p` (I2P-BT tracker).
+/// `https://` is rejected — TLS-over-SAM is not in v1.
+pub fn isI2pHttpUrl(url: []const u8) bool {
+    const rest = if (std.mem.startsWith(u8, url, "http://"))
+        url[7..]
+    else
+        return false;
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
+    const quest = std.mem.indexOfScalar(u8, rest, '?') orelse rest.len;
+    const auth_end = @min(slash, quest);
+    var host = rest[0..auth_end];
+    if (std.mem.lastIndexOfScalar(u8, host, ':')) |c| host = host[0..c];
+    return std.mem.endsWith(u8, host, ".i2p");
 }
 
 /// Parse an IPv4 address string like "192.168.1.1" into 4 bytes.
@@ -535,6 +686,55 @@ test "parse IPv4" {
     try std.testing.expect(parseIpv4("invalid") == null);
     try std.testing.expect(parseIpv4("1.2.3") == null);
     try std.testing.expect(parseIpv4("1.2.3.4.5") == null);
+}
+
+test "parse dict peers with onion and i2p hostnames" {
+    const allocator = std.testing.allocator;
+    const onion = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion";
+    const i2p = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrst.b32.i2p";
+    try std.testing.expectEqual(@as(usize, 62), onion.len);
+    try std.testing.expectEqual(@as(usize, 60), i2p.len);
+
+    const resp_data = try std.fmt.allocPrint(allocator, "d8:intervali1800e5:peersld2:ip{d}:{s}4:porti80eed2:ip{d}:{s}4:porti0eed2:ip9:192.0.2.14:porti6881eeee", .{ onion.len, onion, i2p.len, i2p });
+    defer allocator.free(resp_data);
+
+    const resp = try parseAnnounceResponse(allocator, resp_data);
+    defer resp.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), resp.peers.len);
+    try std.testing.expectEqualStrings(onion, resp.peers[0].host().?);
+    try std.testing.expectEqual(@as(u16, 80), resp.peers[0].port);
+    try std.testing.expectEqualStrings(i2p, resp.peers[1].host().?);
+    try std.testing.expectEqual(@as(u16, 0), resp.peers[1].port);
+    try std.testing.expect(resp.peers[2].host() == null);
+    try std.testing.expectEqual([4]u8{ 192, 0, 2, 1 }, resp.peers[2].ip);
+}
+
+test "parse dict skips invalid onion port 0" {
+    const allocator = std.testing.allocator;
+    const onion = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion";
+    const resp_data = try std.fmt.allocPrint(allocator, "d8:intervali60e5:peersld2:ip{d}:{s}4:porti0eeee", .{ onion.len, onion });
+    defer allocator.free(resp_data);
+    const resp = try parseAnnounceResponse(allocator, resp_data);
+    defer resp.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), resp.peers.len);
+}
+
+test "isI2pHttpUrl" {
+    try std.testing.expect(isI2pHttpUrl("http://tracker2.postman.i2p/announce"));
+    try std.testing.expect(isI2pHttpUrl("http://abc.b32.i2p:80/announce"));
+    try std.testing.expect(!isI2pHttpUrl("http://tracker.opentrackr.org/announce"));
+    try std.testing.expect(!isI2pHttpUrl("udp://tracker2.postman.i2p:6969"));
+    try std.testing.expect(!isI2pHttpUrl("https://example.com/announce"));
+    try std.testing.expect(!isI2pHttpUrl("https://tracker2.postman.i2p/announce"));
+}
+
+test "splitI2pHttpUrl" {
+    const a = splitI2pHttpUrl("http://tracker2.postman.i2p/announce?info_hash=x").?;
+    try std.testing.expectEqualStrings("tracker2.postman.i2p", a[0]);
+    try std.testing.expectEqual(@as(u16, 80), a[1]);
+    try std.testing.expectEqualStrings("/announce?info_hash=x", a[2]);
+    try std.testing.expect(splitI2pHttpUrl("http://example.com/announce") == null);
 }
 
 test "udp as http url rewrite" {
