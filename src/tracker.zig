@@ -414,18 +414,22 @@ fn httpGetOverSam(
     req.appendSlice(allocator, host) catch return error.OutOfMemory;
     req.appendSlice(allocator, "\r\nUser-Agent: carl/0\r\nAccept: */*\r\nConnection: close\r\n\r\n") catch return error.OutOfMemory;
 
+    var write_buffer: [0]u8 = .{};
+    var writer = stream.writer(io, &write_buffer);
     var off: usize = 0;
     while (off < req.items.len) {
-        const n = std.posix.write(stream.socket.handle, req.items[off..]) catch return error.HttpError;
+        const n = writer.interface.write(req.items[off..]) catch return error.HttpError;
         if (n == 0) return error.HttpError;
         off += n;
     }
 
     var resp: std.ArrayList(u8) = .empty;
     defer resp.deinit(allocator);
+    var read_buffer: [0]u8 = .{};
+    var reader = stream.reader(io, &read_buffer);
     var chunk: [8192]u8 = undefined;
     while (true) {
-        const n = std.posix.read(stream.socket.handle, &chunk) catch break;
+        const n = reader.interface.readSliceShort(&chunk) catch break;
         if (n == 0) break;
         resp.appendSlice(allocator, chunk[0..n]) catch return error.OutOfMemory;
         if (resp.items.len > max_i2p_tracker_bytes) return error.HttpError;
