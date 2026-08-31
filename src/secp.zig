@@ -131,7 +131,7 @@ pub fn publicKeyFromSecret(sk: SecretKey) Error!PublicKey {
 // ---------------------------------------------------------------------------
 
 /// Sign a 32-byte message hash with BIP-340 Schnorr. When `aux_rand` is null
-/// we draw 32 fresh bytes from `std.crypto.random` — per BIP-340 §3.3,
+/// we draw 32 fresh bytes from the configured `std.Io` random source — per BIP-340 §3.3,
 /// auxiliary randomness mitigates fault and side-channel attacks on the nonce
 /// derivation, so the safe default is the easy default. Callers needing
 /// deterministic signatures (test vectors, reproducibility) pass an explicit
