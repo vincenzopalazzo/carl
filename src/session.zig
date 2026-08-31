@@ -54,7 +54,10 @@ const connect_fail_cooldown_secs: i64 = 120;
 /// Hard cap on simultaneous SOCKS CONNECT circuits. Tor serializes circuit
 /// builds; a burst of 10 CONNECTs starves an established download.
 const max_socks_inflight: usize = 3;
-const connect_fail_slots: usize = 64;
+/// Replenish records at most 10 unique failures every 3s (the proxied
+/// `max_attempts` cap). Hold that rate for the full cooldown so a
+/// still-cooling host is not overwritten (review on PR #102).
+const connect_fail_slots: usize = 10 * (@as(usize, @intCast(connect_fail_cooldown_secs)) / 3 + 1);
 
 const ConnectFail = struct {
     ip: [4]u8 = .{ 0, 0, 0, 0 },
@@ -2386,12 +2389,23 @@ pub const Session = struct {
                 return;
             }
         }
-        self.connect_fails[self.connect_fail_next] = .{
+        // Prefer empty or expired slots. If every slot is still cooling,
+        // drop this host rather than evict one whose 120s window has not
+        // elapsed — otherwise a large dead swarm would undo the cooldown.
+        var victim: ?usize = null;
+        for (self.connect_fails, 0..) |slot, i| {
+            if (slot.port == 0 or now >= slot.retry_after) {
+                victim = i;
+                break;
+            }
+        }
+        const idx = victim orelse return;
+        self.connect_fails[idx] = .{
             .ip = ip,
             .port = port,
             .retry_after = now + connect_fail_cooldown_secs,
         };
-        self.connect_fail_next = (self.connect_fail_next + 1) % connect_fail_slots;
+        self.connect_fail_next = (idx + 1) % connect_fail_slots;
     }
 
     fn recordPeerConnectFail(self: *Session, p: *peer_mod.PeerConnection) void {
@@ -3099,6 +3113,48 @@ test "connect cooldown skips a recently-failed SOCKS peer" {
     }
     try std.testing.expectEqual(@as(usize, 1), occupied);
     try std.testing.expect(s.isConnectCooling(ip, port, now + 10 + connect_fail_cooldown_secs - 1));
+}
+
+test "connect cooldown prefers expired slots over live ones" {
+    // Regression: a full ring used to overwrite the oldest still-cooling
+    // entry. Replenish can record max_socks_inflight failures every 3s, so
+    // a 64-slot ring dropped hosts before the 120s deadline.
+    var s: Session = undefined;
+    s.connect_fails = [_]ConnectFail{.{}} ** connect_fail_slots;
+    s.connect_fail_next = 0;
+
+    const now: i64 = 1_000_000;
+    var i: usize = 0;
+    while (i < connect_fail_slots) : (i += 1) {
+        const last: u8 = @intCast(i % 256);
+        const hi: u8 = @intCast(i / 256);
+        s.recordConnectFail(.{ 10, 0, hi, last }, @as(u16, @intCast(i + 1)), now);
+    }
+    try std.testing.expect(s.isConnectCooling(.{ 10, 0, 0, 0 }, 1, now + 1));
+
+    s.connect_fails[0].retry_after = now; // expire the first host
+    s.recordConnectFail(.{ 9, 9, 9, 9 }, 9999, now + 1);
+
+    try std.testing.expect(s.isConnectCooling(.{ 9, 9, 9, 9 }, 9999, now + 1));
+    try std.testing.expect(s.isConnectCooling(.{ 10, 0, 0, 1 }, 2, now + 1));
+    try std.testing.expect(!s.isConnectCooling(.{ 10, 0, 0, 0 }, 1, now + 1));
+}
+
+test "connect cooldown never evicts a still-cooling host" {
+    var s: Session = undefined;
+    s.connect_fails = [_]ConnectFail{.{}} ** connect_fail_slots;
+    s.connect_fail_next = 0;
+
+    const now: i64 = 1_000_000;
+    var i: usize = 0;
+    while (i < connect_fail_slots) : (i += 1) {
+        const last: u8 = @intCast(i % 256);
+        const hi: u8 = @intCast(i / 256);
+        s.recordConnectFail(.{ 10, 0, hi, last }, @as(u16, @intCast(i + 1)), now);
+    }
+    s.recordConnectFail(.{ 9, 9, 9, 9 }, 9999, now + 1);
+    try std.testing.expect(!s.isConnectCooling(.{ 9, 9, 9, 9 }, 9999, now + 1));
+    try std.testing.expect(s.isConnectCooling(.{ 10, 0, 0, 0 }, 1, now + 1));
 }
 
 /// Re-encode a resolved Metainfo into full `.torrent` bytes: a top-level dict
