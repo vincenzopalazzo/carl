@@ -168,9 +168,13 @@ error (the daemon stays up); check that your router is running and the
   re-added (restart the transfer). Auto-reconnect is a follow-up.
 - **IPv4 SAM bridge only.** carl connects to the SAM bridge over IPv4; point
   `--i2p-sam` at an IPv4 address (e.g. `127.0.0.1:7656`).
-- **No I2P trackers / I2P DHT yet** — peer discovery is via Nostr peer-announce
-  (`.b32.i2p` carried like a `.onion` host). I2P-native discovery is tracked
-  separately.
+- **I2P HTTP trackers (P3):** if the torrent lists an `http://*.i2p/…` announce
+  URL, carl GETs it over SAM STREAM and dials dictionary `.b32.i2p` peers.
+  Clearnet `http://` / `udp://` announces stay skipped (fail-closed). Profile:
+  [beps/i2p-bt-tracker.md](beps/i2p-bt-tracker.md).
+- **I2P DHT (P4) is not implemented** — wire notes in
+  [beps/i2p-dht.md](beps/i2p-dht.md). Until then, discovery is Nostr kind 30078
+  plus I2P HTTP trackers.
 
 ## Troubleshooting
 
