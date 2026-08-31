@@ -1472,7 +1472,10 @@ fn cmdDaemon(allocator: std.mem.Allocator, stdout: anytype, extra: []const [:0]u
     try stdout.print("carl daemon\n", .{});
     try stdout.print("listen: http://127.0.0.1:{d}\n", .{port});
     try stdout.print("token: {s}\n", .{token});
-    try stdout.print("route: {s}\n", .{route_str});
+    // After restoreSettings so this is the route the daemon will actually
+    // use (persisted GUI setting unless --route was explicit), not the
+    // CLI-flag default of "direct".
+    try stdout.print("route: {s}\n", .{mgr.cfg.route.jsonName()});
 
     // The CLI discovery file (for `carl download` / `carl status`) is
     // published by daemon.serve() once the listen socket is bound — writing

@@ -665,12 +665,12 @@ const Conn = struct {
             return self.sendStatus(.bad_request);
         const obj = if (parsed.value == .object) parsed.value.object else return self.sendStatus(.bad_request);
         const source = strField(obj, "source") orelse return self.sendStatus(.bad_request);
-        // An unknown route string is a 400, never a silent downgrade to
-        // direct: the CLI forwards the daemon's own settings route verbatim,
-        // and a version-skewed value must fail closed, not go clearnet.
-        const route_str = strField(obj, "route") orelse "direct";
-        const route_val = api.Route.parse(route_str) orelse {
-            log.warn("addTransfer: unknown route '{s}'", .{route_str});
+        // Missing `route` inherits the daemon's configured default (the
+        // GUI-persisted / --route setting). An unknown string is still a
+        // 400 — never a silent downgrade to direct, which would put a
+        // proxied daemon's CLI/API add on the clearnet.
+        const route_val = defaultTransferRoute(self.daemon.manager.configuredRoute(), strField(obj, "route")) orelse {
+            log.warn("addTransfer: unknown route '{s}'", .{strField(obj, "route") orelse ""});
             return self.sendStatus(.bad_request);
         };
         const want_nostr = if (obj.get("nostr")) |v| (v == .bool and v.bool) else false;
@@ -1406,9 +1406,23 @@ fn formatAge(arena: Allocator, secs_ago: i64) ![]const u8 {
 
 const testing = std.testing;
 
+/// Resolve the route for POST /api/transfers. A missing field inherits
+/// `configured`; a present-but-unknown string fails closed (null → 400).
+fn defaultTransferRoute(configured: api.Route, route_field: ?[]const u8) ?api.Route {
+    return if (route_field) |s| api.Route.parse(s) else configured;
+}
+
 test "relayNet: onion vs clearnet" {
     try testing.expectEqualStrings("tor", relayNet("ws://abc.onion"));
     try testing.expectEqualStrings("clearnet", relayNet("wss://relay.damus.io"));
+}
+
+test "defaultTransferRoute: omitted inherits configured, unknown fails closed" {
+    try testing.expectEqual(api.Route.proxy, defaultTransferRoute(.proxy, null).?);
+    try testing.expectEqual(api.Route.tor, defaultTransferRoute(.direct, "tor").?);
+    try testing.expectEqual(api.Route.i2p, defaultTransferRoute(.proxy, "i2p").?);
+    try testing.expect(defaultTransferRoute(.proxy, "bogus") == null);
+    try testing.expect(defaultTransferRoute(.proxy, "") == null);
 }
 
 test "textMatches: case-insensitive substring" {
