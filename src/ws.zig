@@ -19,6 +19,7 @@ const Allocator = std.mem.Allocator;
 const Net = std.Io.net;
 const Stream = Net.Stream;
 const HostName = Net.HostName;
+const IpAddress = Net.IpAddress;
 
 const posix = std.posix;
 const tls = std.crypto.tls;
@@ -861,41 +862,176 @@ fn preflightReachable(
     port: u16,
     timeout_ms: i32,
 ) bool {
-    const hostname: HostName = .{ .bytes = host };
-
-    const stream = hostname.connect(io, port, .{
-        .mode = .stream,
-        .timeout = .{
-            .duration = .{
-                .raw = .fromMilliseconds(@intCast(timeout_ms)),
-                .clock = .awake,
-            },
-        },
-    }) catch return false;
+    const stream = boundedTcpConnect(
+        io,
+        host,
+        port,
+        timeout_ms,
+    ) catch return false;
 
     stream.close(io);
     return true;
 }
 
-/// Open TCP to `host`:`port`, preferring IPv4 and trying every resolved address
-/// before giving up. `std.net.tcpConnectToHost` stops on the first non-refused
-/// error, which breaks when DNS returns AAAA before A and IPv6 is unroutable.
 fn tcpConnect(
     io: std.Io,
     host: []const u8,
     port: u16,
 ) Error!Stream {
-    const hostname: HostName = .{ .bytes = host };
+    return boundedTcpConnect(
+        io,
+        host,
+        port,
+        preflight_connect_ms,
+    );
+}
 
-    return hostname.connect(io, port, .{
-        .mode = .stream,
-        .timeout = .{
-            .duration = .{
-                .raw = .fromSeconds(4),
-                .clock = .awake,
-            },
-        },
+/// Resolve `host` and connect to an IPv4 result with a hard timeout.
+///
+/// Zig 0.16's threaded network backend does not yet implement timed
+/// HostName.connect, so use a non-blocking socket + poll + SO_ERROR.
+fn boundedTcpConnect(
+    io: std.Io,
+    host: []const u8,
+    port: u16,
+    timeout_ms: i32,
+) Error!Stream {
+    const host_name =
+        HostName.init(host) catch return error.ConnectFailed;
+
+    var canonical_name_buffer: [HostName.max_len]u8 = undefined;
+    var lookup_buffer: [16]HostName.LookupResult = undefined;
+    var lookup_queue: std.Io.Queue(HostName.LookupResult) =
+        .init(&lookup_buffer);
+
+    host_name.lookup(io, &lookup_queue, .{
+        .port = port,
+        .canonical_name_buffer = &canonical_name_buffer,
     }) catch return error.ConnectFailed;
+
+    while (lookup_queue.getOneUncancelable(io)) |result| {
+        switch (result) {
+            .address => |address| switch (address) {
+                .ip4 => {
+                    if (connectIp4Bounded(address, timeout_ms)) |stream| {
+                        return stream;
+                    }
+                },
+                .ip6 => {},
+            },
+            .canonical_name => {},
+        }
+    } else |err| switch (err) {
+        error.Closed => {},
+    }
+
+    return error.ConnectFailed;
+}
+
+fn connectIp4Bounded(
+    address: IpAddress,
+    timeout_ms: i32,
+) ?Stream {
+    const ip4 = switch (address) {
+        .ip4 => |addr| addr,
+        .ip6 => return null,
+    };
+
+    const sock = std.c.socket(
+        std.posix.AF.INET,
+        std.posix.SOCK.STREAM,
+        std.posix.IPPROTO.TCP,
+    );
+
+    if (sock < 0) return null;
+
+    var socket_owned = true;
+    defer {
+        if (socket_owned) {
+            _ = std.c.close(sock);
+        }
+    }
+
+    _ = std.c.fcntl(
+        sock,
+        std.c.F.SETFD,
+        @as(c_int, std.posix.FD_CLOEXEC),
+    );
+
+    const flags = std.c.fcntl(
+        sock,
+        std.c.F.GETFL,
+        @as(c_int, 0),
+    );
+    if (flags < 0) return null;
+
+    var o: std.c.O = @bitCast(@as(u32, @intCast(flags)));
+    o.NONBLOCK = true;
+
+    _ = std.c.fcntl(
+        sock,
+        std.c.F.SETFL,
+        @as(c_int, @bitCast(o)),
+    );
+
+    const posix_addr = std.posix.sockaddr.in{
+        .port = std.mem.nativeToBig(u16, ip4.port),
+        .addr = @bitCast(ip4.bytes),
+    };
+
+    const rc = std.c.connect(
+        sock,
+        @ptrCast(&posix_addr),
+        @sizeOf(std.posix.sockaddr.in),
+    );
+
+    if (rc != 0) switch (std.posix.errno(rc)) {
+        .AGAIN, .INPROGRESS => {
+            var pfd = [_]std.posix.pollfd{.{
+                .fd = sock,
+                .events = std.posix.POLL.OUT,
+                .revents = 0,
+            }};
+
+            const ready = std.posix.poll(
+                &pfd,
+                timeout_ms,
+            ) catch return null;
+
+            if (ready == 0) return null;
+
+            var socket_error: c_int = 0;
+            var socket_error_len: std.c.socklen_t = @sizeOf(c_int);
+
+            if (std.c.getsockopt(
+                sock,
+                std.c.SOL.SOCKET,
+                std.c.SO.ERROR,
+                &socket_error,
+                &socket_error_len,
+            ) != 0 or socket_error != 0) {
+                return null;
+            }
+        },
+        else => return null,
+    };
+
+    o.NONBLOCK = false;
+
+    _ = std.c.fcntl(
+        sock,
+        std.c.F.SETFL,
+        @as(c_int, @bitCast(o)),
+    );
+
+    socket_owned = false;
+
+    return .{
+        .socket = .{
+            .handle = sock,
+            .address = address,
+        },
+    };
 }
 
 /// Compute the expected Sec-WebSocket-Accept header value for a given

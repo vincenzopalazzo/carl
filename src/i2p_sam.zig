@@ -111,6 +111,123 @@ fn resolveIp4(
     return error.ConnectFailed;
 }
 
+fn connectIp4Bounded(
+    addr: IpAddress,
+    timeout_s: u32,
+) SamError!Stream {
+    const ip4 = switch (addr) {
+        .ip4 => |a| a,
+        .ip6 => return error.ConnectFailed,
+    };
+
+    const timeout_ms: i32 =
+        if (timeout_s > 600)
+            600_000
+        else
+            @intCast(timeout_s * 1000);
+
+    const sock = std.c.socket(
+        std.posix.AF.INET,
+        std.posix.SOCK.STREAM,
+        std.posix.IPPROTO.TCP,
+    );
+
+    if (sock < 0)
+        return error.ConnectFailed;
+
+    var socket_owned = true;
+    defer {
+        if (socket_owned) {
+            _ = std.c.close(sock);
+        }
+    }
+
+    _ = std.c.fcntl(
+        sock,
+        std.c.F.SETFD,
+        @as(c_int, std.posix.FD_CLOEXEC),
+    );
+
+    const flags = std.c.fcntl(
+        sock,
+        std.c.F.GETFL,
+        @as(c_int, 0),
+    );
+
+    if (flags < 0)
+        return error.ConnectFailed;
+
+    var o: std.c.O = @bitCast(@as(u32, @intCast(flags)));
+    o.NONBLOCK = true;
+
+    _ = std.c.fcntl(
+        sock,
+        std.c.F.SETFL,
+        @as(c_int, @bitCast(o)),
+    );
+
+    const posix_addr: std.posix.sockaddr.in = .{
+        .port = std.mem.nativeToBig(u16, ip4.port),
+        .addr = @bitCast(ip4.bytes),
+    };
+
+    const rc = std.c.connect(
+        sock,
+        @ptrCast(&posix_addr),
+        @sizeOf(std.posix.sockaddr.in),
+    );
+
+    if (rc != 0) switch (std.posix.errno(rc)) {
+        .AGAIN, .INPROGRESS => {
+            var pfd = [_]std.posix.pollfd{.{
+                .fd = sock,
+                .events = std.posix.POLL.OUT,
+                .revents = 0,
+            }};
+
+            const ready = std.posix.poll(
+                &pfd,
+                timeout_ms,
+            ) catch return error.ConnectFailed;
+
+            if (ready == 0)
+                return error.ConnectFailed;
+
+            var socket_error: c_int = 0;
+            var socket_error_len: std.c.socklen_t = @sizeOf(c_int);
+
+            if (std.c.getsockopt(
+                sock,
+                std.c.SOL.SOCKET,
+                std.c.SO.ERROR,
+                &socket_error,
+                &socket_error_len,
+            ) != 0 or socket_error != 0) {
+                return error.ConnectFailed;
+            }
+        },
+        else => return error.ConnectFailed,
+    };
+
+    // Connected. Restore blocking mode.
+    o.NONBLOCK = false;
+
+    _ = std.c.fcntl(
+        sock,
+        std.c.F.SETFL,
+        @as(c_int, @bitCast(o)),
+    );
+
+    socket_owned = false;
+
+    return .{
+        .socket = .{
+            .handle = sock,
+            .address = addr,
+        },
+    };
+}
+
 // --- low-level socket helpers (blocking, bounded; mirrors proxy.zig) ---
 
 fn dial(io: std.Io, bridge: Bridge) SamError!Stream {
@@ -118,9 +235,10 @@ fn dial(io: std.Io, bridge: Bridge) SamError!Stream {
         resolveIp4(io, bridge.host, bridge.port) catch
             return error.ConnectFailed;
 
-    const stream = addr.connect(io, .{
-        .mode = .stream,
-    }) catch return error.ConnectFailed;
+    const stream = connectIp4Bounded(
+        addr,
+        timeout_secs,
+    ) catch return error.ConnectFailed;
 
     const tv = std.c.timeval{
         .sec = @intCast(timeout_secs),

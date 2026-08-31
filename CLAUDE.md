@@ -26,7 +26,7 @@ prefer values justified by what libtorrent/qBittorrent ships over invented ones.
 
 ## Build
 
-- Language: Zig 0.15
+- Language: Zig 0.16
 - Build: `zig build`
 - Test: `zig build test`
 - Format: `zig fmt src/`

@@ -2,7 +2,7 @@
     .name = .carl,
     .version = "0.3.1",
     .fingerprint = 0x18cf10e1f7c720be,
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .secp256k1 = .{
             .url = "https://github.com/bitcoin-core/secp256k1/archive/refs/tags/v0.6.0.tar.gz",

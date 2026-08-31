@@ -39,7 +39,7 @@ A BitTorrent client written in pure Zig. The BitTorrent core has zero Zig packag
 
 ## Building
 
-Requires **Zig 0.15.2**, matching the version pinned in CI and `build.zig.zon`.
+Requires **Zig 0.16.0**, matching the version pinned in CI and `build.zig.zon`.
 Newer Zig releases, including 0.16, are not supported until the codebase is
 ported and CI is updated to pin that version. The build fetches `libsecp256k1`
 via `build.zig.zon` on first run; everything else is pure Zig.
