@@ -1453,6 +1453,9 @@ fn cmdDaemon(
     try stdout.print("listen: http://127.0.0.1:{d}\n", .{port});
     try stdout.print("token: {s}\n", .{token});
     try stdout.print("route: {s}\n", .{route_str});
+    // 0.16 stdout is buffered (4 KiB). The GUI sidecar parses `token:` and
+    // gives up after 10s if it never arrives — flush before serve() blocks.
+    try stdout.flush();
 
     // On a proxy/tor route, check the SOCKS proxy up front and say clearly why
     // it's unreachable (the daemon keeps running and the GUI shows live health).
