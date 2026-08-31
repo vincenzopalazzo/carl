@@ -340,9 +340,13 @@ fn cmdAnnounce(io: std.Io, allocator: std.mem.Allocator, stdout: anytype, path: 
 
     try stdout.print("\npeers ({d}):\n", .{resp.peers.len});
     for (resp.peers) |peer| {
-        try stdout.print("  {d}.{d}.{d}.{d}:{d}\n", .{
-            peer.ip[0], peer.ip[1], peer.ip[2], peer.ip[3], peer.port,
-        });
+        if (peer.host()) |h| {
+            try stdout.print("  {s}:{d}\n", .{ h, peer.port });
+        } else {
+            try stdout.print("  {d}.{d}.{d}.{d}:{d}\n", .{
+                peer.ip[0], peer.ip[1], peer.ip[2], peer.ip[3], peer.port,
+            });
+        }
     }
 }
 

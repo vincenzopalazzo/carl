@@ -2230,12 +2230,36 @@ pub const Session = struct {
         return false;
     }
 
+    fn alreadyHasHost(self: *const Session, host: []const u8, port: u16) bool {
+        for (self.peers.items) |existing| {
+            const eh = existing.connect_host orelse continue;
+            const existing_port: u16 = switch (existing.address) {
+                .ip4 => |a| a.port,
+                else => continue,
+            };
+            if (std.mem.eql(u8, eh, host) and existing_port == port) return true;
+        }
+        return false;
+    }
+
     fn tryAnnounceUrl(self: *Session, url: []const u8, req: tracker_mod.AnnounceRequest) ?tracker_mod.AnnounceResponse {
-        // I2P (anonymized with no SOCKS/HTTP proxy) can't reach clearnet
-        // trackers, and announcing over them directly would leak the real IP.
-        // (I2P-native trackers are a follow-up.) Skip all clearnet trackers.
-        if (self.anonymized() and self.proxy == null) return null;
         if (url.len == 0) return null;
+
+        // I2P-BT: HTTP tracker whose host is `.i2p`, over SAM STREAM.
+        // Clearnet http/udp still skipped below (fail-closed).
+        if (self.i2p) |sam| {
+            if (tracker_mod.isI2pHttpUrl(url)) {
+                return tracker_mod.announceI2p(self.io, self.allocator, sam, url, req) catch |err| {
+                    log.warn("i2p tracker {s} failed: {t}", .{ url, err });
+                    return null;
+                };
+            }
+            return null;
+        }
+
+        // I2P without a SAM session shouldn't happen; other anonymized
+        // routes with no SOCKS still must not hit clearnet trackers.
+        if (self.anonymized() and self.proxy == null) return null;
 
         // tracker_mod.announce owns the transport choice (udp:// vs http://)
         // and the fail-closed proxy rewrite, so the session and `carl announce`
@@ -2336,6 +2360,20 @@ pub const Session = struct {
             if (self.peers.items.len >= max_peers) break;
             if (attempts >= max_attempts) break;
 
+            if (tracker_peer.host()) |h| {
+                if (self.alreadyHasHost(h, tracker_peer.port)) continue;
+                attempts += 1;
+                if (std.mem.endsWith(u8, h, ".onion")) {
+                    self.connectOnionPeer(h, tracker_peer.port) catch continue;
+                } else if (std.mem.endsWith(u8, h, ".b32.i2p")) {
+                    self.connectI2pPeer(h, tracker_peer.port) catch continue;
+                }
+                continue;
+            }
+
+            // Compact / dotted-quad IPv4. Never dial these on I2P (IP leak).
+            if (self.i2p != null) continue;
+
             const addr: IpAddress = .{
                 .ip4 = .{
                     .bytes = tracker_peer.ip,
@@ -2344,6 +2382,7 @@ pub const Session = struct {
             };
             var already = false;
             for (self.peers.items) |existing| {
+                if (existing.connect_host != null) continue;
                 if (std.mem.eql(u8, &std.mem.toBytes(existing.address), &std.mem.toBytes(addr))) {
                     already = true;
                     break;
