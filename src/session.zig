@@ -2149,8 +2149,11 @@ pub const Session = struct {
                 self.doMultiTrackerAnnounce(.none) catch {};
             }
 
-            // DHT: retry more aggressively when we have zero peers
-            if (self.peers.items.len == 0 and now - self.last_announce_time > 30) {
+            // DHT: retry when we have zero peers. tryDhtPeerDiscovery has its
+            // own in-flight / retry_after gate — do NOT key this off
+            // last_announce_time, which is the tracker-failure backoff and
+            // can be 60s–6h (review on PR #96).
+            if (self.peers.items.len == 0) {
                 self.tryDhtPeerDiscovery() catch {};
             }
         }
@@ -2229,6 +2232,17 @@ pub const Session = struct {
             self.tryDhtPeerDiscovery() catch {};
         }
 
+        // Stamp even on failure so a down tracker cannot re-fire every
+        // maintenance tick (the interval check is `now - last_announce_time`).
+        // Back off at least 60s; keep a previously-clamped interval if larger.
+        // Clear src_tracker_state so the GUI does not keep showing "working"
+        // from an earlier success for the whole backoff (review on PR #96).
+        self.last_announce_time = std.time.timestamp();
+        if (self.tracker_interval < 60) self.tracker_interval = 60;
+        self.src_tracker_state.store(0, .monotonic);
+        self.src_last_announce_s.store(self.last_announce_time, .monotonic);
+        self.src_announce_interval_s.store(@intCast(self.tracker_interval), .monotonic);
+
         return error.TrackerFailed;
     }
 
@@ -2270,14 +2284,14 @@ pub const Session = struct {
             return;
         }
 
-        self.tracker_interval = resp.interval;
+        self.tracker_interval = tracker_mod.clampInterval(resp.interval, resp.min_interval);
         self.last_announce_time = std.time.timestamp();
 
         // Publish source snapshot data for cross-thread reads.
         self.src_tracker_state.store(1, .monotonic);
         self.src_seeders.store(@intCast(resp.complete orelse 0), .monotonic);
         self.src_leechers.store(@intCast(resp.incomplete orelse 0), .monotonic);
-        self.src_announce_interval_s.store(@intCast(resp.interval), .monotonic);
+        self.src_announce_interval_s.store(@intCast(self.tracker_interval), .monotonic);
         self.src_last_announce_s.store(self.last_announce_time, .monotonic);
 
         const stderr = std.fs.File.stderr().deprecatedWriter();
@@ -2314,14 +2328,13 @@ pub const Session = struct {
     }
 
     fn connectToPeers(self: *Session, peer_list: []const tracker_mod.Peer) !void {
-        // Each proxied connection attempt takes ~10s through Tor (SOCKS
-        // handshake + circuit). Trying all 50 peers serially would block
-        // the session thread for minutes. Cap attempts per call; the
-        // tracker re-announce cycle gradually fills the peer pool.
-        // Clearnet connects are now non-blocking (startConnect returns on
-        // EINPROGRESS), so attempting the whole tracker response is cheap —
-        // the peer-pool cap (max_peers) bounds how many sockets we hold. Proxied
-        // connects still block per attempt, so keep that cap small.
+        // Clearnet connects are non-blocking (`startConnect` returns on
+        // EINPROGRESS). SOCKS5/SOCKS5h finish the CONNECT *reply* on the poll
+        // loop, but the local TCP+method/auth handshake still blocks in
+        // `connectThroughProxyAddrStart` (up to proxy_timeout_secs). A stalled
+        // proxy would freeze the session for N × 10s, so keep a small cap on
+        // any proxied attempt; HTTP CONNECT is fully synchronous too.
+        // The peer-pool cap (`max_peers`) is the real bound on clearnet.
         const max_attempts: usize = if (self.proxy != null) 10 else 200;
         var attempts: usize = 0;
 
@@ -2619,6 +2632,12 @@ pub const Session = struct {
         if (st.peers.len > 0) allocator.free(st.peers);
         st.peers = peers;
         st.nodes = node_count;
+        // Empty successful walks must also back off — otherwise the
+        // zero-peer maintenance branch respawns a full walk every tick
+        // (review on PR #96). Failed walks already set retry_after above.
+        if (st.peers.len == 0) {
+            st.retry_after = std.time.timestamp() + dht_retry_backoff_secs;
+        }
     }
 
     // --- BEP 19: Web seed downloads ---
