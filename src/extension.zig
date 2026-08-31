@@ -68,10 +68,15 @@ pub fn setExtensionBit(reserved: *[8]u8) void {
 
 /// Build our extension handshake payload (bencoded).
 /// Returns the full message bytes: [ext_id=0][bencoded_dict].
+///
+/// `listen_port` is omitted when null: advertising a bind port on an
+/// anonymized (proxy/Tor/I2P) session would tell the swarm we accept
+/// incoming connections we do not, and on Tor it is a fingerprint of
+/// the configured listenPort even though the listener is closed.
 pub fn buildExtensionHandshake(
     allocator: Allocator,
     metadata_size: ?u32,
-    listen_port: u16,
+    listen_port: ?u16,
 ) error{OutOfMemory}![]u8 {
     // Build the "m" dict mapping extension names to our IDs
     var m_entries: [1]bencode.Value.DictEntry = undefined;
@@ -91,8 +96,10 @@ pub fn buildExtensionHandshake(
         entry_count += 1;
     }
 
-    entries_buf[entry_count] = .{ .key = "p", .value = .{ .integer = listen_port } };
-    entry_count += 1;
+    if (listen_port) |port| {
+        entries_buf[entry_count] = .{ .key = "p", .value = .{ .integer = port } };
+        entry_count += 1;
+    }
 
     entries_buf[entry_count] = .{ .key = "v", .value = .{ .string = "Carl/0.1" } };
     entry_count += 1;
@@ -461,6 +468,21 @@ test "build and parse extension handshake" {
     try std.testing.expectEqual(@as(u32, 12345), hs.metadata_size.?);
     try std.testing.expectEqual(@as(u16, 6881), hs.listen_port.?);
     try std.testing.expectEqualStrings("Carl/0.1", hs.client_name.?);
+}
+
+test "extension handshake omits p when listen port is null" {
+    const allocator = std.testing.allocator;
+    const payload = try buildExtensionHandshake(allocator, 12345, null);
+    defer allocator.free(payload);
+
+    var hs = try parseExtensionHandshake(allocator, payload);
+    defer hs.deinit(allocator);
+
+    try std.testing.expectEqual(@as(?u16, null), hs.listen_port);
+    try std.testing.expectEqual(@as(u8, 1), hs.ut_metadata_id.?);
+    try std.testing.expectEqualStrings("Carl/0.1", hs.client_name.?);
+    // The encoded dict must not contain a "p" key at all.
+    try std.testing.expect(std.mem.indexOf(u8, payload, "1:pi") == null);
 }
 
 test "build metadata request" {
