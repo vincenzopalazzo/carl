@@ -236,7 +236,8 @@ pub fn parseMetadataMessage(
 
     const msg_type_val = dict_val.dictGet("msg_type") orelse return error.InvalidMessage;
     const msg_type_int = std.math.cast(u8, msg_type_val.asInt() orelse return error.InvalidMessage) orelse return error.InvalidMessage;
-    const msg_type: MetadataMsgType = std.meta.intToEnum(MetadataMsgType, msg_type_int) catch return error.InvalidMessage;
+    const msg_type: MetadataMsgType =
+        std.enums.fromInt(MetadataMsgType, msg_type_int) orelse return error.InvalidMessage;
 
     const piece_val = dict_val.dictGet("piece") orelse return error.InvalidMessage;
     const piece = std.math.cast(u32, piece_val.asInt() orelse return error.InvalidMessage) orelse return error.InvalidMessage;

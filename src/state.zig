@@ -135,9 +135,13 @@ pub const State = struct {
 };
 
 /// `<config>/carl.db`. Caller owns the returned path.
-pub fn dbPath(a: Allocator) ![]u8 {
-    const dir = try nostr_config.configDir(a);
+pub fn dbPath(
+    ctx: nostr_config.Context,
+    a: Allocator,
+) ![]u8 {
+    const dir = try nostr_config.configDir(ctx, a);
     defer a.free(dir);
+
     return std.fmt.allocPrint(a, "{s}/carl.db", .{dir});
 }
 
@@ -161,6 +165,7 @@ fn exec(db: *Sqlite, sql: [:0]const u8) Error!void {
 /// Write settings + transfers atomically (a single transaction; the table is
 /// rebuilt from `specs`). Persists to `<config>/carl.db`.
 pub fn save(
+    ctx: nostr_config.Context,
     a: Allocator,
     route: api.Route,
     download_dir: []const u8,
@@ -168,7 +173,7 @@ pub fn save(
     follows: []const FollowSpec,
     drives: []const DriveSpec,
 ) !void {
-    const dir = try nostr_config.ensureConfigDir(a);
+    const dir = try nostr_config.ensureConfigDir(ctx, a);
     defer a.free(dir);
     const path = try std.fmt.allocPrintSentinel(a, "{s}/carl.db", .{dir}, 0);
     defer a.free(path);
@@ -240,10 +245,17 @@ fn saveTo(
 
 /// Load persisted state, or null if no database exists yet. Caller frees via
 /// `State.deinit`.
-pub fn load(a: Allocator) !?State {
-    const path = try dbPath(a);
+pub fn load(
+    ctx: nostr_config.Context,
+    a: Allocator,
+) !?State {
+    const path = try dbPath(ctx, a);
     defer a.free(path);
-    std.fs.cwd().access(path, .{}) catch return null; // no DB yet
+    std.Io.Dir.cwd().access(
+        ctx.io,
+        path,
+        .{},
+    ) catch return null; // no DB yet
     const path_z = try a.dupeZ(u8, path);
     defer a.free(path_z);
     return try loadFrom(a, path_z);
@@ -346,10 +358,13 @@ fn loadFrom(a: Allocator, path: [:0]const u8) Error!State {
 /// Read just the persisted `downloadDir` setting, or null when there is no
 /// database / no value / an empty value. Best-effort: any failure reads as
 /// "unset" so callers (workdir resolution) fall back to the built-in default.
-pub fn loadDownloadDir(a: Allocator) ?[]u8 {
-    const path = dbPath(a) catch return null;
+pub fn loadDownloadDir(
+    ctx: nostr_config.Context,
+    a: Allocator,
+) ?[]u8 {
+    const path = dbPath(ctx, a) catch return null;
     defer a.free(path);
-    std.fs.cwd().access(path, .{}) catch return null; // no DB yet
+    std.Io.Dir.cwd().access(ctx.io, path, .{}) catch return null; // no DB yet
     const path_z = a.dupeZ(u8, path) catch return null;
     defer a.free(path_z);
     return loadDownloadDirFrom(a, path_z);
@@ -407,7 +422,7 @@ test "sqlite save/load round-trips settings + transfers" {
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
     defer a.free(dir);
     const path = try std.fmt.allocPrintSentinel(a, "{s}/carl.db", .{dir}, 0);
     defer a.free(path);
@@ -435,7 +450,7 @@ test "sqlite save replaces prior transfers (no accumulation)" {
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
     defer a.free(dir);
     const path = try std.fmt.allocPrintSentinel(a, "{s}/carl.db", .{dir}, 0);
     defer a.free(path);
@@ -455,7 +470,7 @@ test "sqlite save/load round-trips follows" {
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
     defer a.free(dir);
     const path = try std.fmt.allocPrintSentinel(a, "{s}/carl.db", .{dir}, 0);
     defer a.free(path);
@@ -484,7 +499,7 @@ test "sqlite save/load round-trips drives" {
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
     defer a.free(dir);
     const path = try std.fmt.allocPrintSentinel(a, "{s}/carl.db", .{dir}, 0);
     defer a.free(path);
@@ -522,7 +537,7 @@ test "loadDownloadDirFrom reads the setting; empty/missing read as unset" {
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
     defer a.free(dir);
     const path = try std.fmt.allocPrintSentinel(a, "{s}/carl.db", .{dir}, 0);
     defer a.free(path);

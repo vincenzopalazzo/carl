@@ -7,6 +7,11 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const tracker = @import("tracker.zig");
 
+const Net = std.Io.net;
+const IpAddress = Net.IpAddress;
+const Socket = Net.Socket;
+const HostName = Net.HostName;
+
 const log = std.log.scoped(.udp_tracker);
 
 const protocol_id: u64 = 0x41727101980; // magic constant per BEP 15
@@ -26,53 +31,43 @@ pub const UdpTrackerError = error{
 
 /// Perform a UDP tracker announce. Returns parsed AnnounceResponse.
 pub fn announce(
+    io: std.Io,
     allocator: Allocator,
     url: []const u8,
     req: tracker.AnnounceRequest,
 ) UdpTrackerError!tracker.AnnounceResponse {
-    // Parse URL: udp://host:port/announce
-    const host_port = parseUdpUrl(url) orelse return error.InvalidResponse;
+    const host_port =
+        parseUdpUrl(url) orelse return error.InvalidResponse;
 
-    // Resolve host
-    const addr_list = std.net.getAddressList(allocator, host_port.host, host_port.port) catch
-        return error.DnsResolveFailed;
-    defer addr_list.deinit();
+    const resolved_addr =
+        resolveIp4(io, host_port.host, host_port.port) orelse return error.DnsResolveFailed;
+    const bind_addr: IpAddress = .{
+        .ip4 = .{
+            .bytes = .{ 0, 0, 0, 0 },
+            .port = 0,
+        },
+    };
 
-    // Find an IPv4 address (UDP tracker protocol uses AF_INET)
-    var addr: ?std.net.Address = null;
-    for (addr_list.addrs) |a| {
-        if (a.any.family == std.posix.AF.INET) {
-            addr = a;
-            break;
-        }
-    }
-    if (addr == null) return error.DnsResolveFailed;
-    const resolved_addr = addr.?;
+    const sock = bind_addr.bind(io, .{
+        .mode = .dgram,
+    }) catch return error.SocketFailed;
 
-    // Create UDP socket
-    const sock = std.posix.socket(
-        std.posix.AF.INET,
-        std.posix.SOCK.DGRAM | std.posix.SOCK.CLOEXEC,
-        std.posix.IPPROTO.UDP,
-    ) catch return error.SocketFailed;
-    defer std.posix.close(sock);
+    defer sock.close(io);
 
-    // Set receive timeout
-    const tv = std.posix.timeval{ .sec = timeout_ms / 1000, .usec = 0 };
-    std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+    const rng_source: std.Random.IoSource = .{ .io = io };
+    const rng = rng_source.interface();
 
     // Step 1: Connect
-    const txn_id1 = std.crypto.random.int(u32);
+    const txn_id1 = rng.int(u32);
     var connect_buf: [16]u8 = undefined;
     std.mem.writeInt(u64, connect_buf[0..8], protocol_id, .big);
     std.mem.writeInt(u32, connect_buf[8..12], action_connect, .big);
     std.mem.writeInt(u32, connect_buf[12..16], txn_id1, .big);
 
-    _ = std.posix.sendto(sock, &connect_buf, 0, &resolved_addr.any, @sizeOf(std.posix.sockaddr.in)) catch
-        return error.SendFailed;
+    sock.send(io, &resolved_addr, &connect_buf) catch return error.SendFailed;
 
     var recv_buf: [8192]u8 = undefined; // 8KB: holds ~1360 peers in compact format
-    const connect_len = recvWithTimeout(sock, &recv_buf) catch return error.Timeout;
+    const connect_len = recvWithTimeout(io, &sock, &recv_buf) catch return error.Timeout;
 
     if (connect_len < 8) return error.InvalidResponse;
     const resp_action = std.mem.readInt(u32, recv_buf[0..4], .big);
@@ -87,7 +82,7 @@ pub fn announce(
     const connection_id = std.mem.readInt(u64, recv_buf[8..16], .big);
 
     // Step 2: Announce
-    const txn_id2 = std.crypto.random.int(u32);
+    const txn_id2 = rng.int(u32);
     var ann_buf: [98]u8 = undefined;
     std.mem.writeInt(u64, ann_buf[0..8], connection_id, .big);
     std.mem.writeInt(u32, ann_buf[8..12], action_announce, .big);
@@ -99,14 +94,13 @@ pub fn announce(
     std.mem.writeInt(u64, ann_buf[72..80], req.uploaded, .big);
     std.mem.writeInt(u32, ann_buf[80..84], eventToInt(req.event), .big);
     std.mem.writeInt(u32, ann_buf[84..88], 0, .big); // IP address (0 = default)
-    std.mem.writeInt(u32, ann_buf[88..92], std.crypto.random.int(u32), .big); // key
+    std.mem.writeInt(u32, ann_buf[88..92], rng.int(u32), .big); // key
     std.mem.writeInt(i32, ann_buf[92..96], -1, .big); // num_want = -1 (default)
     std.mem.writeInt(u16, ann_buf[96..98], req.port, .big);
 
-    _ = std.posix.sendto(sock, &ann_buf, 0, &resolved_addr.any, @sizeOf(std.posix.sockaddr.in)) catch
-        return error.SendFailed;
+    sock.send(io, &resolved_addr, &ann_buf) catch return error.SendFailed;
 
-    const ann_len = recvWithTimeout(sock, &recv_buf) catch return error.Timeout;
+    const ann_len = recvWithTimeout(io, &sock, &recv_buf) catch return error.Timeout;
 
     if (ann_len < 8) return error.InvalidResponse;
     const ann_action = std.mem.readInt(u32, recv_buf[0..4], .big);
@@ -179,13 +173,54 @@ fn parseUdpUrl(url: []const u8) ?HostPort {
 
     return .{ .host = host, .port = port };
 }
+fn resolveIp4(
+    io: std.Io,
+    host: []const u8,
+    port: u16,
+) ?IpAddress {
+    const host_name = HostName.init(host) catch return null;
 
-fn recvWithTimeout(sock: std.posix.fd_t, buf: []u8) !usize {
-    // The socket already has SO_RCVTIMEO set, so recvfrom will timeout
-    var src_addr: std.posix.sockaddr = undefined;
-    var addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
-    const n = std.posix.recvfrom(sock, buf, 0, &src_addr, &addr_len) catch return error.Timeout;
-    return n;
+    var result_storage: [16]HostName.LookupResult = undefined;
+    var resolved =
+        std.Io.Queue(HostName.LookupResult).init(&result_storage);
+
+    host_name.lookup(io, &resolved, .{
+        .port = port,
+        .family = .ip4,
+    }) catch return null;
+
+    while (true) {
+        const result = resolved.getOne(io) catch break;
+
+        switch (result) {
+            .address => |addr| switch (addr) {
+                .ip4 => return addr,
+                .ip6 => continue,
+            },
+            .canonical_name => {},
+        }
+    }
+
+    return null;
+}
+
+fn recvWithTimeout(
+    io: std.Io,
+    sock: *const Socket,
+    buf: []u8,
+) !usize {
+    const incoming = sock.receiveTimeout(
+        io,
+        buf,
+        .{
+            .duration = .{
+                .raw = .fromMilliseconds(@as(i64, timeout_ms)),
+                .clock = .awake,
+            },
+        },
+    ) catch return error.Timeout;
+
+    return incoming.data.len;
 }
 
 // --- Tests ---

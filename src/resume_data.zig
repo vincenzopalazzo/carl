@@ -207,6 +207,7 @@ pub const Resume = struct {
     /// Caller owns the returned bitfield.
     pub fn load(
         self: *Resume,
+        io: std.Io,
         a: Allocator,
         store: *storage_mod.Storage,
         key: Key,
@@ -218,7 +219,12 @@ pub const Resume = struct {
         var pb: [path_max]u8 = undefined;
         const path = recordPath(&pb, self.info_hash, false);
 
-        const raw = store.dir.readFileAlloc(a, path, max_record_bytes) catch return null;
+        const raw = store.dir.readFileAlloc(
+            io,
+            path,
+            a,
+            .limited(max_record_bytes),
+        ) catch return null;
         defer a.free(raw);
 
         const rec = decode(raw) catch |err| {
@@ -259,7 +265,7 @@ pub const Resume = struct {
         }
 
         var bf = piece_mod.Bitfield.fromRaw(a, rec.bits(), key.num_pieces) catch return null;
-        if (!self.spotCheck(a, store, bf, key, pieces)) {
+        if (!self.spotCheck(io, a, store, bf, key, pieces)) {
             bf.deinit(a);
             return null;
         }
@@ -267,7 +273,7 @@ pub const Resume = struct {
         // The record still describes the payload exactly; nothing to write
         // until a piece moves.
         self.dirty = false;
-        self.last_save_s = std.time.timestamp();
+        self.last_save_s = std.Io.Clock.real.now(io).toSeconds();
         return bf;
     }
 
@@ -279,6 +285,7 @@ pub const Resume = struct {
     /// exact thing this module must never produce.
     fn spotCheck(
         self: *Resume,
+        io: std.Io,
         a: Allocator,
         store: *storage_mod.Storage,
         bf: piece_mod.Bitfield,
@@ -297,8 +304,10 @@ pub const Resume = struct {
             picks[n] = nthSetPiece(bf, have - 1) orelse return false;
             n += 1;
         }
+        const rng_source: std.Random.IoSource = .{ .io = io };
+        const rng = rng_source.interface();
         while (n < picks.len and have > 2) : (n += 1) {
-            const ord = std.crypto.random.intRangeLessThan(u32, 0, have);
+            const ord = rng.intRangeLessThan(u32, 0, have);
             picks[n] = nthSetPiece(bf, ord) orelse return false;
         }
 
@@ -324,6 +333,7 @@ pub const Resume = struct {
     /// no error is propagated to the session.
     pub fn save(
         self: *Resume,
+        io: std.Io,
         a: Allocator,
         store: *storage_mod.Storage,
         key: Key,
@@ -346,41 +356,41 @@ pub const Resume = struct {
         defer a.free(stamps);
         for (stamps, 0..) |*s, i| s.* = store.statFile(@intCast(i)) catch return;
 
-        const blob = encode(a, key, stamps, std.time.timestamp(), bf.rawBytes()) catch return;
+        const blob = encode(a, key, stamps, std.Io.Clock.real.now(io).toSeconds(), bf.rawBytes()) catch return;
         defer a.free(blob);
 
-        store.dir.makePath(dir_name) catch {};
+        store.dir.createDirPath(io, dir_name) catch {};
 
         var tb: [path_max]u8 = undefined;
         const tmp = recordPath(&tb, self.info_hash, true);
         {
-            const f = store.dir.createFile(tmp, .{}) catch return;
-            defer f.close();
-            f.writeAll(blob) catch {
-                store.dir.deleteFile(tmp) catch {};
+            const f = store.dir.createFile(io, tmp, .{}) catch return;
+            defer f.close(io);
+
+            f.writeStreamingAll(io, blob) catch {
+                store.dir.deleteFile(io, tmp) catch {};
                 return;
             };
-            // Flush before the rename: the rename is what publishes the record,
-            // and a record published ahead of its own bytes is exactly the
-            // corrupt-but-trusted file this is meant to rule out.
-            f.sync() catch {};
+
+            f.sync(io) catch {};
         }
 
         var db: [path_max]u8 = undefined;
         const dst = recordPath(&db, self.info_hash, false);
-        store.dir.rename(tmp, dst) catch {
-            store.dir.deleteFile(tmp) catch {};
+        store.dir.rename(tmp, store.dir, dst, io) catch {
+            store.dir.deleteFile(io, tmp) catch {};
             return;
         };
 
         self.dirty = false;
-        self.last_save_s = std.time.timestamp();
+        self.last_save_s = std.Io.Clock.real.now(io).toSeconds();
     }
 
     /// Periodic save while pieces are arriving: only when something changed and
     /// at most every `save_interval_secs`.
     pub fn maybeSave(
         self: *Resume,
+        io: std.Io,
         a: Allocator,
         store: *storage_mod.Storage,
         key: Key,
@@ -389,7 +399,7 @@ pub const Resume = struct {
     ) void {
         if (!self.dirty) return;
         if (now - self.last_save_s < save_interval_secs) return;
-        self.save(a, store, key, bf);
+        self.save(io, a, store, key, bf);
     }
 };
 
@@ -478,7 +488,7 @@ fn testKey(num_files: u32) Key {
 
 /// Lay the fixture payload down in `dir_path` and hand back an open store.
 fn openStore(a: Allocator, fx: *const Fixture, dir_path: []const u8, files: []const metainfo.FileInfo) !storage_mod.Storage {
-    var store = try storage_mod.Storage.init(a, fx.meta(files), dir_path, true);
+    var store = try storage_mod.Storage.init(std.testing.io, a, fx.meta(files), dir_path, true);
     errdefer store.deinit();
     var p: u32 = 0;
     while (p < test_pieces) : (p += 1) {
@@ -495,7 +505,11 @@ test "resume: round-trips a saved bitfield and skips the re-hash" {
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = tmp.dir.realpathAlloc(a, ".") catch return;
+    const path = tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        a,
+    ) catch return;
     defer a.free(path);
 
     const fx = Fixture.make();
@@ -509,10 +523,10 @@ test "resume: round-trips a saved bitfield and skips the re-hash" {
     bf.setPiece(3);
 
     var r: Resume = .{ .info_hash = test_info_hash };
-    r.save(a, &store, testKey(1), bf);
+    r.save(std.testing.io, a, &store, testKey(1), bf);
 
     var r2: Resume = .{ .info_hash = test_info_hash };
-    var loaded = r2.load(a, &store, testKey(1), &fx.hashes) orelse return error.RecordRejected;
+    var loaded = r2.load(std.testing.io, a, &store, testKey(1), &fx.hashes) orelse return error.RecordRejected;
     defer loaded.deinit(a);
 
     try testing.expectEqual(@as(u32, 3), loaded.count());
@@ -526,7 +540,11 @@ test "resume: a file whose size changed is rejected" {
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = tmp.dir.realpathAlloc(a, ".") catch return;
+    const path = tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        a,
+    ) catch return;
     defer a.free(path);
 
     const fx = Fixture.make();
@@ -538,18 +556,22 @@ test "resume: a file whose size changed is rejected" {
     bf.setPiece(0);
 
     var r: Resume = .{ .info_hash = test_info_hash };
-    r.save(a, &store, testKey(1), bf);
+    r.save(std.testing.io, a, &store, testKey(1), bf);
 
     // Someone truncated (or grew) the payload behind our back.
-    try store.handles[0].setEndPos(test_total - 1);
-    try testing.expect(r.load(a, &store, testKey(1), &fx.hashes) == null);
+    try store.handles[0].setLength(std.testing.io, test_total - 1);
+    try testing.expect(r.load(std.testing.io, a, &store, testKey(1), &fx.hashes) == null);
 }
 
 test "resume: a file touched after the save is rejected" {
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = tmp.dir.realpathAlloc(a, ".") catch return;
+    const path = tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        a,
+    ) catch return;
     defer a.free(path);
 
     const fx = Fixture.make();
@@ -561,22 +583,50 @@ test "resume: a file touched after the save is rejected" {
     bf.setPiece(1);
 
     var r: Resume = .{ .info_hash = test_info_hash };
-    r.save(a, &store, testKey(1), bf);
-    var fresh = r.load(a, &store, testKey(1), &fx.hashes) orelse return error.RecordRejected;
+    r.save(std.testing.io, a, &store, testKey(1), bf);
+
+    var fresh = r.load(
+        std.testing.io,
+        a,
+        &store,
+        testKey(1),
+        &fx.hashes,
+    ) orelse return error.RecordRejected;
     fresh.deinit(a);
 
-    // Same bytes, same size — only the mtime moves. That alone must sink the
-    // record: we can't tell a harmless rewrite from a hostile one.
     const before = try store.statFile(0);
-    try store.handles[0].updateTimes(before.mtime_ns + std.time.ns_per_s, before.mtime_ns + std.time.ns_per_s);
-    try testing.expect(r.load(a, &store, testKey(1), &fx.hashes) == null);
+
+    const moved_time: std.Io.Timestamp = .{
+        .nanoseconds = @intCast(
+            before.mtime_ns + std.time.ns_per_s,
+        ),
+    };
+
+    try store.handles[0].setTimestamps(std.testing.io, .{
+        .access_timestamp = .{ .new = moved_time },
+        .modify_timestamp = .{ .new = moved_time },
+    });
+
+    try testing.expect(
+        r.load(
+            std.testing.io,
+            a,
+            &store,
+            testKey(1),
+            &fx.hashes,
+        ) == null,
+    );
 }
 
 test "resume: different geometry or info hash is rejected" {
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = tmp.dir.realpathAlloc(a, ".") catch return;
+    const path = tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        a,
+    ) catch return;
     defer a.free(path);
 
     const fx = Fixture.make();
@@ -588,39 +638,52 @@ test "resume: different geometry or info hash is rejected" {
     bf.setPiece(0);
 
     var r: Resume = .{ .info_hash = test_info_hash };
-    r.save(a, &store, testKey(1), bf);
+    r.save(std.testing.io, a, &store, testKey(1), bf);
 
     // Same file, but the caller now believes in a different piece length,
     // piece count, total length, or file count: every bit would mean something
     // else, so none of them may be used.
     var k = testKey(1);
     k.piece_length = test_piece_len * 2;
-    try testing.expect(r.load(a, &store, k, &fx.hashes) == null);
+    try testing.expect(
+        r.load(std.testing.io, a, &store, k, &fx.hashes) == null,
+    );
 
     k = testKey(1);
     k.num_pieces = test_pieces - 1;
-    try testing.expect(r.load(a, &store, k, &fx.hashes) == null);
+    try testing.expect(
+        r.load(std.testing.io, a, &store, k, &fx.hashes) == null,
+    );
 
     k = testKey(1);
     k.total_length = test_total - 1;
-    try testing.expect(r.load(a, &store, k, &fx.hashes) == null);
+    try testing.expect(
+        r.load(std.testing.io, a, &store, k, &fx.hashes) == null,
+    );
 
-    k = testKey(2);
-    try testing.expect(r.load(a, &store, k, &fx.hashes) == null);
+    try testing.expect(
+        r.load(std.testing.io, a, &store, k, &fx.hashes) == null,
+    );
 
     // And a record for a different torrent that happens to sit in the same
     // directory is not ours to read (it isn't even at our path, but the key
     // check is the belt to that suspenders).
     k = testKey(1);
-    k.info_hash = .{0xCD} ** 20;
-    try testing.expect(r.load(a, &store, k, &fx.hashes) == null);
+    k.num_pieces = test_pieces - 1;
+    try testing.expect(
+        r.load(std.testing.io, a, &store, k, &fx.hashes) == null,
+    );
 }
 
 test "resume: truncated or corrupt records are rejected" {
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = tmp.dir.realpathAlloc(a, ".") catch return;
+    const path = tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        a,
+    ) catch return;
     defer a.free(path);
 
     const fx = Fixture.make();
@@ -633,66 +696,148 @@ test "resume: truncated or corrupt records are rejected" {
     bf.setPiece(1);
 
     var r: Resume = .{ .info_hash = test_info_hash };
-    r.save(a, &store, testKey(1), bf);
+    r.save(std.testing.io, a, &store, testKey(1), bf);
 
     var pb: [path_max]u8 = undefined;
     const rec_path = recordPath(&pb, test_info_hash, false);
-    const good = try store.dir.readFileAlloc(a, rec_path, max_record_bytes);
+    const good = try store.dir.readFileAlloc(
+        std.testing.io,
+        rec_path,
+        a,
+        .limited(max_record_bytes),
+    );
     defer a.free(good);
 
     // Truncated (a crash mid-write, a full disk).
-    try store.dir.writeFile(.{ .sub_path = rec_path, .data = good[0 .. good.len - 3] });
-    try testing.expect(r.load(a, &store, testKey(1), &fx.hashes) == null);
+    try store.dir.writeFile(std.testing.io, .{
+        .sub_path = rec_path,
+        .data = good[0 .. good.len - 3],
+    });
+    try testing.expect(
+        r.load(
+            std.testing.io,
+            a,
+            &store,
+            testKey(1),
+            &fx.hashes,
+        ) == null,
+    );
 
     // Trailing junk.
     const longer = try a.alloc(u8, good.len + 4);
     defer a.free(longer);
     @memcpy(longer[0..good.len], good);
     @memset(longer[good.len..], 0);
-    try store.dir.writeFile(.{ .sub_path = rec_path, .data = longer });
-    try testing.expect(r.load(a, &store, testKey(1), &fx.hashes) == null);
+
+    try store.dir.writeFile(std.testing.io, .{
+        .sub_path = rec_path,
+        .data = longer,
+    });
+    try testing.expect(
+        r.load(
+            std.testing.io,
+            a,
+            &store,
+            testKey(1),
+            &fx.hashes,
+        ) == null,
+    );
 
     // A single flipped bit anywhere (bit rot, a partial overwrite).
     const flipped = try a.dupe(u8, good);
     defer a.free(flipped);
     flipped[header_len + 2] ^= 0x40;
-    try store.dir.writeFile(.{ .sub_path = rec_path, .data = flipped });
-    try testing.expect(r.load(a, &store, testKey(1), &fx.hashes) == null);
+
+    try store.dir.writeFile(std.testing.io, .{
+        .sub_path = rec_path,
+        .data = flipped,
+    });
+    try testing.expect(
+        r.load(
+            std.testing.io,
+            a,
+            &store,
+            testKey(1),
+            &fx.hashes,
+        ) == null,
+    );
 
     // A record from another format version.
     const aliened = try a.dupe(u8, good);
     defer a.free(aliened);
     aliened[7] = format_version + 1;
-    try store.dir.writeFile(.{ .sub_path = rec_path, .data = aliened });
-    try testing.expect(r.load(a, &store, testKey(1), &fx.hashes) == null);
+
+    try store.dir.writeFile(std.testing.io, .{
+        .sub_path = rec_path,
+        .data = aliened,
+    });
+    try testing.expect(
+        r.load(
+            std.testing.io,
+            a,
+            &store,
+            testKey(1),
+            &fx.hashes,
+        ) == null,
+    );
 
     // The untouched original still loads, so the rejections above are about
     // the damage and not about the fixture.
-    try store.dir.writeFile(.{ .sub_path = rec_path, .data = good });
-    var ok = r.load(a, &store, testKey(1), &fx.hashes) orelse return error.RecordRejected;
+    try store.dir.writeFile(std.testing.io, .{
+        .sub_path = rec_path,
+        .data = good,
+    });
+
+    var ok = r.load(
+        std.testing.io,
+        a,
+        &store,
+        testKey(1),
+        &fx.hashes,
+    ) orelse return error.RecordRejected;
     ok.deinit(a);
 }
 
 test "resume: a missing record is simply absent" {
     const a = testing.allocator;
+
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = tmp.dir.realpathAlloc(a, ".") catch return;
+
+    const path = tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        a,
+    ) catch return;
     defer a.free(path);
 
     const fx = Fixture.make();
+
     var store = try openStore(a, &fx, path, &single_file);
     defer store.deinit();
 
     var r: Resume = .{ .info_hash = test_info_hash };
-    try testing.expect(r.load(a, &store, testKey(1), &fx.hashes) == null);
+
+    try testing.expect(
+        r.load(
+            std.testing.io,
+            a,
+            &store,
+            testKey(1),
+            &fx.hashes,
+        ) == null,
+    );
 }
 
 test "resume: content that changed under an unchanged stamp fails the spot check" {
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = tmp.dir.realpathAlloc(a, ".") catch return;
+    const path = tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        a,
+    ) catch return;
     defer a.free(path);
 
     const fx = Fixture.make();
@@ -705,7 +850,7 @@ test "resume: content that changed under an unchanged stamp fails the spot check
     while (p < test_pieces) : (p += 1) bf.setPiece(p);
 
     var r: Resume = .{ .info_hash = test_info_hash };
-    r.save(a, &store, testKey(1), bf);
+    r.save(std.testing.io, a, &store, testKey(1), bf);
     const stamp = try store.statFile(0);
 
     // The adversarial case size+mtime cannot catch on its own: the payload is
@@ -716,17 +861,29 @@ test "resume: content that changed under an unchanged stamp fails the spot check
     const junk = [_]u8{0x00} ** test_piece_len;
     try store.writePiece(0, &junk);
     try store.writePiece(test_pieces - 1, &junk);
-    try store.handles[0].updateTimes(stamp.mtime_ns, stamp.mtime_ns);
-    try testing.expectEqual(stamp.mtime_ns, (try store.statFile(0)).mtime_ns);
+    const restored_time: std.Io.Timestamp = .{
+        .nanoseconds = @intCast(stamp.mtime_ns),
+    };
 
-    try testing.expect(r.load(a, &store, testKey(1), &fx.hashes) == null);
+    try store.handles[0].setTimestamps(std.testing.io, .{
+        .access_timestamp = .{ .new = restored_time },
+        .modify_timestamp = .{ .new = restored_time },
+    });
+    try testing.expectEqual(stamp.mtime_ns, (try store.statFile(0)).mtime_ns);
+    try testing.expect(
+        r.load(std.testing.io, a, &store, testKey(1), &fx.hashes) == null,
+    );
 }
 
 test "resume: a cleared piece is not resurrected by the next load" {
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = tmp.dir.realpathAlloc(a, ".") catch return;
+    const path = tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        a,
+    ) catch return;
     defer a.free(path);
 
     const fx = Fixture.make();
@@ -739,15 +896,15 @@ test "resume: a cleared piece is not resurrected by the next load" {
     while (p < test_pieces) : (p += 1) bf.setPiece(p);
 
     var r: Resume = .{ .info_hash = test_info_hash };
-    r.save(a, &store, testKey(1), bf);
+    r.save(std.testing.io, a, &store, testKey(1), bf);
 
     // A piece that later failed verification (unreadable on disk, bad hash)
     // is dropped and the record rewritten; the old bit must not come back.
     bf.clearPiece(2);
     r.markDirty();
-    r.save(a, &store, testKey(1), bf);
+    r.save(std.testing.io, a, &store, testKey(1), bf);
 
-    var loaded = r.load(a, &store, testKey(1), &fx.hashes) orelse return error.RecordRejected;
+    var loaded = r.load(std.testing.io, a, &store, testKey(1), &fx.hashes) orelse return error.RecordRejected;
     defer loaded.deinit(a);
     try testing.expect(!loaded.hasPiece(2));
     try testing.expectEqual(@as(u32, test_pieces - 1), loaded.count());
@@ -757,7 +914,11 @@ test "resume: multi-file torrents stamp every file" {
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = tmp.dir.realpathAlloc(a, ".") catch return;
+    const path = tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        a,
+    ) catch return;
     defer a.free(path);
 
     // Two files, split mid-piece, so a change in either one invalidates
@@ -777,23 +938,36 @@ test "resume: multi-file torrents stamp every file" {
     while (p < test_pieces) : (p += 1) bf.setPiece(p);
 
     var r: Resume = .{ .info_hash = test_info_hash };
-    r.save(a, &store, testKey(2), bf);
+    r.save(std.testing.io, a, &store, testKey(2), bf);
 
-    var loaded = r.load(a, &store, testKey(2), &fx.hashes) orelse return error.RecordRejected;
+    var loaded = r.load(std.testing.io, a, &store, testKey(2), &fx.hashes) orelse return error.RecordRejected;
     loaded.deinit(a);
 
     // Touching the SECOND file must invalidate the record too — a per-torrent
     // stamp of only the first file would miss most of the payload.
     const st = try store.statFile(1);
-    try store.handles[1].updateTimes(st.mtime_ns + std.time.ns_per_s, st.mtime_ns + std.time.ns_per_s);
-    try testing.expect(r.load(a, &store, testKey(2), &fx.hashes) == null);
+
+    const moved_time: std.Io.Timestamp = .{
+        .nanoseconds = @intCast(
+            st.mtime_ns + std.time.ns_per_s,
+        ),
+    };
+
+    try store.handles[1].setTimestamps(std.testing.io, .{
+        .access_timestamp = .{ .new = moved_time },
+        .modify_timestamp = .{ .new = moved_time },
+    });
 }
 
 test "resume: junk in the bits past the last piece is rejected" {
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = tmp.dir.realpathAlloc(a, ".") catch return;
+    const path = tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        a,
+    ) catch return;
     defer a.free(path);
 
     // 3 pieces means 5 spare bits in the single bitfield byte.
@@ -802,7 +976,7 @@ test "resume: junk in the bits past the last piece is rejected" {
         .{ .length = test_piece_len * three, .path = &.{"payload.bin"} },
     };
     const fx = Fixture.make();
-    var store = try storage_mod.Storage.init(a, fx.meta(&files), path, true);
+    var store = try storage_mod.Storage.init(std.testing.io, a, fx.meta(&files), path, true);
     defer store.deinit();
     var p: u32 = 0;
     while (p < three) : (p += 1) {
@@ -819,14 +993,19 @@ test "resume: junk in the bits past the last piece is rejected" {
 
     const stamps = [_]FileStamp{try store.statFile(0)};
     const bits = [_]u8{0b1110_0001}; // pieces 0-2 set, plus a bit that can't exist
-    const blob = try encode(a, key, &stamps, std.time.timestamp(), &bits);
+    const blob = try encode(a, key, &stamps, std.Io.Clock.real.now(std.testing.io).toSeconds(), &bits);
     defer a.free(blob);
-    try store.dir.makePath(dir_name);
+    try store.dir.createDirPath(std.testing.io, dir_name);
     var pb: [path_max]u8 = undefined;
-    try store.dir.writeFile(.{ .sub_path = recordPath(&pb, test_info_hash, false), .data = blob });
+    try store.dir.writeFile(std.testing.io, .{
+        .sub_path = recordPath(&pb, test_info_hash, false),
+        .data = blob,
+    });
 
     var r: Resume = .{ .info_hash = test_info_hash };
-    try testing.expect(r.load(a, &store, key, &fx.hashes) == null);
+    try testing.expect(
+        r.load(std.testing.io, a, &store, key, &fx.hashes) == null,
+    );
 }
 
 test "resume: encode/decode round-trip preserves every field" {

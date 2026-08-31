@@ -15,6 +15,14 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const nostr_config = @import("nostr_config.zig");
 
+const builtin = @import("builtin");
+
+const private_permissions: std.Io.File.Permissions =
+    if (builtin.os.tag == .windows)
+        .default_file
+    else
+        @enumFromInt(0o600);
+
 const log = std.log.scoped(.i2p_seed);
 
 /// SAM destination private keys are ~884 base64 chars for Ed25519; allow ample
@@ -40,39 +48,61 @@ pub fn isValidDestBlob(data: []const u8) bool {
     return @max(std_n, i2p_n) >= min_dest_decoded_len;
 }
 
-fn destPath(allocator: Allocator, info_hash_hex: []const u8) ![]u8 {
-    const dir = try nostr_config.configDir(allocator);
+fn destPath(
+    ctx: nostr_config.Context,
+    allocator: Allocator,
+    info_hash_hex: []const u8,
+) ![]u8 {
+    const dir = try nostr_config.configDir(ctx, allocator);
     defer allocator.free(dir);
-    return std.fmt.allocPrint(allocator, "{s}/i2p-seeds/{s}.dest", .{ dir, info_hash_hex });
+
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}/i2p-seeds/{s}.dest",
+        .{ dir, info_hash_hex },
+    );
 }
 
 /// Load a persisted destination private key for `info_hash_hex`, or null if
 /// none is stored yet. Caller owns the returned slice.
-pub fn load(allocator: Allocator, info_hash_hex: []const u8) !?[]u8 {
-    const path = try destPath(allocator, info_hash_hex);
+pub fn load(
+    ctx: nostr_config.Context,
+    allocator: Allocator,
+    info_hash_hex: []const u8,
+) !?[]u8 {
+    const path = try destPath(ctx, allocator, info_hash_hex);
     defer allocator.free(path);
-    const data = std.fs.cwd().readFileAlloc(allocator, path, max_dest_len) catch |err| switch (err) {
+
+    const data = std.Io.Dir.cwd().readFileAlloc(
+        ctx.io,
+        path,
+        allocator,
+        .limited(max_dest_len),
+    ) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
+
     const trimmed = std.mem.trim(u8, data, " \t\r\n");
+
     if (trimmed.len == 0) {
         allocator.free(data);
         return null;
     }
-    // A truncated/corrupt blob (e.g. daemon killed mid-save before the write
-    // was atomic) would be fed to SESSION CREATE, SAM rejects it, and the
-    // seed process exits — the seed vanishes on every restart. Treat it as
-    // missing instead: quarantine the file and let the caller generate a
-    // fresh transient destination (new address beats no seed).
+
     if (!isValidDestBlob(trimmed)) {
-        log.warn("ignoring corrupt i2p seed destination {s} ({d} bytes) — a fresh address will be generated", .{ path, trimmed.len });
+        log.warn(
+            "ignoring corrupt i2p seed destination {s} ({d} bytes) — a fresh address will be generated",
+            .{ path, trimmed.len },
+        );
+
         allocator.free(data);
-        std.fs.cwd().deleteFile(path) catch {};
+        std.Io.Dir.cwd().deleteFile(ctx.io, path) catch {};
         return null;
     }
+
     if (trimmed.len == data.len) return data;
-    // Trim copied a sub-slice; re-own it compactly so the caller can free it.
+
     defer allocator.free(data);
     return try allocator.dupe(u8, trimmed);
 }
@@ -80,37 +110,73 @@ pub fn load(allocator: Allocator, info_hash_hex: []const u8) !?[]u8 {
 /// Persist `dest_priv` (the SAM private-key blob) for `info_hash_hex`, 0600.
 /// Best-effort: a write failure is logged, not fatal — the seed still runs
 /// this session, it just won't keep its address on the next restart.
-pub fn save(allocator: Allocator, info_hash_hex: []const u8, dest_priv: []const u8) void {
-    saveImpl(allocator, info_hash_hex, dest_priv) catch |err| {
-        log.warn("could not persist i2p seed destination for {s}: {}", .{ info_hash_hex, err });
+pub fn save(
+    ctx: nostr_config.Context,
+    allocator: Allocator,
+    info_hash_hex: []const u8,
+    dest_priv: []const u8,
+) void {
+    saveImpl(ctx, allocator, info_hash_hex, dest_priv) catch |err| {
+        log.warn(
+            "could not persist i2p seed destination for {s}: {}",
+            .{ info_hash_hex, err },
+        );
     };
 }
 
-fn saveImpl(allocator: Allocator, info_hash_hex: []const u8, dest_priv: []const u8) !void {
-    const dir = try nostr_config.configDir(allocator);
+fn saveImpl(
+    ctx: nostr_config.Context,
+    allocator: Allocator,
+    info_hash_hex: []const u8,
+    dest_priv: []const u8,
+) !void {
+    const dir = try nostr_config.configDir(ctx, allocator);
     defer allocator.free(dir);
-    const seeds_dir = try std.fmt.allocPrint(allocator, "{s}/i2p-seeds", .{dir});
+
+    const seeds_dir = try std.fmt.allocPrint(
+        allocator,
+        "{s}/i2p-seeds",
+        .{dir},
+    );
     defer allocator.free(seeds_dir);
-    std.fs.cwd().makePath(seeds_dir) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
-    const path = try std.fmt.allocPrint(allocator, "{s}/{s}.dest", .{ seeds_dir, info_hash_hex });
+
+    try std.Io.Dir.cwd().createDirPath(ctx.io, seeds_dir);
+
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}.dest",
+        .{ seeds_dir, info_hash_hex },
+    );
     defer allocator.free(path);
-    // Write to a temp file + rename so a crash mid-write can never leave a
-    // truncated key behind — the rename is atomic, readers see either the old
-    // complete blob or the new one, never a prefix. (Observed in the field:
-    // a daemon crash left a 4-byte .dest, SAM then rejected it and the seed
-    // died on every restart.)
-    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+
+    const tmp_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}.tmp",
+        .{path},
+    );
     defer allocator.free(tmp_path);
+
     {
-        var file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true, .mode = 0o600 });
-        defer file.close();
-        try file.writeAll(dest_priv);
-        try file.chmod(0o600);
+        const file = try std.Io.Dir.cwd().createFile(
+            ctx.io,
+            tmp_path,
+            .{
+                .truncate = true,
+                .permissions = private_permissions,
+            },
+        );
+        defer file.close(ctx.io);
+
+        try file.writeStreamingAll(ctx.io, dest_priv);
+        try file.setPermissions(ctx.io, private_permissions);
     }
-    try std.fs.cwd().rename(tmp_path, path);
+
+    try std.Io.Dir.cwd().rename(
+        tmp_path,
+        std.Io.Dir.cwd(),
+        path,
+        ctx.io,
+    );
 }
 
 test "i2p_seed: isValidDestBlob rejects truncated/corrupt writes" {
@@ -127,36 +193,53 @@ test "i2p_seed: isValidDestBlob rejects truncated/corrupt writes" {
 }
 
 /// Delete the persisted destination for `info_hash_hex` (best-effort).
-pub fn remove(allocator: Allocator, info_hash_hex: []const u8) void {
-    const path = destPath(allocator, info_hash_hex) catch return;
+pub fn remove(
+    ctx: nostr_config.Context,
+    allocator: Allocator,
+    info_hash_hex: []const u8,
+) void {
+    const path = destPath(ctx, allocator, info_hash_hex) catch return;
     defer allocator.free(path);
-    std.fs.cwd().deleteFile(path) catch {};
+
+    std.Io.Dir.cwd().deleteFile(ctx.io, path) catch {};
 }
 
 test "i2p_seed: save then load round-trips; missing is null" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(tmp_path);
 
-    // Point configDir at the tmp dir via XDG_CONFIG_HOME for the duration.
-    const prev = std.process.getEnvVarOwned(allocator, "XDG_CONFIG_HOME") catch null;
-    defer if (prev) |p| allocator.free(p);
-    // Note: setenv isn't available portably in Zig tests without libc helpers,
-    // so this test exercises the path math + IO against an explicit dir instead.
+    // Exercise the path math + IO against an explicit temp dir.
     const hex = "aa" ** 20;
     const dir = try std.fmt.allocPrint(allocator, "{s}/carl/i2p-seeds", .{tmp_path});
     defer allocator.free(dir);
-    try std.fs.cwd().makePath(dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, dir);
+
     const path = try std.fmt.allocPrint(allocator, "{s}/{s}.dest", .{ dir, hex });
     defer allocator.free(path);
+
     {
-        var f = try std.fs.cwd().createFile(path, .{ .truncate = true, .mode = 0o600 });
-        defer f.close();
-        try f.writeAll("persisted-key-blob\n");
+        var f = try std.Io.Dir.cwd().createFile(
+            std.testing.io,
+            path,
+            .{ .truncate = true, .permissions = @enumFromInt(0o600) },
+        );
+        defer f.close(std.testing.io);
+
+        try f.writeStreamingAll(
+            std.testing.io,
+            "persisted-key-blob\n",
+        );
     }
-    const data = try std.fs.cwd().readFileAlloc(allocator, path, max_dest_len);
+
+    const data = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        path,
+        allocator,
+        .limited(max_dest_len),
+    );
     defer allocator.free(data);
     try std.testing.expectEqualStrings("persisted-key-blob", std.mem.trim(u8, data, " \t\r\n"));
 }

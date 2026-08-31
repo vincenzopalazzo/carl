@@ -21,6 +21,10 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const tls = std.crypto.tls;
 
+const Net = std.Io.net;
+const Stream = Net.Stream;
+const IpAddress = Net.IpAddress;
+
 const log = std.log.scoped(.proxy);
 
 pub const ProxyError = error{
@@ -168,25 +172,34 @@ pub fn redactUrl(url: []const u8, out: []u8) []const u8 {
 
 /// Open a TCP tunnel through the proxy to an IPv4 peer address. Returns a
 /// connected stream ready for the BitTorrent handshake.
-pub fn connectThroughProxyAddr(allocator: Allocator, proxy: Proxy, target: std.net.Address) ProxyError!std.net.Stream {
-    if (target.any.family != std.posix.AF.INET) return error.UnsupportedAddress;
-    const ip4: [4]u8 = @bitCast(target.in.sa.addr);
-    const port = target.getPort();
+pub fn connectThroughProxyAddr(
+    io: std.Io,
+    allocator: Allocator,
+    proxy: Proxy,
+    target: IpAddress,
+) ProxyError!Stream {
+    const target_ip4 = switch (target) {
+        .ip4 => |addr| addr,
+        .ip6 => return error.UnsupportedAddress,
+    };
 
-    var stream = try dialProxy(allocator, proxy, proxy_timeout_secs);
-    errdefer stream.close();
+    const ip4 = target_ip4.bytes;
+    const port = target_ip4.port;
+
+    var stream = try dialProxy(io, allocator, proxy, proxy_timeout_secs);
+    errdefer stream.close(io);
 
     switch (proxy.scheme) {
         .socks5, .socks5h => {
-            try socks5Handshake(stream, proxy);
-            try socks5ConnectIp4(stream, ip4, port);
+            try socks5Handshake(io, stream, proxy);
+            try socks5ConnectIp4(io, stream, ip4, port);
         },
         .http => {
             var host_buf: [16]u8 = undefined;
             const host = std.fmt.bufPrint(&host_buf, "{d}.{d}.{d}.{d}", .{
                 ip4[0], ip4[1], ip4[2], ip4[3],
             }) catch return error.HandshakeFailed;
-            try httpConnect(allocator, stream, proxy, host, port);
+            try httpConnect(io, allocator, stream, proxy, host, port);
         },
     }
 
@@ -197,26 +210,40 @@ pub fn connectThroughProxyAddr(allocator: Allocator, proxy: Proxy, target: std.n
 /// CONNECT request, but DON'T read the reply. The caller polls for readability
 /// and then calls `readSocks5ReplyPub`. Lets the Tor circuit-build (1-10s)
 /// happen async without blocking the event loop.
-pub fn connectThroughProxyAddrStart(allocator: Allocator, proxy: Proxy, target: std.net.Address) ProxyError!std.net.Stream {
-    if (target.any.family != std.posix.AF.INET) return error.UnsupportedAddress;
-    const ip4: [4]u8 = @bitCast(target.in.sa.addr);
-    const port = target.getPort();
+pub fn connectThroughProxyAddrStart(
+    io: std.Io,
+    allocator: Allocator,
+    proxy: Proxy,
+    target: IpAddress,
+) ProxyError!Stream {
+    const ip4_addr = switch (target) {
+        .ip4 => |addr| addr,
+        .ip6 => return error.UnsupportedAddress,
+    };
 
-    var stream = try dialProxy(allocator, proxy, proxy_timeout_secs);
-    errdefer stream.close();
+    const ip4 = ip4_addr.bytes;
+    const port = ip4_addr.port;
+
+    var stream = try dialProxy(
+        io,
+        allocator,
+        proxy,
+        proxy_timeout_secs,
+    );
+    errdefer stream.close(io);
 
     switch (proxy.scheme) {
         .socks5, .socks5h => {
-            try socks5Handshake(stream, proxy);
+            try socks5Handshake(io, stream, proxy);
             const req = buildSocks5ConnectIp4(ip4, port);
-            try writeAll(stream, &req);
+            try writeAll(io, stream, &req);
         },
         .http => {
             var host_buf: [16]u8 = undefined;
             const host = std.fmt.bufPrint(&host_buf, "{d}.{d}.{d}.{d}", .{
                 ip4[0], ip4[1], ip4[2], ip4[3],
             }) catch return error.HandshakeFailed;
-            try httpConnect(allocator, stream, proxy, host, port);
+            try httpConnect(io, allocator, stream, proxy, host, port);
         },
     }
 
@@ -225,29 +252,47 @@ pub fn connectThroughProxyAddrStart(allocator: Allocator, proxy: Proxy, target: 
 
 /// Public wrapper so the async proxy-connect path can read the SOCKS5 CONNECT
 /// reply when the socket becomes readable.
-pub fn readSocks5ReplyPub(stream: std.net.Stream) ProxyError!void {
-    return readSocks5Reply(stream);
+pub fn readSocks5ReplyPub(
+    io: std.Io,
+    stream: Stream,
+) ProxyError!void {
+    return readSocks5Reply(io, stream);
 }
 
 /// Open a TCP tunnel through the proxy to a host:port. With socks5h the
 /// hostname is sent to the proxy to resolve (no DNS leak); with socks5 we
 /// resolve locally; with http the proxy resolves via CONNECT.
-pub fn connectThroughProxyHost(allocator: Allocator, proxy: Proxy, host: []const u8, port: u16) ProxyError!std.net.Stream {
-    var stream = try dialProxy(allocator, proxy, http_get_timeout_secs);
-    errdefer stream.close();
+pub fn connectThroughProxyHost(
+    io: std.Io,
+    allocator: Allocator,
+    proxy: Proxy,
+    host: []const u8,
+    port: u16,
+) ProxyError!Stream {
+    var stream = try dialProxy(
+        io,
+        allocator,
+        proxy,
+        http_get_timeout_secs,
+    );
+    errdefer stream.close(io);
 
     switch (proxy.scheme) {
         .socks5 => {
-            try socks5Handshake(stream, proxy);
-            const addr = try resolveIp4(allocator, host, port);
-            const ip4: [4]u8 = @bitCast(addr.in.sa.addr);
-            try socks5ConnectIp4(stream, ip4, port);
+            try socks5Handshake(io, stream, proxy);
+            const addr = try resolveIp4(io, host, port);
+
+            const ip4 = switch (addr) {
+                .ip4 => |a| a.bytes,
+                .ip6 => return error.UnsupportedAddress,
+            };
+            try socks5ConnectIp4(io, stream, ip4, port);
         },
         .socks5h => {
-            try socks5Handshake(stream, proxy);
-            try socks5ConnectDomain(stream, host, port);
+            try socks5Handshake(io, stream, proxy);
+            try socks5ConnectDomain(io, stream, host, port);
         },
-        .http => try httpConnect(allocator, stream, proxy, host, port),
+        .http => try httpConnect(io, allocator, stream, proxy, host, port),
     }
 
     return stream;
@@ -261,11 +306,23 @@ pub fn connectThroughProxyHost(allocator: Allocator, proxy: Proxy, host: []const
 /// We build the request by hand rather than using `std.http.Client`: its proxy
 /// support (0.15.2) covers HTTP/HTTPS proxies only, not SOCKS, so routing GETs
 /// over our own tunnel keeps a single code path for every proxy scheme.
-pub fn httpGet(allocator: Allocator, proxy: Proxy, url: []const u8, extra_headers: ?[]const Header) ProxyError![]u8 {
+pub fn httpGet(
+    io: std.Io,
+    allocator: Allocator,
+    proxy: Proxy,
+    url: []const u8,
+    extra_headers: ?[]const Header,
+) ProxyError![]u8 {
     const u = parseHttpUrl(url) orelse return error.InvalidUrl;
 
-    var stream = try connectThroughProxyHost(allocator, proxy, u.host, u.port);
-    defer stream.close();
+    var stream = try connectThroughProxyHost(
+        io,
+        allocator,
+        proxy,
+        u.host,
+        u.port,
+    );
+    defer stream.close(io);
 
     // Build the request by appending directly (tracker paths can be long --
     // info_hash, peer_id, and private-tracker passkeys -- so avoid fixed buffers).
@@ -292,21 +349,26 @@ pub fn httpGet(allocator: Allocator, proxy: Proxy, url: []const u8, extra_header
     };
     try append(allocator, &req, "\r\n");
 
-    if (u.is_https) return httpsExchange(allocator, stream, u.host, req.items);
+    if (u.is_https) {
+        return httpsExchange(io, allocator, stream, u.host, req.items);
+    }
 
-    try writeAll(stream, req.items);
+    try writeAll(io, stream, req.items);
     return readPlainResponse(allocator, stream);
 }
 
 /// Read a plaintext HTTP response to completion and parse it. We sent
 /// `Connection: close`, so the server closes at EOF; `responseComplete` lets us
 /// stop early once a Content-Length body is fully received.
-fn readPlainResponse(allocator: Allocator, stream: std.net.Stream) ProxyError![]u8 {
+fn readPlainResponse(allocator: Allocator, stream: Stream) ProxyError![]u8 {
     var resp: std.ArrayList(u8) = .empty;
     defer resp.deinit(allocator);
     var chunk: [8192]u8 = undefined;
     while (true) {
-        const n = stream.read(&chunk) catch break;
+        const n = std.posix.read(
+            stream.socket.handle,
+            &chunk,
+        ) catch break;
         if (n == 0) break;
         resp.appendSlice(allocator, chunk[0..n]) catch return error.OutOfMemory;
         if (resp.items.len > max_response_bytes) break;
@@ -318,24 +380,49 @@ fn readPlainResponse(allocator: Allocator, stream: std.net.Stream) ProxyError![]
 /// Run an HTTPS exchange over the already-proxied stream: TLS handshake with
 /// certificate verification against the system CA bundle, send `request`, then
 /// read and parse the response. The proxy only ever sees encrypted bytes.
-fn httpsExchange(allocator: Allocator, stream: std.net.Stream, host: []const u8, request: []const u8) ProxyError![]u8 {
-    var ca_bundle: std.crypto.Certificate.Bundle = .{};
-    ca_bundle.rescan(allocator) catch return error.TlsFailed;
+fn httpsExchange(
+    io: std.Io,
+    allocator: Allocator,
+    stream: Stream,
+    host: []const u8,
+    request: []const u8,
+) ProxyError![]u8 {
+    var ca_bundle: std.crypto.Certificate.Bundle = .empty;
+    defer ca_bundle.deinit(allocator);
+
+    const now = std.Io.Clock.real.now(io);
+
+    ca_bundle.rescan(allocator, io, now) catch
+        return error.TlsFailed;
     defer ca_bundle.deinit(allocator);
 
     var sock_read_buf: [tls.max_ciphertext_record_len]u8 = undefined;
     var sock_write_buf: [tls.max_ciphertext_record_len]u8 = undefined;
-    var sr = stream.reader(&sock_read_buf);
-    var sw = stream.writer(&sock_write_buf);
+    var sr = stream.reader(io, &sock_read_buf);
+    var sw = stream.writer(io, &sock_write_buf);
 
     var tls_read_buf: [tls.max_ciphertext_record_len]u8 = undefined;
     var tls_write_buf: [tls.max_ciphertext_record_len]u8 = undefined;
 
-    var client = tls.Client.init(sr.interface(), &sw.interface, .{
+    var ca_lock: std.Io.RwLock = .init;
+
+    var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
+    io.random(&entropy);
+
+    var client = tls.Client.init(&sr.interface, &sw.interface, .{
         .host = .{ .explicit = host },
-        .ca = .{ .bundle = ca_bundle },
+        .ca = .{
+            .bundle = .{
+                .gpa = allocator,
+                .io = io,
+                .lock = &ca_lock,
+                .bundle = &ca_bundle,
+            },
+        },
         .write_buffer = &tls_write_buf,
         .read_buffer = &tls_read_buf,
+        .entropy = &entropy,
+        .realtime_now = now,
     }) catch return error.TlsFailed;
 
     // Both layers must flush: the TLS writer stages a record, the socket writer
@@ -386,33 +473,79 @@ fn contentLength(head: []const u8) ?usize {
 
 // --- Proxy socket setup ---
 
-fn dialProxy(allocator: Allocator, proxy: Proxy, timeout_secs: u32) ProxyError!std.net.Stream {
-    const proxy_addr = try resolveIp4(allocator, proxy.host, proxy.port);
+fn dialProxy(
+    io: std.Io,
+    allocator: Allocator,
+    proxy: Proxy,
+    timeout_secs: u32,
+) ProxyError!Stream {
+    _ = allocator;
 
-    const sock = std.posix.socket(
-        std.posix.AF.INET,
-        std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
-        std.posix.IPPROTO.TCP,
-    ) catch return error.SocketFailed;
-    errdefer std.posix.close(sock);
+    const host_name = Net.HostName.init(proxy.host) catch
+        return error.DnsResolveFailed;
 
-    // Bound both directions so a malicious/broken proxy cannot hang us forever.
-    const tv = std.posix.timeval{ .sec = @intCast(timeout_secs), .usec = 0 };
-    std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
-    std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+    var stream = host_name.connect(
+        io,
+        proxy.port,
+        .{ .mode = .stream },
+    ) catch return error.ConnectFailed;
 
-    std.posix.connect(sock, &proxy_addr.any, proxy_addr.getOsSockLen()) catch
-        return error.ConnectFailed;
+    errdefer stream.close(io);
 
-    return std.net.Stream{ .handle = sock };
+    const sock = stream.socket.handle;
+
+    // Keep Carl's existing read/write socket timeouts.
+    const tv = std.posix.timeval{
+        .sec = @intCast(timeout_secs),
+        .usec = 0,
+    };
+
+    std.posix.setsockopt(
+        sock,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.SNDTIMEO,
+        std.mem.asBytes(&tv),
+    ) catch {};
+
+    std.posix.setsockopt(
+        sock,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.RCVTIMEO,
+        std.mem.asBytes(&tv),
+    ) catch {};
+
+    return stream;
 }
+fn resolveIp4(
+    io: std.Io,
+    host: []const u8,
+    port: u16,
+) ProxyError!IpAddress {
+    const host_name = Net.HostName.init(host) catch
+        return error.DnsResolveFailed;
 
-fn resolveIp4(allocator: Allocator, host: []const u8, port: u16) ProxyError!std.net.Address {
-    const list = std.net.getAddressList(allocator, host, port) catch return error.DnsResolveFailed;
-    defer list.deinit();
-    for (list.addrs) |a| {
-        if (a.any.family == std.posix.AF.INET) return a;
+    var canonical_name_buffer: [Net.HostName.max_len]u8 = undefined;
+    var lookup_buffer: [16]Net.HostName.LookupResult = undefined;
+    var lookup_queue: std.Io.Queue(Net.HostName.LookupResult) =
+        .init(&lookup_buffer);
+
+    host_name.lookup(io, &lookup_queue, .{
+        .port = port,
+        .canonical_name_buffer = &canonical_name_buffer,
+    }) catch return error.DnsResolveFailed;
+
+    while (lookup_queue.getOneUncancelable(io)) |result| {
+        switch (result) {
+            .address => |address| switch (address) {
+                .ip4 => return address,
+                .ip6 => {},
+            },
+            .canonical_name => {},
+        }
+    } else |err| switch (err) {
+        error.Closed => {},
     }
+
     return error.DnsResolveFailed;
 }
 
@@ -424,99 +557,221 @@ fn resolveIp4(allocator: Allocator, host: []const u8, port: u16) ProxyError!std.
 /// Pure classification: never returns an error, it maps every failure into a
 /// `ProxyState`. (Full CONNECT reply codes only arise on real peer dials —
 /// surfacing those per-transfer is a documented follow-up.)
-pub fn classifySocks5(allocator: Allocator, proxy: Proxy, timeout_secs: u32) ProxyProbe {
-    const addr = resolveIp4(allocator, proxy.host, proxy.port) catch
-        return .{ .state = .not_running }; // can't resolve → treat as unreachable
-    // poll() takes an i32 millisecond timeout; clamp so a pathological
-    // `timeout_secs` can't overflow the cast (callers pass small values).
-    const timeout_ms: i32 = if (timeout_secs > 600) 600_000 else @intCast(timeout_secs * 1000);
+pub fn classifySocks5(
+    io: std.Io,
+    allocator: Allocator,
+    proxy: Proxy,
+    timeout_secs: u32,
+) ProxyProbe {
+    _ = allocator;
 
-    const sock = std.posix.socket(
+    const addr = resolveIp4(io, proxy.host, proxy.port) catch
+        return .{ .state = .not_running };
+
+    const timeout_ms: i32 =
+        if (timeout_secs > 600) 600_000 else @intCast(timeout_secs * 1000);
+
+    const sock = std.c.socket(
         std.posix.AF.INET,
-        std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
+        std.posix.SOCK.STREAM,
         std.posix.IPPROTO.TCP,
-    ) catch return .{ .state = .timeout };
-    defer std.posix.close(sock);
+    );
 
-    // Non-blocking connect + poll so a filtered/dead host yields a real timeout
-    // (SO_SNDTIMEO does not bound connect() on macOS), and so we can tell
-    // "connection refused" (proxy not running) from "timed out".
-    const flags = std.posix.fcntl(sock, std.posix.F.GETFL, 0) catch return .{ .state = .timeout };
-    var o: std.posix.O = @bitCast(@as(u32, @truncate(flags)));
+    if (sock < 0)
+        return .{ .state = .timeout };
+
+    defer _ = std.c.close(sock);
+
+    // macOS does not accept SOCK.CLOEXEC in the socket type here.
+    _ = std.c.fcntl(
+        sock,
+        std.c.F.SETFD,
+        @as(c_int, std.posix.FD_CLOEXEC),
+    );
+
+    const flags = std.c.fcntl(
+        sock,
+        std.c.F.GETFL,
+        @as(c_int, 0),
+    );
+
+    if (flags < 0)
+        return .{ .state = .timeout };
+
+    var o: std.c.O = @bitCast(@as(u32, @intCast(flags)));
     o.NONBLOCK = true;
-    _ = std.posix.fcntl(sock, std.posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
 
-    std.posix.connect(sock, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
-        error.WouldBlock => {
-            var pfd = [_]std.posix.pollfd{.{ .fd = sock, .events = std.posix.POLL.OUT, .revents = 0 }};
-            const ready = std.posix.poll(&pfd, timeout_ms) catch
+    _ = std.c.fcntl(
+        sock,
+        std.c.F.SETFL,
+        @as(c_int, @bitCast(o)),
+    );
+
+    const ip4 = switch (addr) {
+        .ip4 => |a| a,
+        .ip6 => return .{ .state = .not_running },
+    };
+
+    const posix_addr: std.posix.sockaddr.in = .{
+        .port = std.mem.nativeToBig(u16, ip4.port),
+        .addr = @bitCast(ip4.bytes),
+    };
+
+    const rc = std.c.connect(
+        sock,
+        @ptrCast(&posix_addr),
+        @sizeOf(std.posix.sockaddr.in),
+    );
+
+    if (rc != 0) switch (std.posix.errno(rc)) {
+        .AGAIN, .INPROGRESS => {
+            var pfd = [_]std.posix.pollfd{.{
+                .fd = sock,
+                .events = std.posix.POLL.OUT,
+                .revents = 0,
+            }};
+
+            const ready = std.posix.poll(
+                &pfd,
+                timeout_ms,
+            ) catch return .{ .state = .timeout };
+
+            if (ready == 0)
                 return .{ .state = .timeout };
-            if (ready == 0) return .{ .state = .timeout };
-            // Surface the async connect result: refused => not running, else timeout.
-            std.posix.getsockoptError(sock) catch |e| return .{
-                .state = if (e == error.ConnectionRefused) .not_running else .timeout,
-            };
+
+            var socket_error: c_int = 0;
+            var socket_error_len: std.c.socklen_t = @sizeOf(c_int);
+
+            if (std.c.getsockopt(
+                sock,
+                std.c.SOL.SOCKET,
+                std.c.SO.ERROR,
+                &socket_error,
+                &socket_error_len,
+            ) != 0) {
+                return .{ .state = .timeout };
+            }
+
+            if (socket_error != 0) {
+                if (socket_error == @intFromEnum(std.c.E.CONNREFUSED))
+                    return .{ .state = .not_running };
+
+                return .{ .state = .timeout };
+            }
         },
-        error.ConnectionRefused => return .{ .state = .not_running },
+        .CONNREFUSED => return .{ .state = .not_running },
         else => return .{ .state = .timeout },
     };
 
-    // Connected. Back to blocking with bounded reads/writes for the greeting.
+    // Connected. Restore blocking mode.
     o.NONBLOCK = false;
-    _ = std.posix.fcntl(sock, std.posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
-    const tv = std.posix.timeval{ .sec = @intCast(timeout_secs), .usec = 0 };
-    std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
-    std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
 
-    const stream = std.net.Stream{ .handle = sock };
-    // SOCKS5 greeting: VER=5, NMETHODS=1, METHOD=0x00 (no auth).
-    writeAll(stream, &[_]u8{ 0x05, 0x01, 0x00 }) catch return .{ .state = .timeout };
+    _ = std.c.fcntl(
+        sock,
+        std.c.F.SETFL,
+        @as(c_int, @bitCast(o)),
+    );
+
+    // Bound the SOCKS greeting reads/writes too.
+    const tv = std.c.timeval{
+        .sec = @intCast(timeout_secs),
+        .usec = 0,
+    };
+
+    _ = std.c.setsockopt(
+        sock,
+        std.c.SOL.SOCKET,
+        std.c.SO.SNDTIMEO,
+        &tv,
+        @intCast(@sizeOf(std.c.timeval)),
+    );
+
+    _ = std.c.setsockopt(
+        sock,
+        std.c.SOL.SOCKET,
+        std.c.SO.RCVTIMEO,
+        &tv,
+        @intCast(@sizeOf(std.c.timeval)),
+    );
+
+    const stream: Stream = .{
+        .socket = .{
+            .handle = sock,
+            .address = addr,
+        },
+    };
+
+    writeAll(
+        io,
+        stream,
+        &[_]u8{ 0x05, 0x01, 0x00 },
+    ) catch return .{ .state = .timeout };
+
     var reply: [2]u8 = undefined;
-    readN(stream, &reply) catch return .{ .state = .timeout };
 
-    if (reply[0] != 0x05) return .{ .state = .rejected, .reply = reply[0] }; // not SOCKS5
-    if (reply[1] == 0x00) return .{ .state = .ok }; // no-auth accepted
-    return .{ .state = .rejected, .reply = reply[1] }; // 0xFF = auth required / no method
+    readN(
+        io,
+        stream,
+        &reply,
+    ) catch return .{ .state = .timeout };
+
+    if (reply[0] != 0x05)
+        return .{ .state = .rejected, .reply = reply[0] };
+
+    if (reply[1] == 0x00)
+        return .{ .state = .ok };
+
+    return .{ .state = .rejected, .reply = reply[1] };
 }
 
 // --- Blocking stream I/O helpers ---
 
-fn writeAll(stream: std.net.Stream, bytes: []const u8) ProxyError!void {
-    var off: usize = 0;
-    while (off < bytes.len) {
-        const n = stream.write(bytes[off..]) catch return error.HandshakeFailed;
-        if (n == 0) return error.HandshakeFailed;
-        off += n;
-    }
+fn writeAll(
+    io: std.Io,
+    stream: Stream,
+    bytes: []const u8,
+) ProxyError!void {
+    var buffer: [0]u8 = .{};
+    var writer = stream.writer(io, &buffer);
+
+    writer.interface.writeAll(bytes) catch
+        return error.HandshakeFailed;
 }
 
-fn readN(stream: std.net.Stream, buf: []u8) ProxyError!void {
-    var off: usize = 0;
-    while (off < buf.len) {
-        const n = stream.read(buf[off..]) catch return error.HandshakeFailed;
-        if (n == 0) return error.HandshakeFailed; // unexpected EOF
-        off += n;
-    }
+fn readN(
+    io: std.Io,
+    stream: Stream,
+    buf: []u8,
+) ProxyError!void {
+    var buffer: [0]u8 = .{};
+    var reader = stream.reader(io, &buffer);
+
+    reader.interface.readSliceAll(buf) catch
+        return error.HandshakeFailed;
 }
 
 // --- SOCKS5 (RFC 1928) + user/pass auth (RFC 1929) ---
 
-fn socks5Handshake(stream: std.net.Stream, proxy: Proxy) ProxyError!void {
+fn socks5Handshake(
+    io: std.Io,
+    stream: Stream,
+    proxy: Proxy,
+) ProxyError!void {
     const have_auth = proxy.username != null;
 
     var greeting: [4]u8 = undefined;
     const greeting_len = buildSocks5Greeting(&greeting, have_auth);
-    try writeAll(stream, greeting[0..greeting_len]);
+    try writeAll(io, stream, greeting[0..greeting_len]);
 
     var sel: [2]u8 = undefined;
-    try readN(stream, &sel);
+    try readN(io, stream, &sel);
     if (sel[0] != 0x05) return error.InvalidResponse;
     switch (sel[1]) {
         // No-auth accepted. We allow this even when credentials were supplied:
         // the proxy doesn't require them, and withholding creds from a proxy
         // that didn't ask avoids leaking them to a misconfigured endpoint.
         0x00 => {},
-        0x02 => try socks5UserPassAuth(stream, proxy),
+        0x02 => try socks5UserPassAuth(io, stream, proxy),
         else => return error.AuthenticationFailed, // includes 0xFF (no acceptable method)
     }
 }
@@ -536,7 +791,11 @@ fn buildSocks5Greeting(out: *[4]u8, have_auth: bool) usize {
     return 3;
 }
 
-fn socks5UserPassAuth(stream: std.net.Stream, proxy: Proxy) ProxyError!void {
+fn socks5UserPassAuth(
+    io: std.Io,
+    stream: Stream,
+    proxy: Proxy,
+) ProxyError!void {
     const user = proxy.username orelse return error.AuthenticationFailed;
     const pass = proxy.password orelse "";
     if (user.len > 255 or pass.len > 255) return error.AuthenticationFailed;
@@ -553,17 +812,22 @@ fn socks5UserPassAuth(stream: std.net.Stream, proxy: Proxy) ProxyError!void {
     i += 1;
     @memcpy(buf[i .. i + pass.len], pass);
     i += pass.len;
-    try writeAll(stream, buf[0..i]);
+    try writeAll(io, stream, buf[0..i]);
 
     var reply: [2]u8 = undefined;
-    try readN(stream, &reply);
+    try readN(io, stream, &reply);
     if (reply[1] != 0x00) return error.AuthenticationFailed;
 }
 
-fn socks5ConnectIp4(stream: std.net.Stream, ip4: [4]u8, port: u16) ProxyError!void {
+fn socks5ConnectIp4(
+    io: std.Io,
+    stream: Stream,
+    ip4: [4]u8,
+    port: u16,
+) ProxyError!void {
     const req = buildSocks5ConnectIp4(ip4, port);
-    try writeAll(stream, &req);
-    try readSocks5Reply(stream);
+    try writeAll(io, stream, &req);
+    try readSocks5Reply(io, stream);
 }
 
 /// Build a SOCKS5 CONNECT request for an IPv4 destination (10 bytes).
@@ -579,7 +843,12 @@ fn buildSocks5ConnectIp4(ip4: [4]u8, port: u16) [10]u8 {
     return req;
 }
 
-fn socks5ConnectDomain(stream: std.net.Stream, host: []const u8, port: u16) ProxyError!void {
+fn socks5ConnectDomain(
+    io: std.Io,
+    stream: Stream,
+    host: []const u8,
+    port: u16,
+) ProxyError!void {
     if (host.len == 0 or host.len > 255) return error.InvalidProxyUrl;
     var req: [262]u8 = undefined; // 4 + 1 + 255 + 2
     req[0] = 0x05; // version
@@ -590,15 +859,18 @@ fn socks5ConnectDomain(stream: std.net.Stream, host: []const u8, port: u16) Prox
     @memcpy(req[5 .. 5 + host.len], host);
     req[5 + host.len] = @intCast((port >> 8) & 0xff);
     req[6 + host.len] = @intCast(port & 0xff);
-    try writeAll(stream, req[0 .. 7 + host.len]);
-    try readSocks5Reply(stream);
+    try writeAll(io, stream, req[0 .. 7 + host.len]);
+    try readSocks5Reply(io, stream);
 }
 
 /// Read and validate a SOCKS5 CONNECT reply, discarding the variable-length
 /// BND.ADDR / BND.PORT trailer.
-fn readSocks5Reply(stream: std.net.Stream) ProxyError!void {
+fn readSocks5Reply(
+    io: std.Io,
+    stream: Stream,
+) ProxyError!void {
     var head: [4]u8 = undefined;
-    try readN(stream, &head);
+    try readN(io, stream, &head);
     if (head[0] != 0x05) return error.InvalidResponse;
     if (head[1] != 0x00) {
         // REP != succeeded: log the reason (0x05 refused, 0x04 host unreachable,
@@ -613,7 +885,7 @@ fn readSocks5Reply(stream: std.net.Stream) ProxyError!void {
         0x04 => 16, // IPv6
         0x03 => blk: {
             var l: [1]u8 = undefined;
-            try readN(stream, &l);
+            try readN(io, stream, &l);
             break :blk l[0];
         },
         else => return error.InvalidResponse,
@@ -623,14 +895,21 @@ fn readSocks5Reply(stream: std.net.Stream) ProxyError!void {
     var scratch: [256]u8 = undefined;
     while (trailer > 0) {
         const take = @min(trailer, scratch.len);
-        try readN(stream, scratch[0..take]);
+        try readN(io, stream, scratch[0..take]);
         trailer -= take;
     }
 }
 
 // --- HTTP CONNECT ---
 
-fn httpConnect(allocator: Allocator, stream: std.net.Stream, proxy: Proxy, host: []const u8, port: u16) ProxyError!void {
+fn httpConnect(
+    io: std.Io,
+    allocator: Allocator,
+    stream: Stream,
+    proxy: Proxy,
+    host: []const u8,
+    port: u16,
+) ProxyError!void {
     var req: std.ArrayList(u8) = .empty;
     defer req.deinit(allocator);
 
@@ -649,8 +928,8 @@ fn httpConnect(allocator: Allocator, stream: std.net.Stream, proxy: Proxy, host:
     }
     try append(allocator, &req, "\r\n");
 
-    try writeAll(stream, req.items);
-    try readHttpConnectStatus(stream);
+    try writeAll(io, stream, req.items);
+    try readHttpConnectStatus(io, stream);
 }
 
 /// Append a byte slice to `req`, mapping allocation failure to ProxyError.
@@ -683,20 +962,36 @@ fn appendBasicProxyAuth(allocator: Allocator, req: *std.ArrayList(u8), user: []c
 }
 
 /// Read the HTTP CONNECT response headers and require a 2xx status.
-fn readHttpConnectStatus(stream: std.net.Stream) ProxyError!void {
+fn readHttpConnectStatus(
+    io: std.Io,
+    stream: Stream,
+) ProxyError!void {
+    var read_buffer: [0]u8 = .{};
+    var reader = stream.reader(io, &read_buffer);
+
     var buf: [1024]u8 = undefined;
     var len: usize = 0;
+
     while (len < buf.len) {
-        const n = stream.read(buf[len .. len + 1]) catch return error.HandshakeFailed;
-        if (n == 0) return error.HandshakeFailed;
+        reader.interface.readSliceAll(buf[len .. len + 1]) catch
+            return error.HandshakeFailed;
+
         len += 1;
-        if (len >= 4 and std.mem.eql(u8, buf[len - 4 .. len], "\r\n\r\n")) break;
+
+        if (len >= 4 and
+            std.mem.eql(u8, buf[len - 4 .. len], "\r\n\r\n"))
+        {
+            break;
+        }
     } else {
-        return error.InvalidResponse; // headers too long
+        return error.InvalidResponse;
     }
 
-    const status = parseStatusCode(buf[0..len]) orelse return error.InvalidResponse;
-    if (status < 200 or status >= 300) return error.HandshakeFailed;
+    const status = parseStatusCode(buf[0..len]) orelse
+        return error.InvalidResponse;
+
+    if (status < 200 or status >= 300)
+        return error.HandshakeFailed;
 }
 
 // --- HTTP response parsing (for httpGet) ---
@@ -937,39 +1232,52 @@ test "responseComplete stops on full Content-Length body" {
 // --- classifySocks5 against a mock SOCKS5 endpoint ---
 
 const MockSocks = struct {
-    server: *std.net.Server,
+    server: *std.Io.net.Server,
     stop: std.atomic.Value(bool),
     reply: [2]u8,
 };
 
 fn mockSocksRun(ctx: *MockSocks) void {
-    // Poll-with-timeout accept so the thread can observe `stop` and exit (a bare
-    // accept() would park forever); mirrors the i2p_sam mock-bridge test.
-    var pfd = [_]std.posix.pollfd{.{ .fd = ctx.server.stream.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    var pfd = [_]std.posix.pollfd{.{
+        .fd = ctx.server.socket.handle,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+
     while (!ctx.stop.load(.acquire)) {
         const ready = std.posix.poll(&pfd, 200) catch 0;
         if (ready == 0) continue;
-        const conn = ctx.server.accept() catch continue;
-        defer conn.stream.close();
-        var greeting: [3]u8 = undefined; // VER, NMETHODS, METHOD
+
+        const conn = ctx.server.accept(std.testing.io) catch continue;
+        defer conn.close(std.testing.io);
+
+        var greeting: [3]u8 = undefined;
+        var read_buffer: [0]u8 = .{};
+        var reader = conn.reader(std.testing.io, &read_buffer);
+
         var got: usize = 0;
         while (got < greeting.len) {
-            const n = conn.stream.read(greeting[got..]) catch break;
+            const n = reader.interface.readSliceShort(greeting[got..]) catch break;
             if (n == 0) break;
             got += n;
         }
-        var sent: usize = 0;
-        while (sent < ctx.reply.len) {
-            const n = conn.stream.write(ctx.reply[sent..]) catch break;
-            if (n == 0) break;
-            sent += n;
-        }
+
+        var write_buffer: [0]u8 = .{};
+        var writer = conn.writer(std.testing.io, &write_buffer);
+        writer.interface.writeAll(&ctx.reply) catch break;
     }
 }
 
-fn startMockSocks(server: *std.net.Server, reply: [2]u8) !struct { ctx: *MockSocks, thread: std.Thread } {
+fn startMockSocks(
+    server: *std.Io.net.Server,
+    reply: [2]u8,
+) !struct { ctx: *MockSocks, thread: std.Thread } {
     const ctx = try std.testing.allocator.create(MockSocks);
-    ctx.* = .{ .server = server, .stop = std.atomic.Value(bool).init(false), .reply = reply };
+    ctx.* = .{
+        .server = server,
+        .stop = std.atomic.Value(bool).init(false),
+        .reply = reply,
+    };
     const thread = try std.Thread.spawn(.{}, mockSocksRun, .{ctx});
     return .{ .ctx = ctx, .thread = thread };
 }
@@ -977,60 +1285,92 @@ fn startMockSocks(server: *std.net.Server, reply: [2]u8) !struct { ctx: *MockSoc
 test "classifySocks5: connection refused => not_running" {
     const a = std.testing.allocator;
     // Bind to grab a free port, then close it so connects are refused.
-    var server = try std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0).listen(.{ .reuse_address = true });
-    const port = server.listen_address.getPort();
-    server.deinit();
+    const addr: std.Io.net.IpAddress = .{
+        .ip4 = .loopback(0),
+    };
 
-    const probe = classifySocks5(a, .{ .scheme = .socks5, .host = "127.0.0.1", .port = port }, 2);
+    var server = try addr.listen(
+        std.testing.io,
+        .{ .reuse_address = true },
+    );
+
+    const port = server.socket.address.getPort();
+    server.deinit(std.testing.io);
+
+    const probe = classifySocks5(std.testing.io, a, .{ .scheme = .socks5, .host = "127.0.0.1", .port = port }, 2);
     try std.testing.expectEqual(ProxyState.not_running, probe.state);
 }
 
 test "classifySocks5: no-auth accepted => ok" {
     const a = std.testing.allocator;
-    var server = try std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0).listen(.{ .reuse_address = true });
-    const port = server.listen_address.getPort();
+    const addr: std.Io.net.IpAddress = .{
+        .ip4 = .loopback(0),
+    };
+
+    var server = try addr.listen(
+        std.testing.io,
+        .{ .reuse_address = true },
+    );
+
+    const port = server.socket.address.getPort();
     const mock = try startMockSocks(&server, .{ 0x05, 0x00 });
     defer {
         mock.ctx.stop.store(true, .release);
         mock.thread.join();
-        server.deinit();
+        server.deinit(std.testing.io);
         a.destroy(mock.ctx);
     }
 
-    const probe = classifySocks5(a, .{ .scheme = .socks5, .host = "127.0.0.1", .port = port }, 2);
+    const probe = classifySocks5(std.testing.io, a, .{ .scheme = .socks5, .host = "127.0.0.1", .port = port }, 2);
     try std.testing.expectEqual(ProxyState.ok, probe.state);
 }
 
 test "classifySocks5: no acceptable method => rejected with reply byte" {
     const a = std.testing.allocator;
-    var server = try std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0).listen(.{ .reuse_address = true });
-    const port = server.listen_address.getPort();
+    const addr: std.Io.net.IpAddress = .{
+        .ip4 = .loopback(0),
+    };
+
+    var server = try addr.listen(
+        std.testing.io,
+        .{ .reuse_address = true },
+    );
+
+    const port = server.socket.address.getPort();
     const mock = try startMockSocks(&server, .{ 0x05, 0xFF });
     defer {
         mock.ctx.stop.store(true, .release);
         mock.thread.join();
-        server.deinit();
+        server.deinit(std.testing.io);
         a.destroy(mock.ctx);
     }
 
-    const probe = classifySocks5(a, .{ .scheme = .socks5, .host = "127.0.0.1", .port = port }, 2);
+    const probe = classifySocks5(std.testing.io, a, .{ .scheme = .socks5, .host = "127.0.0.1", .port = port }, 2);
     try std.testing.expectEqual(ProxyState.rejected, probe.state);
     try std.testing.expectEqual(@as(?u8, 0xFF), probe.reply);
 }
 
 test "classifySocks5: non-SOCKS5 version => rejected" {
     const a = std.testing.allocator;
-    var server = try std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0).listen(.{ .reuse_address = true });
-    const port = server.listen_address.getPort();
+    const addr: std.Io.net.IpAddress = .{
+        .ip4 = .loopback(0),
+    };
+
+    var server = try addr.listen(
+        std.testing.io,
+        .{ .reuse_address = true },
+    );
+
+    const port = server.socket.address.getPort();
     const mock = try startMockSocks(&server, .{ 0x04, 0x00 }); // SOCKS4-ish version byte
     defer {
         mock.ctx.stop.store(true, .release);
         mock.thread.join();
-        server.deinit();
+        server.deinit(std.testing.io);
         a.destroy(mock.ctx);
     }
 
-    const probe = classifySocks5(a, .{ .scheme = .socks5, .host = "127.0.0.1", .port = port }, 2);
+    const probe = classifySocks5(std.testing.io, a, .{ .scheme = .socks5, .host = "127.0.0.1", .port = port }, 2);
     try std.testing.expectEqual(ProxyState.rejected, probe.state);
     try std.testing.expectEqual(@as(?u8, 0x04), probe.reply);
 }

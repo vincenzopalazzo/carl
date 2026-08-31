@@ -199,13 +199,14 @@ pub fn parseAnnounceResponse(
 /// loop, `carl announce`, and the seeding paths all come through here, so the
 /// udp:// and proxy rules below cannot drift between callers.
 pub fn announce(
+    io: std.Io,
     allocator: Allocator,
     announce_url: []const u8,
     req: AnnounceRequest,
     proxy: ?proxy_mod.Proxy,
 ) TrackerError!AnnounceResponse {
     if (!std.mem.startsWith(u8, announce_url, "udp://")) {
-        return announceHttp(allocator, announce_url, req, proxy);
+        return announceHttp(io, allocator, announce_url, req, proxy);
     }
 
     // BEP 15: udp:// goes to the UDP tracker client. UDP cannot be tunneled
@@ -217,10 +218,10 @@ pub fn announce(
         var buf: [512]u8 = undefined;
         const http_url = udpAsHttpUrl(&buf, announce_url) orelse return error.HttpError;
         log.info("proxied: rewriting {s} -> {s}", .{ announce_url, http_url });
-        return announceHttp(allocator, http_url, req, proxy);
+        return announceHttp(io, allocator, http_url, req, proxy);
     }
 
-    return udp_tracker.announce(allocator, announce_url, req) catch |err| switch (err) {
+    return udp_tracker.announce(io, allocator, announce_url, req) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         // TrackerError has no UDP-specific variant; log the real cause so a
         // bare "HttpError" on a udp:// URL is still diagnosable.
@@ -241,6 +242,7 @@ fn udpAsHttpUrl(buf: []u8, udp_url: []const u8) ?[]const u8 {
 }
 
 fn announceHttp(
+    io: std.Io,
     allocator: Allocator,
     announce_url: []const u8,
     req: AnnounceRequest,
@@ -249,41 +251,40 @@ fn announceHttp(
     const url = buildAnnounceUrl(allocator, announce_url, req) catch return error.OutOfMemory;
     defer allocator.free(url);
 
-    if (proxy) |px| return announceThroughProxy(allocator, px, url);
+    if (proxy) |px| return announceThroughProxy(io, allocator, px, url);
 
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client: std.http.Client = .{
+        .allocator = allocator,
+        .io = io,
+    };
     defer client.deinit();
 
-    var response_body: std.ArrayList(u8) = .empty;
-    defer response_body.deinit(allocator);
-
-    var adapt_buf: [4096]u8 = undefined;
-    const deprecated_writer = response_body.writer(allocator);
-    var adapter = deprecated_writer.adaptToNewApi(&adapt_buf);
+    var response_body: std.Io.Writer.Allocating = .init(allocator);
+    defer response_body.deinit();
 
     const result = client.fetch(.{
         .location = .{ .url = url },
-        .response_writer = &adapter.new_interface,
+        .response_writer = &response_body.writer,
     }) catch return error.HttpError;
 
     if (result.status != .ok) return error.HttpError;
 
-    // Flush the adapter's buffered tail: a response smaller than the adapter
-    // buffer (announce responses almost always are) would otherwise never
-    // reach `response_body` and parse as empty.
-    const buffered = adapter.new_interface.buffered();
-    if (buffered.len > 0) {
-        response_body.appendSlice(allocator, buffered) catch return error.OutOfMemory;
-    }
-
-    return parseAnnounceResponse(allocator, response_body.items);
+    return parseAnnounceResponse(
+        allocator,
+        response_body.writer.buffered(),
+    );
 }
 
 /// Announce by tunneling the GET through the proxy. `http://` goes in plaintext,
 /// `https://` runs TLS over the proxied stream -- both via `proxy.httpGet`, so
 /// nothing is ever sent directly.
-fn announceThroughProxy(allocator: Allocator, proxy: proxy_mod.Proxy, url: []const u8) TrackerError!AnnounceResponse {
-    const body = proxy_mod.httpGet(allocator, proxy, url, null) catch |err| {
+fn announceThroughProxy(
+    io: std.Io,
+    allocator: Allocator,
+    proxy: proxy_mod.Proxy,
+    url: []const u8,
+) TrackerError!AnnounceResponse {
+    const body = proxy_mod.httpGet(io, allocator, proxy, url, null) catch |err| {
         log.debug("proxied tracker announce failed: {}", .{err});
         return error.HttpError;
     };

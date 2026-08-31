@@ -6,6 +6,9 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Net = std.Io.net;
+const Stream = Net.Stream;
+const HostName = Net.HostName;
 const posix = std.posix;
 
 const log = std.log.scoped(.tor);
@@ -24,8 +27,9 @@ pub const Error = error{
 };
 
 pub const HiddenService = struct {
+    io: std.Io,
     allocator: Allocator,
-    stream: std.net.Stream,
+    stream: Stream,
     service_id: []const u8,
     onion_host: []const u8,
     onion_port: u16,
@@ -36,18 +40,26 @@ pub const HiddenService = struct {
         };
         self.allocator.free(self.service_id);
         self.allocator.free(self.onion_host);
-        self.stream.close();
+        self.stream.close(self.io);
     }
 
     fn delOnion(self: *HiddenService) !void {
         var cmd_buf: [128]u8 = undefined;
-        const cmd = std.fmt.bufPrint(&cmd_buf, "DEL_ONION {s}\r\n", .{self.service_id}) catch return;
-        sendCommand(self.stream, cmd) catch return;
-        _ = readReply(self.stream) catch return;
+        const cmd = std.fmt.bufPrint(
+            &cmd_buf,
+            "DEL_ONION {s}\r\n",
+            .{self.service_id},
+        ) catch return;
+
+        sendCommand(self.io, self.stream, cmd) catch return;
+
+        var reply_buf: [4096]u8 = undefined;
+        _ = readReply(self.io, self.stream, &reply_buf) catch return;
     }
 };
 
 pub const Options = struct {
+    home: ?[]const u8 = null,
     /// `host:port` for the ControlPort (default `127.0.0.1:9051`).
     control_addr: []const u8 = "127.0.0.1:9051",
     /// Path to the control cookie file (default `~/.tor/control_auth_cookie`).
@@ -59,14 +71,18 @@ pub const Options = struct {
 };
 
 /// Create a v3 hidden service forwarding `onion_port` → `127.0.0.1:local_port`.
-pub fn addOnion(allocator: Allocator, opts: Options) Error!HiddenService {
-    const stream = connectControl(allocator, opts.control_addr) catch return error.ConnectFailed;
-    errdefer stream.close();
+pub fn addOnion(
+    io: std.Io,
+    allocator: Allocator,
+    opts: Options,
+) Error!HiddenService {
+    const stream = connectControl(io, opts.control_addr) catch return error.ConnectFailed;
+    errdefer stream.close(io);
 
-    const cookie_path = opts.cookie_path orelse defaultCookiePath(allocator) catch return error.AuthFailed;
+    const cookie_path = opts.cookie_path orelse defaultCookiePath(allocator, opts.home) catch return error.AuthFailed;
     defer if (opts.cookie_path == null) allocator.free(cookie_path);
 
-    authenticate(allocator, stream, cookie_path) catch return error.AuthFailed;
+    authenticate(io, allocator, stream, cookie_path) catch return error.AuthFailed;
 
     var cmd_buf: [256]u8 = undefined;
     const cmd = std.fmt.bufPrint(
@@ -74,9 +90,9 @@ pub fn addOnion(allocator: Allocator, opts: Options) Error!HiddenService {
         "ADD_ONION NEW:ED25519-V3 Port={d},127.0.0.1:{d}\r\n",
         .{ opts.onion_port, opts.local_port },
     ) catch return error.CommandFailed;
-    sendCommand(stream, cmd) catch return error.CommandFailed;
+    sendCommand(io, stream, cmd) catch return error.CommandFailed;
 
-    const reply = readReplyAlloc(allocator, stream) catch return error.InvalidResponse;
+    const reply = readReplyAlloc(io, allocator, stream) catch return error.InvalidResponse;
     defer allocator.free(reply);
 
     const service_id = parseServiceId(allocator, reply) catch return error.InvalidResponse;
@@ -96,6 +112,7 @@ pub fn addOnion(allocator: Allocator, opts: Options) Error!HiddenService {
     });
 
     return .{
+        .io = io,
         .allocator = allocator,
         .stream = stream,
         .service_id = service_id,
@@ -104,93 +121,182 @@ pub fn addOnion(allocator: Allocator, opts: Options) Error!HiddenService {
     };
 }
 
-fn defaultCookiePath(allocator: Allocator) ![]const u8 {
-    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return error.OutOfMemory;
-    defer allocator.free(home);
-    return std.fmt.allocPrint(allocator, "{s}/.tor/control_auth_cookie", .{home});
+fn defaultCookiePath(
+    allocator: Allocator,
+    home: ?[]const u8,
+) ![]const u8 {
+    const value = home orelse return error.AuthFailed;
+
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}/.tor/control_auth_cookie",
+        .{value},
+    );
 }
 
-fn connectControl(allocator: Allocator, addr_str: []const u8) !std.net.Stream {
-    const colon = std.mem.lastIndexOfScalar(u8, addr_str, ':') orelse return error.ConnectFailed;
+fn connectControl(
+    io: std.Io,
+    addr_str: []const u8,
+) !Stream {
+    const colon =
+        std.mem.lastIndexOfScalar(u8, addr_str, ':') orelse
+        return error.ConnectFailed;
+
     const host = addr_str[0..colon];
-    const port = std.fmt.parseUnsigned(u16, addr_str[colon + 1 ..], 10) catch return error.ConnectFailed;
+    const port = std.fmt.parseUnsigned(
+        u16,
+        addr_str[colon + 1 ..],
+        10,
+    ) catch return error.ConnectFailed;
 
     if (!isLoopbackControlHost(host)) {
-        log.err("refusing non-loopback Tor control host '{s}' (use 127.0.0.1 or localhost)", .{host});
+        log.err(
+            "refusing non-loopback Tor control host '{s}' (use 127.0.0.1 or localhost)",
+            .{host},
+        );
         return error.ConnectFailed;
     }
 
-    const list = std.net.getAddressList(allocator, host, port) catch return error.ConnectFailed;
-    defer list.deinit();
+    const host_name =
+        HostName.init(host) catch return error.ConnectFailed;
 
-    for (list.addrs) |a| {
-        if (std.net.tcpConnectToAddress(a)) |s| {
-            // Bound control reads/writes: `authenticate`/`readReply` do blocking
-            // reads with no timeout, so without this a port that accepts but
-            // never replies (not Tor) would wedge the caller forever.
-            const tv = posix.timeval{ .sec = control_timeout_secs, .usec = 0 };
-            posix.setsockopt(s.handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
-            posix.setsockopt(s.handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
-            return s;
-        } else |_| {}
-    }
-    return error.ConnectFailed;
+    const stream = host_name.connect(io, port, .{
+        .mode = .stream,
+        .timeout = .{
+            .duration = .{
+                .raw = .fromSeconds(control_timeout_secs),
+                .clock = .awake,
+            },
+        },
+    }) catch return error.ConnectFailed;
+
+    // Preserve Carl's existing read/write timeout behavior.
+    const tv = posix.timeval{
+        .sec = control_timeout_secs,
+        .usec = 0,
+    };
+
+    posix.setsockopt(
+        stream.socket.handle,
+        posix.SOL.SOCKET,
+        posix.SO.RCVTIMEO,
+        std.mem.asBytes(&tv),
+    ) catch {};
+
+    posix.setsockopt(
+        stream.socket.handle,
+        posix.SOL.SOCKET,
+        posix.SO.SNDTIMEO,
+        std.mem.asBytes(&tv),
+    ) catch {};
+
+    return stream;
 }
 
-fn authenticate(allocator: Allocator, stream: std.net.Stream, cookie_path: []const u8) !void {
-    const cookie = std.fs.cwd().readFileAlloc(allocator, cookie_path, 256) catch return error.AuthFailed;
+fn authenticate(
+    io: std.Io,
+    allocator: Allocator,
+    stream: Stream,
+    cookie_path: []const u8,
+) !void {
+    const cookie = std.Io.Dir.cwd().readFileAlloc(
+        io,
+        cookie_path,
+        allocator,
+        .limited(256),
+    ) catch return error.AuthFailed;
     defer allocator.free(cookie);
+
     if (cookie.len == 0) return error.AuthFailed;
 
-    var hex_buf: std.ArrayList(u8) = .empty;
-    defer hex_buf.deinit(allocator);
+    var hex_buf: [512]u8 = undefined;
+    const digits = "0123456789abcdef";
+    var hex_len: usize = 0;
+
     for (cookie) |b| {
-        hex_buf.writer(allocator).print("{x:0>2}", .{b}) catch return error.AuthFailed;
+        hex_buf[hex_len] = digits[b >> 4];
+        hex_buf[hex_len + 1] = digits[b & 0x0f];
+        hex_len += 2;
     }
 
-    var cmd_list: std.ArrayList(u8) = .empty;
-    defer cmd_list.deinit(allocator);
-    cmd_list.writer(allocator).print("AUTHENTICATE {s}\r\n", .{hex_buf.items}) catch return error.AuthFailed;
-    sendCommand(stream, cmd_list.items) catch return error.AuthFailed;
-    const reply = readReply(stream) catch return error.AuthFailed;
-    if (!std.mem.startsWith(u8, reply, "250")) return error.AuthFailed;
+    var cmd_buf: [530]u8 = undefined;
+    const cmd = std.fmt.bufPrint(
+        &cmd_buf,
+        "AUTHENTICATE {s}\r\n",
+        .{hex_buf[0..hex_len]},
+    ) catch return error.AuthFailed;
+
+    sendCommand(io, stream, cmd) catch
+        return error.AuthFailed;
+
+    var reply_buf: [4096]u8 = undefined;
+    const reply = readReply(
+        io,
+        stream,
+        &reply_buf,
+    ) catch return error.AuthFailed;
+
+    if (!std.mem.startsWith(u8, reply, "250"))
+        return error.AuthFailed;
 }
 
-fn sendCommand(stream: std.net.Stream, cmd: []const u8) !void {
-    try stream.writeAll(cmd);
+fn sendCommand(
+    io: std.Io,
+    stream: Stream,
+    cmd: []const u8,
+) !void {
+    var write_buffer: [0]u8 = .{};
+    var writer = stream.writer(io, &write_buffer);
+
+    var offset: usize = 0;
+    while (offset < cmd.len) {
+        const n = writer.interface.write(cmd[offset..]) catch
+            return error.CommandFailed;
+
+        if (n == 0) return error.CommandFailed;
+        offset += n;
+    }
 }
 
-fn readReplyAlloc(allocator: Allocator, stream: std.net.Stream) ![]u8 {
+fn readReplyAlloc(
+    io: std.Io,
+    allocator: Allocator,
+    stream: Stream,
+) ![]u8 {
     var buf: [4096]u8 = undefined;
+    const reply = try readReply(io, stream, &buf);
+    return try allocator.dupe(u8, reply);
+}
+
+fn readReply(
+    io: std.Io,
+    stream: Stream,
+    buf: []u8,
+) ![]const u8 {
+    var read_buffer: [0]u8 = .{};
+    var reader = stream.reader(io, &read_buffer);
+
     var len: usize = 0;
+
     while (len < buf.len) {
-        const n = stream.read(buf[len..]) catch return error.InvalidResponse;
-        if (n == 0) break;
+        var parts = [_][]u8{buf[len..]};
+
+        const n = reader.interface.readVec(&parts) catch |err| {
+            if (err == error.EndOfStream) break;
+            return error.InvalidResponse;
+        };
+
         len += n;
+
         if (std.mem.endsWith(u8, buf[0..len], "\r\n250 OK\r\n") or
             std.mem.endsWith(u8, buf[0..len], "250 OK\r\n"))
         {
             break;
         }
     }
-    if (len == 0) return error.InvalidResponse;
-    return try allocator.dupe(u8, buf[0..len]);
-}
 
-fn readReply(stream: std.net.Stream) ![]const u8 {
-    var buf: [4096]u8 = undefined;
-    var len: usize = 0;
-    while (len < buf.len) {
-        const n = stream.read(buf[len..]) catch return error.InvalidResponse;
-        if (n == 0) break;
-        len += n;
-        if (std.mem.endsWith(u8, buf[0..len], "\r\n250 OK\r\n") or
-            std.mem.endsWith(u8, buf[0..len], "250 OK\r\n"))
-        {
-            break;
-        }
-    }
     if (len == 0) return error.InvalidResponse;
+
     return buf[0..len];
 }
 
@@ -220,15 +326,25 @@ fn isValidServiceId(id: []const u8) bool {
 
 fn isLoopbackControlHost(host: []const u8) bool {
     if (std.mem.eql(u8, host, "localhost")) return true;
-    if (std.net.Ip4Address.parse(host, 0)) |addr| {
-        const o = std.mem.asBytes(&addr.sa.addr);
-        return o[0] == 127;
-    } else |_| {}
-    if (std.net.Ip6Address.parse(host, 0)) |addr| {
-        const o = std.mem.asBytes(&addr.sa.addr);
-        return std.mem.eql(u8, o, &[_]u8{0} ** 15 ++ .{1});
-    } else |_| {}
-    return false;
+    if (std.mem.eql(u8, host, "::1")) return true;
+
+    var parts = std.mem.splitScalar(u8, host, '.');
+    var octets: [4]u8 = undefined;
+    var i: usize = 0;
+
+    while (parts.next()) |part| {
+        if (i >= 4 or part.len == 0) return false;
+
+        octets[i] = std.fmt.parseUnsigned(
+            u8,
+            part,
+            10,
+        ) catch return false;
+
+        i += 1;
+    }
+
+    return i == 4 and octets[0] == 127;
 }
 
 fn isValidV3OnionHost(host: []const u8) bool {

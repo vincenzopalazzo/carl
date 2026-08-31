@@ -315,9 +315,18 @@ pub const default_piece_length: u32 = 256 * 1024;
 /// Nostr / DHT. A `.tar`/`.zip`/`.pdf` is just a single file, so this covers the
 /// "seed an archive" case directly. Streams the file so large inputs don't load
 /// into memory at once.
-pub fn createSingleFile(allocator: Allocator, path: []const u8, piece_length: u32) MetainfoError!Metainfo {
-    var file = std.fs.cwd().openFile(path, .{}) catch return error.InvalidTorrent;
-    defer file.close();
+pub fn createSingleFile(
+    io: std.Io,
+    allocator: Allocator,
+    path: []const u8,
+    piece_length: u32,
+) MetainfoError!Metainfo {
+    const file = std.Io.Dir.cwd().openFile(
+        io,
+        path,
+        .{},
+    ) catch return error.InvalidTorrent;
+    defer file.close(io);
 
     const base = std.fs.path.basename(path);
     if (base.len == 0) return error.InvalidTorrent;
@@ -331,13 +340,31 @@ pub fn createSingleFile(allocator: Allocator, path: []const u8, piece_length: u3
 
     var total: u64 = 0;
     while (true) {
-        const n = file.readAll(chunk) catch return error.InvalidTorrent;
-        if (n == 0) break;
+        var filled: usize = 0;
+
+        while (filled < chunk.len) {
+            var buffers = [_][]u8{chunk[filled..]};
+
+            const n = file.readStreaming(io, &buffers) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return error.InvalidTorrent,
+            };
+
+            if (n == 0) continue;
+            filled += n;
+        }
+
+        if (filled == 0) break;
+
         var digest: [20]u8 = undefined;
-        std.crypto.hash.Sha1.hash(chunk[0..n], &digest, .{});
-        pieces_buf.appendSlice(allocator, &digest) catch return error.OutOfMemory;
-        total += n;
-        if (n < piece_length) break; // final (partial) piece
+        std.crypto.hash.Sha1.hash(chunk[0..filled], &digest, .{});
+
+        pieces_buf.appendSlice(allocator, &digest) catch
+            return error.OutOfMemory;
+
+        total += filled;
+
+        if (filled < piece_length) break;
     }
     const pieces = pieces_buf.toOwnedSlice(allocator) catch return error.OutOfMemory;
     errdefer allocator.free(pieces);
@@ -436,7 +463,12 @@ fn pathComponents(aa: Allocator, rel: []const u8) MetainfoError![]bencode.Value 
 /// for a deterministic, reproducible info-hash. Trackers/comment/created-by live
 /// in the top-level dict, so they never affect the info-hash. Streams every file
 /// so large inputs don't load into memory at once. Caller owns `result.data`.
-pub fn buildTorrent(allocator: Allocator, path: []const u8, opts: CreateOptions) MetainfoError!CreateResult {
+pub fn buildTorrent(
+    io: std.Io,
+    allocator: Allocator,
+    path: []const u8,
+    opts: CreateOptions,
+) MetainfoError!CreateResult {
     const piece_length: u32 = if (opts.piece_length == 0) default_piece_length else opts.piece_length;
 
     // Everything intermediate (Value tree, piece buffer, per-file dicts) lives in
@@ -448,13 +480,17 @@ pub fn buildTorrent(allocator: Allocator, path: []const u8, opts: CreateOptions)
     // Trim a trailing slash so a directory path "/a/b/" yields the name "b"
     // (basename of "/a/b/" is otherwise empty).
     const sep = [_]u8{std.fs.path.sep};
-    const trimmed_path = std.mem.trimRight(u8, path, &sep);
+    const trimmed_path = std.mem.trimEnd(u8, path, &sep);
     const eff_path = if (trimmed_path.len == 0) path else trimmed_path;
     const base = std.fs.path.basename(eff_path);
     if (base.len == 0) return error.InvalidTorrent;
     const name = aa.dupe(u8, base) catch return error.OutOfMemory;
 
-    const st = std.fs.cwd().statFile(path) catch return error.InvalidTorrent;
+    const st = std.Io.Dir.cwd().statFile(
+        io,
+        path,
+        .{},
+    ) catch return error.InvalidTorrent;
 
     var pieces: std.ArrayList(u8) = .empty;
     var total: u64 = 0;
@@ -468,15 +504,19 @@ pub fn buildTorrent(allocator: Allocator, path: []const u8, opts: CreateOptions)
     var info_entries: std.ArrayList(bencode.Value.DictEntry) = .empty;
 
     if (st.kind == .directory) {
-        var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch return error.InvalidTorrent;
-        defer dir.close();
+        var dir = std.Io.Dir.cwd().openDir(
+            io,
+            path,
+            .{ .iterate = true },
+        ) catch return error.InvalidTorrent;
+        defer dir.close(io);
 
         // Collect every regular file (relative to the dir), then sort for a
         // deterministic piece layout.
         var works: std.ArrayList(FileWork) = .empty;
         var walker = dir.walk(aa) catch return error.OutOfMemory;
         defer walker.deinit(); // closes the dir handles the walker keeps open
-        while (walker.next() catch return error.InvalidTorrent) |entry| {
+        while (walker.next(io) catch return error.InvalidTorrent) |entry| {
             if (entry.kind != .file) continue;
             const rel = aa.dupe(u8, entry.path) catch return error.OutOfMemory;
             works.append(aa, .{ .rel = rel }) catch return error.OutOfMemory;
@@ -488,12 +528,22 @@ pub fn buildTorrent(allocator: Allocator, path: []const u8, opts: CreateOptions)
         // while building the `files` list (each a {length, path} dict).
         var files_list: std.ArrayList(bencode.Value) = .empty;
         for (works.items) |w| {
-            var f = dir.openFile(w.rel, .{}) catch return error.InvalidTorrent;
-            defer f.close();
+            const f = dir.openFile(
+                io,
+                w.rel,
+                .{},
+            ) catch return error.InvalidTorrent;
+            defer f.close(io);
             var flen: u64 = 0;
             while (true) {
-                const n = f.readAll(chunk[filled..]) catch return error.InvalidTorrent;
-                if (n == 0) break;
+                var buffers = [_][]u8{chunk[filled..]};
+
+                const n = f.readStreaming(io, &buffers) catch |err| switch (err) {
+                    error.EndOfStream => break,
+                    else => return error.InvalidTorrent,
+                };
+
+                if (n == 0) continue;
                 filled += n;
                 total += n;
                 flen += n;
@@ -516,11 +566,21 @@ pub fn buildTorrent(allocator: Allocator, path: []const u8, opts: CreateOptions)
         // Multi-file's unique key; "files" sorts before the shared "name" below.
         info_entries.append(aa, .{ .key = "files", .value = .{ .list = files_slice } }) catch return error.OutOfMemory;
     } else {
-        var f = std.fs.cwd().openFile(path, .{}) catch return error.InvalidTorrent;
-        defer f.close();
+        const f = std.Io.Dir.cwd().openFile(
+            io,
+            path,
+            .{},
+        ) catch return error.InvalidTorrent;
+        defer f.close(io);
         while (true) {
-            const n = f.readAll(chunk[filled..]) catch return error.InvalidTorrent;
-            if (n == 0) break;
+            var buffers = [_][]u8{chunk[filled..]};
+
+            const n = f.readStreaming(io, &buffers) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return error.InvalidTorrent,
+            };
+
+            if (n == 0) continue;
             filled += n;
             total += n;
             if (filled == piece_length) {
@@ -578,11 +638,15 @@ test "createSingleFile: hashes a file into a valid metainfo" {
     defer tmp.cleanup();
 
     // 10 bytes with piece_length 4 → 3 pieces (4 + 4 + 2).
-    try tmp.dir.writeFile(.{ .sub_path = "data.bin", .data = "0123456789" });
-    const path = try tmp.dir.realpathAlloc(allocator, "data.bin");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "data.bin", .data = "0123456789" });
+    const path = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        "data.bin",
+        allocator,
+    );
     defer allocator.free(path);
 
-    const mi = try createSingleFile(allocator, path, 4);
+    const mi = try createSingleFile(std.testing.io, allocator, path, 4);
     defer mi.deinit(allocator);
 
     try std.testing.expectEqualStrings("data.bin", mi.name);
@@ -605,12 +669,16 @@ test "buildTorrent: single file re-parses with trackers + matching info-hash" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{ .sub_path = "data.bin", .data = "0123456789" });
-    const path = try tmp.dir.realpathAlloc(allocator, "data.bin");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "data.bin", .data = "0123456789" });
+    const path = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        "data.bin",
+        allocator,
+    );
     defer allocator.free(path);
 
     const trackers = [_][]const u8{ "http://t.example/announce", "udp://t2.example:6969" };
-    const res = try buildTorrent(allocator, path, .{
+    const res = try buildTorrent(std.testing.io, allocator, path, .{
         .piece_length = 4,
         .trackers = &trackers,
         .comment = "hello",
@@ -645,14 +713,14 @@ test "buildTorrent: directory hashes pieces continuously across files" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("d/sub");
-    try tmp.dir.writeFile(.{ .sub_path = "d/a.txt", .data = "AAAA" }); // 4 bytes
-    try tmp.dir.writeFile(.{ .sub_path = "d/sub/b.txt", .data = "BBBBBB" }); // 6 bytes
-    const path = try tmp.dir.realpathAlloc(allocator, "d");
+    try tmp.dir.createDirPath(std.testing.io, "d/sub");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "d/a.txt", .data = "AAAA" }); // 4 bytes
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "d/sub/b.txt", .data = "BBBBBB" }); // 6 bytes
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "d", allocator);
     defer allocator.free(path);
 
     // 10 bytes total, piece_length 4 → 3 pieces; the 2nd piece spans a.txt→b.txt.
-    const res = try buildTorrent(allocator, path, .{ .piece_length = 4, .created_by = null });
+    const res = try buildTorrent(std.testing.io, allocator, path, .{ .piece_length = 4, .created_by = null });
     defer allocator.free(res.data);
 
     try std.testing.expectEqual(@as(u64, 10), res.total_length);
@@ -678,14 +746,22 @@ test "buildTorrent: trailing-slash directory path yields the right name" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("md");
-    try tmp.dir.writeFile(.{ .sub_path = "md/f.txt", .data = "abcd" });
-    const base = try tmp.dir.realpathAlloc(allocator, "md");
+    try tmp.dir.createDirPath(std.testing.io, "md");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "md/f.txt",
+        .data = "abcd",
+    });
+    const base = try tmp.dir.realPathFileAlloc(std.testing.io, "md", allocator);
     defer allocator.free(base);
     const path = try std.fmt.allocPrint(allocator, "{s}/", .{base}); // trailing slash
     defer allocator.free(path);
 
-    const res = try buildTorrent(allocator, path, .{ .piece_length = 4 });
+    const res = try buildTorrent(
+        std.testing.io,
+        allocator,
+        path,
+        .{ .piece_length = 4 },
+    );
     defer allocator.free(res.data);
     const mi = try parse(allocator, res.data);
     defer mi.deinit(allocator);
@@ -698,11 +774,11 @@ test "buildTorrent: trackerless single file omits announce" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "x.bin", .data = "abcd" });
-    const path = try tmp.dir.realpathAlloc(allocator, "x.bin");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "x.bin", .data = "abcd" });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "x.bin", allocator);
     defer allocator.free(path);
 
-    const res = try buildTorrent(allocator, path, .{ .piece_length = 4 });
+    const res = try buildTorrent(std.testing.io, allocator, path, .{ .piece_length = 4 });
     defer allocator.free(res.data);
     const mi = try parse(allocator, res.data);
     defer mi.deinit(allocator);
@@ -714,10 +790,17 @@ test "buildTorrent: empty directory rejects" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("empty");
-    const path = try tmp.dir.realpathAlloc(allocator, "empty");
+    try tmp.dir.createDirPath(std.testing.io, "empty");
+    const path = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        "empty",
+        allocator,
+    );
     defer allocator.free(path);
-    try std.testing.expectError(error.InvalidTorrent, buildTorrent(allocator, path, .{}));
+    try std.testing.expectError(
+        error.InvalidTorrent,
+        buildTorrent(std.testing.io, allocator, path, .{}),
+    );
 }
 
 test "parse single-file torrent" {

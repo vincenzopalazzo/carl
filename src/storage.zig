@@ -92,12 +92,13 @@ pub const FileStat = struct {
 
 /// Manages open file handles and performs positioned reads/writes.
 pub const Storage = struct {
+    io: std.Io,
     allocator: Allocator,
     file_map: FileMap,
-    handles: []std.fs.File,
+    handles: []std.Io.File,
     piece_len: u64,
     /// The output directory, kept open so handles can be reopened read-only.
-    dir: std.fs.Dir,
+    dir: std.Io.Dir,
     /// Relative path of each file inside `dir` (joined components), owned.
     paths: [][]u8,
     /// True when `handles` are read-only (seed mode, or after a downgrade).
@@ -115,6 +116,7 @@ pub const Storage = struct {
     /// Initialize storage for a torrent. If `create` is true, creates/preallocates files.
     /// If false, opens existing files for reading (seed mode).
     pub fn init(
+        io: std.Io,
         allocator: Allocator,
         meta: metainfo.Metainfo,
         output_dir_path: []const u8,
@@ -123,7 +125,10 @@ pub const Storage = struct {
         const fm = FileMap.init(allocator, meta.files) catch return error.OutOfMemory;
         errdefer fm.deinit(allocator);
 
-        const handles = allocator.alloc(std.fs.File, meta.files.len) catch return error.OutOfMemory;
+        const handles = allocator.alloc(
+            std.Io.File,
+            meta.files.len,
+        ) catch return error.OutOfMemory;
         @memset(handles, undefined);
         errdefer allocator.free(handles);
 
@@ -133,12 +138,16 @@ pub const Storage = struct {
         var opened: usize = 0;
         var paths_set: usize = 0;
         errdefer {
-            for (handles[0..opened]) |h| h.close();
+            for (handles[0..opened]) |h| h.close(io);
             for (paths[0..paths_set]) |p| allocator.free(p);
         }
 
-        var dir = std.fs.cwd().openDir(output_dir_path, .{}) catch return error.FileOpenFailed;
-        errdefer dir.close();
+        var dir = std.Io.Dir.cwd().openDir(
+            io,
+            output_dir_path,
+            .{},
+        ) catch return error.FileOpenFailed;
+        errdefer dir.close(io);
 
         // Validate all path components before creating any files (path traversal defense)
         for (meta.files) |file_info| {
@@ -162,7 +171,7 @@ pub const Storage = struct {
                     @memcpy(path_buf[pos .. pos + comp.len], comp);
                     pos += comp.len;
                 }
-                dir.makePath(path_buf[0..pos]) catch {};
+                dir.createDirPath(io, path_buf[0..pos]) catch {};
             }
 
             // Build full relative path
@@ -180,7 +189,14 @@ pub const Storage = struct {
             const path = path_buf[0..pos];
 
             if (create) {
-                handles[i] = dir.createFile(path, .{ .read = true, .truncate = false }) catch return error.FileOpenFailed;
+                handles[i] = dir.createFile(
+                    io,
+                    path,
+                    .{
+                        .read = true,
+                        .truncate = false,
+                    },
+                ) catch return error.FileOpenFailed;
                 // Count the handle as opened before preallocating, so a
                 // setEndPos failure (disk full) doesn't leak the descriptor
                 // on the error path — Session.init failures don't kill the
@@ -192,14 +208,21 @@ pub const Storage = struct {
                 // record keys on mtime — a pointless ftruncate here would
                 // invalidate every saved bitfield and force a full re-hash on
                 // every single start.
-                const cur_len = handles[i].getEndPos() catch 0;
+                const cur_len = handles[i].length(io) catch 0;
                 if (cur_len != file_info.length) {
-                    handles[i].setEndPos(file_info.length) catch return error.WriteFailed;
+                    handles[i].setLength(
+                        io,
+                        file_info.length,
+                    ) catch return error.WriteFailed;
                 }
             } else {
                 // Seeding only reads: a read-only handle leaves the file free
                 // for other programs (no write lock on data we never modify).
-                handles[i] = dir.openFile(path, .{ .mode = .read_only }) catch return error.FileOpenFailed;
+                handles[i] = dir.openFile(
+                    io,
+                    path,
+                    .{ .mode = .read_only },
+                ) catch return error.FileOpenFailed;
                 opened += 1;
             }
             paths[i] = allocator.dupe(u8, path) catch return error.OutOfMemory;
@@ -207,6 +230,7 @@ pub const Storage = struct {
         }
 
         return .{
+            .io = io,
             .allocator = allocator,
             .file_map = fm,
             .handles = handles,
@@ -222,7 +246,7 @@ pub const Storage = struct {
         self.allocator.free(self.handles);
         for (self.paths) |p| self.allocator.free(p);
         self.allocator.free(self.paths);
-        self.dir.close();
+        self.dir.close(self.io);
         self.file_map.deinit(self.allocator);
     }
 
@@ -232,7 +256,7 @@ pub const Storage = struct {
     /// keep its files open. Reads/writes fail after this.
     pub fn closeFiles(self: *Storage) void {
         if (self.files_closed) return;
-        for (self.handles) |h| h.close();
+        for (self.handles) |h| h.close(self.io);
         self.files_closed = true;
     }
 
@@ -243,8 +267,12 @@ pub const Storage = struct {
     pub fn downgradeToReadOnly(self: *Storage) void {
         if (self.files_closed or self.read_only) return;
         for (self.handles, self.paths) |*h, p| {
-            const ro = self.dir.openFile(p, .{ .mode = .read_only }) catch continue;
-            h.close();
+            const ro = self.dir.openFile(
+                self.io,
+                p,
+                .{ .mode = .read_only },
+            ) catch continue;
+            h.close(self.io);
             h.* = ro;
         }
         self.read_only = true;
@@ -257,8 +285,8 @@ pub const Storage = struct {
     /// descriptor does.
     pub fn statFile(self: *Storage, index: u32) IoError!FileStat {
         if (self.files_closed or index >= self.handles.len) return error.ReadFailed;
-        const st = self.handles[index].stat() catch return error.ReadFailed;
-        return .{ .size = st.size, .mtime_ns = st.mtime };
+        const st = self.handles[index].stat(self.io) catch return error.ReadFailed;
+        return .{ .size = st.size, .mtime_ns = st.mtime.nanoseconds };
     }
 
     /// Flush every payload file to stable storage, best-effort. Called before
@@ -267,7 +295,7 @@ pub const Storage = struct {
     /// A read-only store never wrote anything, so there is nothing to flush.
     pub fn syncAll(self: *Storage) void {
         if (self.files_closed or self.read_only) return;
-        for (self.handles) |h| h.sync() catch {};
+        for (self.handles) |h| h.sync(self.io) catch {};
     }
 
     /// Write a verified piece to disk.
@@ -280,7 +308,11 @@ pub const Storage = struct {
         for (slices) |s| {
             const chunk_len = std.math.cast(usize, s.length) orelse return error.WriteFailed;
             const chunk = data[data_pos .. data_pos + chunk_len];
-            self.handles[s.file_index].pwriteAll(chunk, s.file_offset) catch return error.WriteFailed;
+            self.handles[s.file_index].writePositionalAll(
+                self.io,
+                chunk,
+                s.file_offset,
+            ) catch return error.WriteFailed;
             data_pos += chunk_len;
         }
     }
@@ -304,7 +336,11 @@ pub const Storage = struct {
         var buf_pos: usize = 0;
         for (slices) |s| {
             const chunk_len = std.math.cast(usize, s.length) orelse return error.ReadFailed;
-            const bytes_read = self.handles[s.file_index].pread(buf[buf_pos .. buf_pos + chunk_len], s.file_offset) catch return error.ReadFailed;
+            const bytes_read = self.handles[s.file_index].readPositionalAll(
+                self.io,
+                buf[buf_pos .. buf_pos + chunk_len],
+                s.file_offset,
+            ) catch return error.ReadFailed;
             if (bytes_read != chunk_len) return error.ReadFailed;
             buf_pos += chunk_len;
         }
@@ -407,7 +443,7 @@ test "storage write and read roundtrip" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = tmp_dir.dir.realpathAlloc(allocator, ".") catch return;
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.testing.io, ".", allocator) catch return;
     defer allocator.free(tmp_path);
 
     const files = [_]metainfo.FileInfo{
@@ -428,7 +464,7 @@ test "storage write and read roundtrip" {
         .url_list = null,
     };
 
-    var store = Storage.init(allocator, meta, tmp_path, true) catch return;
+    var store = Storage.init(std.testing.io, allocator, meta, tmp_path, true) catch return;
     defer store.deinit();
 
     // Write piece 0
@@ -456,7 +492,7 @@ test "readRange reads a mid-piece block spanning a file boundary" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = tmp_dir.dir.realpathAlloc(allocator, ".") catch return;
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.testing.io, ".", allocator) catch return;
     defer allocator.free(tmp_path);
 
     // One 16 KiB piece split across two files (10000 + 6384 bytes), so a
@@ -466,7 +502,7 @@ test "readRange reads a mid-piece block spanning a file boundary" {
         .{ .length = 6384, .path = &.{"b.bin"} },
     };
 
-    var store = Storage.init(allocator, testMeta(&files), tmp_path, true) catch return;
+    var store = Storage.init(std.testing.io, allocator, testMeta(&files), tmp_path, true) catch return;
     defer store.deinit();
 
     var data: [16384]u8 = undefined;
@@ -513,13 +549,13 @@ test "downgradeToReadOnly: reads keep working, writes fail" {
     const allocator = std.testing.allocator;
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = tmp_dir.dir.realpathAlloc(allocator, ".") catch return;
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.testing.io, ".", allocator) catch return;
     defer allocator.free(tmp_path);
 
     const files = [_]metainfo.FileInfo{
         .{ .length = 16384, .path = &.{"dl.bin"} },
     };
-    var store = Storage.init(allocator, testMeta(&files), tmp_path, true) catch return;
+    var store = Storage.init(std.testing.io, allocator, testMeta(&files), tmp_path, true) catch return;
     defer store.deinit();
 
     const data = [_]u8{0xCC} ** 16384;
@@ -538,7 +574,7 @@ test "seed mode opens files read-only" {
     const allocator = std.testing.allocator;
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = tmp_dir.dir.realpathAlloc(allocator, ".") catch return;
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.testing.io, ".", allocator) catch return;
     defer allocator.free(tmp_path);
 
     const files = [_]metainfo.FileInfo{
@@ -547,13 +583,13 @@ test "seed mode opens files read-only" {
 
     // Lay the file down via a create-mode store first.
     {
-        var store = Storage.init(allocator, testMeta(&files), tmp_path, true) catch return;
+        var store = Storage.init(std.testing.io, allocator, testMeta(&files), tmp_path, true) catch return;
         defer store.deinit();
         const data = [_]u8{0xDD} ** 16384;
         try store.writePiece(0, &data);
     }
 
-    var store = Storage.init(allocator, testMeta(&files), tmp_path, false) catch return;
+    var store = Storage.init(std.testing.io, allocator, testMeta(&files), tmp_path, false) catch return;
     defer store.deinit();
     try std.testing.expect(store.read_only);
 
@@ -568,13 +604,13 @@ test "closeFiles is idempotent and safe before deinit" {
     const allocator = std.testing.allocator;
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = tmp_dir.dir.realpathAlloc(allocator, ".") catch return;
+    const tmp_path = tmp_dir.dir.realPathFileAlloc(std.testing.io, ".", allocator) catch return;
     defer allocator.free(tmp_path);
 
     const files = [_]metainfo.FileInfo{
         .{ .length = 16384, .path = &.{"done.bin"} },
     };
-    var store = Storage.init(allocator, testMeta(&files), tmp_path, true) catch return;
+    var store = Storage.init(std.testing.io, allocator, testMeta(&files), tmp_path, true) catch return;
     defer store.deinit(); // closes again via the guard — must not double-close
 
     const data = [_]u8{0xAB} ** 16384;

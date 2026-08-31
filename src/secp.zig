@@ -8,6 +8,7 @@
 //! signing and verification; we randomize it once for side-channel resistance.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @cImport({
     @cDefine("ENABLE_MODULE_SCHNORRSIG", "1");
     @cDefine("ENABLE_MODULE_EXTRAKEYS", "1");
@@ -46,28 +47,41 @@ pub const Signature = [64]u8;
 // Shared context
 // ---------------------------------------------------------------------------
 
-var ctx_once = std.once(initContext);
 var shared_ctx: ?*c.secp256k1_context = null;
+var shared_io: ?std.Io = null;
 
-fn initContext() void {
-    const new_ctx = c.secp256k1_context_create(c.SECP256K1_CONTEXT_NONE);
+pub fn init(io: std.Io) Error!void {
+    if (shared_ctx != null) return;
+
+    const new_ctx =
+        c.secp256k1_context_create(c.SECP256K1_CONTEXT_NONE);
+
     if (new_ctx == null) {
         log.err("secp256k1_context_create returned null", .{});
-        return;
+        return error.OutOfMemory;
     }
-    // Randomize the context to harden internal computations against side
-    // channels. Failure here is non-fatal but we want to know about it.
+
     var seed: [32]u8 = undefined;
-    std.crypto.random.bytes(&seed);
+    io.random(&seed);
+
     if (c.secp256k1_context_randomize(new_ctx, &seed) != 1) {
         log.warn("secp256k1_context_randomize failed", .{});
     }
+
+    shared_io = io;
     shared_ctx = new_ctx;
 }
 
 fn getCtx() !*c.secp256k1_context {
-    ctx_once.call();
-    return shared_ctx orelse return error.OutOfMemory;
+    if (shared_ctx == null and builtin.is_test) {
+        try init(std.testing.io);
+    }
+
+    return shared_ctx orelse error.OutOfMemory;
+}
+
+fn getIo() !std.Io {
+    return shared_io orelse error.OutOfMemory;
 }
 
 // ---------------------------------------------------------------------------
@@ -78,10 +92,11 @@ fn getCtx() !*c.secp256k1_context {
 /// outside [1, n-1] by checking with libsecp256k1.
 pub fn generateSecretKey() Error!SecretKey {
     const ctx_ptr = try getCtx();
+    const io = try getIo();
     var sk: SecretKey = undefined;
     var attempts: u32 = 0;
     while (attempts < 256) : (attempts += 1) {
-        std.crypto.random.bytes(&sk);
+        io.random(&sk);
         if (c.secp256k1_ec_seckey_verify(ctx_ptr, &sk) == 1) return sk;
     }
     // Statistically unreachable (~256 * 2^-256), but if the RNG is broken or
@@ -127,7 +142,8 @@ pub fn sign(sk: SecretKey, msg32: [32]u8, aux_rand: ?[32]u8) Error!Signature {
     if (aux_rand) |a| {
         aux = a;
     } else {
-        std.crypto.random.bytes(&aux);
+        const io = try getIo();
+        io.random(&aux);
     }
     var sig: Signature = undefined;
     if (c.secp256k1_schnorrsig_sign32(ctx_ptr, &sig, &msg32, &keypair, &aux) != 1) {
@@ -299,7 +315,7 @@ test "generateSecretKey produces a valid key that derives a pubkey" {
 
     // Round-trip: sign random msg and verify.
     var msg: [32]u8 = undefined;
-    std.crypto.random.bytes(&msg);
+    std.Io.random(std.testing.io, &msg);
     const sig = try sign(sk, msg, null);
     try std.testing.expect(verify(sig, &msg, pk));
 }
