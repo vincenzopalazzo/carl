@@ -10,6 +10,7 @@ const Net = std.Io.net;
 const Stream = Net.Stream;
 const HostName = Net.HostName;
 const posix = std.posix;
+const IpAddress = Net.IpAddress;
 
 const log = std.log.scoped(.tor);
 
@@ -134,6 +135,146 @@ fn defaultCookiePath(
     );
 }
 
+fn boundedControlConnect(
+    io: std.Io,
+    host: []const u8,
+    port: u16,
+) !Stream {
+    const host_name =
+        HostName.init(host) catch return error.ConnectFailed;
+
+    var canonical_name_buffer: [HostName.max_len]u8 = undefined;
+    var lookup_buffer: [16]HostName.LookupResult = undefined;
+    var lookup_queue: std.Io.Queue(HostName.LookupResult) =
+        .init(&lookup_buffer);
+
+    host_name.lookup(io, &lookup_queue, .{
+        .port = port,
+        .canonical_name_buffer = &canonical_name_buffer,
+    }) catch return error.ConnectFailed;
+
+    while (lookup_queue.getOneUncancelable(io)) |result| {
+        switch (result) {
+            .address => |address| switch (address) {
+                .ip4 => {
+                    if (connectControlIp4(address)) |stream| {
+                        return stream;
+                    }
+                },
+                .ip6 => {},
+            },
+            .canonical_name => {},
+        }
+    } else |err| switch (err) {
+        error.Closed => {},
+    }
+
+    return error.ConnectFailed;
+}
+
+fn connectControlIp4(address: IpAddress) ?Stream {
+    const ip4 = switch (address) {
+        .ip4 => |addr| addr,
+        .ip6 => return null,
+    };
+
+    const sock = std.c.socket(
+        std.posix.AF.INET,
+        std.posix.SOCK.STREAM,
+        std.posix.IPPROTO.TCP,
+    );
+
+    if (sock < 0) return null;
+
+    var socket_owned = true;
+    defer {
+        if (socket_owned) {
+            _ = std.c.close(sock);
+        }
+    }
+
+    _ = std.c.fcntl(
+        sock,
+        std.c.F.SETFD,
+        @as(c_int, std.posix.FD_CLOEXEC),
+    );
+
+    const flags = std.c.fcntl(
+        sock,
+        std.c.F.GETFL,
+        @as(c_int, 0),
+    );
+    if (flags < 0) return null;
+
+    var o: std.c.O = @bitCast(@as(u32, @intCast(flags)));
+    o.NONBLOCK = true;
+
+    _ = std.c.fcntl(
+        sock,
+        std.c.F.SETFL,
+        @as(c_int, @bitCast(o)),
+    );
+
+    const posix_addr = std.posix.sockaddr.in{
+        .port = std.mem.nativeToBig(u16, ip4.port),
+        .addr = @bitCast(ip4.bytes),
+    };
+
+    const rc = std.c.connect(
+        sock,
+        @ptrCast(&posix_addr),
+        @sizeOf(std.posix.sockaddr.in),
+    );
+
+    if (rc != 0) switch (std.posix.errno(rc)) {
+        .AGAIN, .INPROGRESS => {
+            var pfd = [_]std.posix.pollfd{.{
+                .fd = sock,
+                .events = std.posix.POLL.OUT,
+                .revents = 0,
+            }};
+
+            const ready = std.posix.poll(
+                &pfd,
+                @intCast(control_timeout_secs * 1000),
+            ) catch return null;
+
+            if (ready == 0) return null;
+
+            var socket_error: c_int = 0;
+            var socket_error_len: std.c.socklen_t = @sizeOf(c_int);
+
+            if (std.c.getsockopt(
+                sock,
+                std.c.SOL.SOCKET,
+                std.c.SO.ERROR,
+                &socket_error,
+                &socket_error_len,
+            ) != 0 or socket_error != 0) {
+                return null;
+            }
+        },
+        else => return null,
+    };
+
+    o.NONBLOCK = false;
+
+    _ = std.c.fcntl(
+        sock,
+        std.c.F.SETFL,
+        @as(c_int, @bitCast(o)),
+    );
+
+    socket_owned = false;
+
+    return .{
+        .socket = .{
+            .handle = sock,
+            .address = address,
+        },
+    };
+}
+
 fn connectControl(
     io: std.Io,
     addr_str: []const u8,
@@ -157,18 +298,11 @@ fn connectControl(
         return error.ConnectFailed;
     }
 
-    const host_name =
-        HostName.init(host) catch return error.ConnectFailed;
-
-    const stream = host_name.connect(io, port, .{
-        .mode = .stream,
-        .timeout = .{
-            .duration = .{
-                .raw = .fromSeconds(control_timeout_secs),
-                .clock = .awake,
-            },
-        },
-    }) catch return error.ConnectFailed;
+    const stream = boundedControlConnect(
+        io,
+        host,
+        port,
+    ) catch return error.ConnectFailed;
 
     // Preserve Carl's existing read/write timeout behavior.
     const tv = posix.timeval{

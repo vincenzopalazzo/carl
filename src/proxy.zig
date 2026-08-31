@@ -394,7 +394,6 @@ fn httpsExchange(
 
     ca_bundle.rescan(allocator, io, now) catch
         return error.TlsFailed;
-    defer ca_bundle.deinit(allocator);
 
     var sock_read_buf: [tls.max_ciphertext_record_len]u8 = undefined;
     var sock_write_buf: [tls.max_ciphertext_record_len]u8 = undefined;
@@ -481,14 +480,16 @@ fn dialProxy(
 ) ProxyError!Stream {
     _ = allocator;
 
-    const host_name = Net.HostName.init(proxy.host) catch
-        return error.DnsResolveFailed;
-
-    var stream = host_name.connect(
+    const addr = try resolveIp4(
         io,
+        proxy.host,
         proxy.port,
-        .{ .mode = .stream },
-    ) catch return error.ConnectFailed;
+    );
+
+    var stream = try connectIp4Bounded(
+        addr,
+        timeout_secs,
+    );
 
     errdefer stream.close(io);
 
@@ -547,6 +548,123 @@ fn resolveIp4(
     }
 
     return error.DnsResolveFailed;
+}
+
+fn connectIp4Bounded(
+    addr: IpAddress,
+    timeout_secs: u32,
+) ProxyError!Stream {
+    const ip4 = switch (addr) {
+        .ip4 => |a| a,
+        .ip6 => return error.ConnectFailed,
+    };
+
+    const timeout_ms: i32 =
+        if (timeout_secs > 600)
+            600_000
+        else
+            @intCast(timeout_secs * 1000);
+
+    const sock = std.c.socket(
+        std.posix.AF.INET,
+        std.posix.SOCK.STREAM,
+        std.posix.IPPROTO.TCP,
+    );
+
+    if (sock < 0)
+        return error.ConnectFailed;
+
+    var socket_owned = true;
+    defer {
+        if (socket_owned) {
+            _ = std.c.close(sock);
+        }
+    }
+
+    _ = std.c.fcntl(
+        sock,
+        std.c.F.SETFD,
+        @as(c_int, std.posix.FD_CLOEXEC),
+    );
+
+    const flags = std.c.fcntl(
+        sock,
+        std.c.F.GETFL,
+        @as(c_int, 0),
+    );
+
+    if (flags < 0)
+        return error.ConnectFailed;
+
+    var o: std.c.O = @bitCast(@as(u32, @intCast(flags)));
+    o.NONBLOCK = true;
+
+    _ = std.c.fcntl(
+        sock,
+        std.c.F.SETFL,
+        @as(c_int, @bitCast(o)),
+    );
+
+    const posix_addr: std.posix.sockaddr.in = .{
+        .port = std.mem.nativeToBig(u16, ip4.port),
+        .addr = @bitCast(ip4.bytes),
+    };
+
+    const rc = std.c.connect(
+        sock,
+        @ptrCast(&posix_addr),
+        @sizeOf(std.posix.sockaddr.in),
+    );
+
+    if (rc != 0) switch (std.posix.errno(rc)) {
+        .AGAIN, .INPROGRESS => {
+            var pfd = [_]std.posix.pollfd{.{
+                .fd = sock,
+                .events = std.posix.POLL.OUT,
+                .revents = 0,
+            }};
+
+            const ready = std.posix.poll(
+                &pfd,
+                timeout_ms,
+            ) catch return error.ConnectFailed;
+
+            if (ready == 0)
+                return error.ConnectFailed;
+
+            var socket_error: c_int = 0;
+            var socket_error_len: std.c.socklen_t = @sizeOf(c_int);
+
+            if (std.c.getsockopt(
+                sock,
+                std.c.SOL.SOCKET,
+                std.c.SO.ERROR,
+                &socket_error,
+                &socket_error_len,
+            ) != 0 or socket_error != 0) {
+                return error.ConnectFailed;
+            }
+        },
+        else => return error.ConnectFailed,
+    };
+
+    // Connected. Restore blocking mode.
+    o.NONBLOCK = false;
+
+    _ = std.c.fcntl(
+        sock,
+        std.c.F.SETFL,
+        @as(c_int, @bitCast(o)),
+    );
+
+    socket_owned = false;
+
+    return .{
+        .socket = .{
+            .handle = sock,
+            .address = addr,
+        },
+    };
 }
 
 /// Health-check a SOCKS5 proxy using only the method-negotiation greeting — we

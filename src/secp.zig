@@ -49,8 +49,12 @@ pub const Signature = [64]u8;
 
 var shared_ctx: ?*c.secp256k1_context = null;
 var shared_io: ?std.Io = null;
+var init_mutex: std.Io.Mutex = .init;
 
 pub fn init(io: std.Io) Error!void {
+    init_mutex.lockUncancelable(io);
+    defer init_mutex.unlock(io);
+
     if (shared_ctx != null) return;
 
     const new_ctx =
