@@ -34,7 +34,14 @@ pub fn main(init: std.process.Init) !void {
 
     const command = args[1];
 
-    if (std.mem.eql(u8, command, "info")) {
+    if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h") or std.mem.eql(u8, command, "help")) {
+        printUsage(init.io);
+        std.process.exit(0);
+    } else if (std.mem.eql(u8, command, "--version") or std.mem.eql(u8, command, "-V") or std.mem.eql(u8, command, "version")) {
+        try stdout.print("carl 0.3.1\n", .{});
+        try stdout.flush();
+        std.process.exit(0);
+    } else if (std.mem.eql(u8, command, "info")) {
         if (args.len < 3) {
             log.err("usage: carl info <file.torrent>", .{});
             std.process.exit(1);
