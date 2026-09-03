@@ -1024,7 +1024,7 @@ pub const Session = struct {
             const revents = fds[fd_idx].revents;
 
             if (revents & (std.posix.POLL.HUP | std.posix.POLL.ERR) != 0) {
-                if (p.state == .active) log.debug("peer dropped (HUP/ERR), idle {d}s", .{std.Io.Clock.real.now(self.io)});
+                if (p.state == .active) log.debug("peer dropped (HUP/ERR), idle {d}s", .{std.Io.Clock.real.now(self.io).toSeconds() - p.last_recv_time});
                 p.disconnect();
                 fd_idx += 1;
                 continue;
