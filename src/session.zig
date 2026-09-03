@@ -2142,7 +2142,12 @@ pub const Session = struct {
         // swarm most tracker peers are unreachable, so a single connect burst
         // leaves us with almost nothing. Cycle through the cached list (skipping
         // peers already connected) until the pool reaches a healthy count.
-        if (self.mode == .download and self.peers.items.len < 30 and self.cached_peers.len > 0 and now - self.last_replenish_s >= 3) {
+        //
+        // Proxied (and any other no-listener) seeds must keep dialing too:
+        // they never bind a clearnet port, so the only way to upload is an
+        // outbound SOCKS/TCP connection to a leecher. Without this they
+        // announce `left=0` (a "ghost seed") and never serve anyone.
+        if (self.wantsPeerReplenish(now)) {
             self.last_replenish_s = now;
             self.connectToPeers(self.cached_peers) catch {};
         }
@@ -2151,15 +2156,53 @@ pub const Session = struct {
         // relays for fresh peer-announces — a seed may have appeared or come
         // back. Runs on this (the session) thread, so the callback adds peers
         // safely. Gated on download mode + zero peers so it never duplicates a
-        // live connection, competes with an active download, or fires once the
-        // transfer has completed and is only seeding (dialing out is pointless
-        // then); rate-limited because relay queries are slow.
+        // live connection or competes with an active download; rate-limited
+        // because relay queries are slow. Proxied seeds replenish via the
+        // tracker compact list above, not via Nostr (kind-30078 is onion/i2p).
         if (self.peer_discovery) |pd| {
             if (self.mode == .download and self.peers.items.len == 0 and now - self.last_peer_discovery_s > peer_rediscovery_interval_secs) {
                 self.last_peer_discovery_s = now;
                 pd.run(pd.ctx);
             }
         }
+    }
+
+    /// Pure replenish gate (unit-tested). Leecher always; seeder only when
+    /// there is no inbound path. I2P seeds never dial the clearnet compact
+    /// list (that would leak the real IP).
+    fn peerReplenishWanted(
+        mode: Mode,
+        peer_count: usize,
+        cached_len: usize,
+        last_replenish_s: i64,
+        now: i64,
+        has_listener: bool,
+        is_i2p: bool,
+    ) bool {
+        if (cached_len == 0) return false;
+        if (now - last_replenish_s < 3) return false;
+        if (peer_count >= 30) return false;
+        if (mode == .download) return true;
+        // Seed: outbound replenish is the only upload path without a listener.
+        // Skip I2P: compact peers are clearnet IPv4.
+        if (is_i2p) return false;
+        return !has_listener;
+    }
+
+    /// Whether maintenance should dial cached tracker peers this tick.
+    /// Leecher: always, so a NAT'd swarm keeps yielding reachable hosts.
+    /// Seeder: only with no inbound path (proxy/Tor SOCKS, or a failed listen).
+    /// I2P seeds must not dial the clearnet compact-peer list (IP leak).
+    fn wantsPeerReplenish(self: *const Session, now: i64) bool {
+        return peerReplenishWanted(
+            self.mode,
+            self.peers.items.len,
+            self.cached_peers.len,
+            self.last_replenish_s,
+            now,
+            self.listener != null,
+            self.i2p != null,
+        );
     }
 
     // --- Multi-tracker announce (BEP 12 + BEP 15) ---
@@ -2955,6 +2998,31 @@ test "sampleRate counts block bytes as progress before a piece verifies" {
     // No new bytes: the progress stamp must not advance.
     s.sampleRate(110);
     try std.testing.expectEqual(@as(i64, 104), s.last_progress_s.load(.monotonic));
+}
+
+test "peerReplenishWanted keeps dialing a proxied seed" {
+    // Regression: replenish was gated on mode==download, so a completed
+    // proxy/Tor seed announced left=0 (ghost seed) and never dialed leechers.
+    const now: i64 = 1_000_000;
+    const last: i64 = now - 3;
+
+    // Leecher with cached peers: always.
+    try std.testing.expect(Session.peerReplenishWanted(.download, 0, 8, last, now, false, false));
+    try std.testing.expect(Session.peerReplenishWanted(.download, 0, 8, last, now, true, false));
+
+    // Proxied seed (no listener): must replenish.
+    try std.testing.expect(Session.peerReplenishWanted(.seed, 0, 8, last, now, false, false));
+
+    // Clearnet seed with a live listener: inbound is enough.
+    try std.testing.expect(!Session.peerReplenishWanted(.seed, 0, 8, last, now, true, false));
+
+    // I2P seed: compact list is clearnet IPv4 — never dial it.
+    try std.testing.expect(!Session.peerReplenishWanted(.seed, 0, 8, last, now, false, true));
+
+    // Caps and empty cache still apply.
+    try std.testing.expect(!Session.peerReplenishWanted(.seed, 0, 0, last, now, false, false));
+    try std.testing.expect(!Session.peerReplenishWanted(.seed, 30, 8, last, now, false, false));
+    try std.testing.expect(!Session.peerReplenishWanted(.seed, 0, 8, now, now, false, false));
 }
 
 /// Re-encode a resolved Metainfo into full `.torrent` bytes: a top-level dict

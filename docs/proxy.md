@@ -48,6 +48,7 @@ with an error instead of silently running unproxied.
 | DHT (BEP 5) | direct UDP | **disabled** |
 | Web seeds (BEP 19) | direct HTTP | **disabled** |
 | Incoming listener | bound | **not bound** (inbound peers would see your real IP) |
+| Seeding after complete | inbound + outbound | **outbound only** — carl keeps dialing tracker peers so a completed proxied download can still upload; nobody can connect in |
 
 carl prints a one-line banner on startup when a proxy is active so you know the
 above is in effect.
@@ -244,6 +245,10 @@ Optional flags: `--tor-control host:port`, `--tor-cookie path`,
 - **IPv4 only** -- consistent with the rest of carl.
 - **Connects are blocking** -- each proxied peer handshake runs synchronously
   (up to ~10s), so a batch of unreachable peers can briefly stall progress.
+- **Seeding is outbound-only** -- with no inbound listener, a completed
+  proxied download can only upload on connections carl dials (SOCKS CONNECT
+  to a reachable leecher). The session keeps replenishing that pool from the
+  tracker compact list; it cannot accept incoming peers.
 
 ## Tor vs I2P for BitTorrent
 
