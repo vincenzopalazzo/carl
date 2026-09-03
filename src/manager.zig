@@ -752,7 +752,12 @@ pub const Manager = struct {
         // re-add the transfer twice on the next restart — two sessions on the
         // same files). Only after the spawn: dropping earlier would let the
         // failed-spawn rollback persist state with the saved spec already gone.
-        self.dropRetained(source_src);
+        self.dropRetained(.{
+            .kind = if (is_seed) .seed else .download,
+            .source = source_src,
+            .route = route,
+            .nostr = want_nostr,
+        });
         self.mutex.unlock(self.io);
 
         self.persist();
@@ -1476,8 +1481,9 @@ pub const Manager = struct {
             if (res) |id| {
                 self.allocator.free(id);
                 log.info("retry: restored '{s}'", .{t.source});
-            } else |e| {
-                log.debug("retry: '{s}' still unavailable: {}", .{ t.source, e });
+            } else |_| {
+                // Kept for the next tick/restart; a transport that is still
+                // starting must not spam daemon.log every probe interval.
             }
         }
     }
@@ -1485,11 +1491,19 @@ pub const Manager = struct {
     /// Remove every retained spec whose source matches (the spec became live
     /// again, or the caller is discarding it). Caller must hold `mutex` when the
     /// manager is serving (restore runs single-threaded before that).
-    fn dropRetained(self: *Manager, source: []const u8) void {
+    fn dropRetained(self: *Manager, spec: state_mod.TransferSpec) void {
         var i: usize = 0;
         while (i < self.retained_specs.items.len) {
-            if (std.mem.eql(u8, self.retained_specs.items[i].source, source)) {
-                self.allocator.free(self.retained_specs.items[i].source);
+            const s = self.retained_specs.items[i];
+            // Multi-route overlays can share one source; only the exact spec
+            // that became live may be dropped, or a sibling route disappears
+            // from persistence on the next save.
+            if (s.kind == spec.kind and
+                s.route == spec.route and
+                s.nostr == spec.nostr and
+                std.mem.eql(u8, s.source, spec.source))
+            {
+                self.allocator.free(s.source);
                 _ = self.retained_specs.swapRemove(i);
             } else {
                 i += 1;
@@ -2326,7 +2340,7 @@ test "formatEta" {
     try testing.expectEqualStrings("2h 46m", formatEta(&buf, .downloading, 1_000_000, 100));
 }
 
-test "Manager: dropRetained removes a re-added source so persist can't duplicate it" {
+test "Manager: dropRetained removes only the exact re-added route" {
     const allocator = testing.allocator;
     const ctx: nostr_config.Context = .{
         .io = std.testing.io,
@@ -2343,19 +2357,26 @@ test "Manager: dropRetained removes a re-added source so persist can't duplicate
     defer m.deinit();
 
     try testing.expect(m.retainSpec(.{ .kind = .download, .source = "magnet:?xt=urn:btih:aa", .route = .i2p, .nostr = true }));
+    try testing.expect(m.retainSpec(.{ .kind = .download, .source = "magnet:?xt=urn:btih:aa", .route = .tor, .nostr = true }));
     try testing.expect(m.retainSpec(.{ .kind = .seed, .source = "/data/file.bin", .route = .tor, .nostr = false }));
-    try testing.expectEqual(@as(usize, 2), m.retained_specs.items.len);
+    try testing.expectEqual(@as(usize, 3), m.retained_specs.items.len);
 
-    // The magnet came back (user re-added it / transport recovered): its
-    // retained copy must go away or persist() would write it twice and the
-    // next restart would run two sessions on the same files.
-    m.dropRetained("magnet:?xt=urn:btih:aa");
-    try testing.expectEqual(@as(usize, 1), m.retained_specs.items.len);
-    try testing.expectEqualStrings("/data/file.bin", m.retained_specs.items[0].source);
+    // One overlay route came back: only that route's retained copy may go
+    // away, or persist() would silently drop the sibling route on the next save.
+    m.dropRetained(.{ .kind = .download, .source = "magnet:?xt=urn:btih:aa", .route = .i2p, .nostr = true });
+    try testing.expectEqual(@as(usize, 2), m.retained_specs.items.len);
+    var tor_overlay_kept = false;
+    for (m.retained_specs.items) |s| {
+        if (std.mem.eql(u8, s.source, "magnet:?xt=urn:btih:aa")) {
+            try testing.expectEqual(api.Route.tor, s.route);
+            tor_overlay_kept = true;
+        }
+    }
+    try testing.expect(tor_overlay_kept);
 
     // Unrelated source is a no-op.
-    m.dropRetained("magnet:?xt=urn:btih:bb");
-    try testing.expectEqual(@as(usize, 1), m.retained_specs.items.len);
+    m.dropRetained(.{ .kind = .download, .source = "magnet:?xt=urn:btih:bb", .route = .i2p, .nostr = true });
+    try testing.expectEqual(@as(usize, 2), m.retained_specs.items.len);
 }
 
 test "Manager: init/deinit with config defaults" {

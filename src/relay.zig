@@ -310,7 +310,6 @@ pub fn dial(
         switch (health().skip(io, url, proxy)) {
             .none => {},
             .backoff => {
-                log.debug("relay {s}: skipped, backing off", .{url});
                 return error.Skipped;
             },
             .invalid => {
