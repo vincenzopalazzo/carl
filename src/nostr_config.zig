@@ -181,6 +181,11 @@ pub fn readRelays(ctx: Context, allocator: Allocator) ![][]const u8 {
 
         if (t.len == 0 or t[0] == '#') continue;
 
+        if (!std.mem.startsWith(u8, t, "wss://") and !std.mem.startsWith(u8, t, "ws://")) {
+            log.warn("ignoring invalid relay URL '{s}' (must be wss:// or ws://)", .{t});
+            continue;
+        }
+
         try list.append(
             allocator,
             try allocator.dupe(u8, t),
@@ -233,7 +238,13 @@ pub fn writeRelays(
     defer file.close(ctx.io);
 
     for (relays) |relay| {
-        try file.writeStreamingAll(ctx.io, relay);
+        const t = std.mem.trim(u8, relay, " \t");
+        if (t.len == 0) continue;
+        if (!std.mem.startsWith(u8, t, "wss://") and !std.mem.startsWith(u8, t, "ws://")) {
+            log.warn("ignoring invalid relay URL '{s}' on write (must be wss:// or ws://)", .{t});
+            continue;
+        }
+        try file.writeStreamingAll(ctx.io, t);
         try file.writeStreamingAll(ctx.io, "\n");
     }
 }

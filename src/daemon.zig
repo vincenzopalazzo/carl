@@ -492,8 +492,12 @@ const Conn = struct {
         if (req.header("x-carl-token")) |h| {
             if (constantTimeEql(h, expected)) return true;
         }
-        if (req.queryParam("token")) |q| {
-            if (constantTimeEql(q, expected)) return true;
+        // ?token= is only for the WebSocket handshake (browsers cannot set headers there).
+        // REST endpoints must use X-Carl-Token so the secret never appears in access logs.
+        if (std.mem.eql(u8, req.path, "/ws")) {
+            if (req.queryParam("token")) |q| {
+                if (constantTimeEql(q, expected)) return true;
+            }
         }
         return false;
     }

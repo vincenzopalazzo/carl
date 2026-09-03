@@ -314,7 +314,6 @@ pub fn dial(
                 return error.Skipped;
             },
             .invalid => {
-                log.debug("relay {s}: skipped, unusable URL", .{url});
                 return error.Skipped;
             },
         }
