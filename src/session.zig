@@ -2108,8 +2108,6 @@ pub const Session = struct {
             // consume any peers it found (connects happen on this thread).
             if (self.dht_state) |st| {
                 st.mutex.lockUncancelable(st.io);
-                // work
-                st.mutex.unlock(st.io);
 
                 const nodes = st.nodes;
                 const peers = st.peers;
