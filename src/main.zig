@@ -38,7 +38,7 @@ pub fn main(init: std.process.Init) !void {
         printUsage(init.io);
         std.process.exit(0);
     } else if (std.mem.eql(u8, command, "--version") or std.mem.eql(u8, command, "-V") or std.mem.eql(u8, command, "version")) {
-        try stdout.print("carl 0.3.1\n", .{});
+        try stdout.print("carl 0.3.2\n", .{});
         try stdout.flush();
         std.process.exit(0);
     } else if (std.mem.eql(u8, command, "info")) {
